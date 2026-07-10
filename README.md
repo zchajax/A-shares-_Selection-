@@ -39,13 +39,27 @@
 - **策略层**:指标计算 + 可插拔策略 + 大盘过滤 + 全市场打分排序 + 回测 + 参数寻优。这是软件的核心价值。
 - **界面层**:DearPyGui 渲染,左侧配置策略,右侧看结果、K 线、回测、盯盘。
 
+## 环境准备
+
+需要 Python 3.9+。首次使用建议创建虚拟环境并安装依赖:
+
+```bash
+python -m venv venv
+# Windows
+venv\Scripts\activate
+# macOS / Linux
+source venv/bin/activate
+
+pip install -r requirements.txt
+```
+
 ## 运行方式
 
-方式一:双击 `启动.bat`
+方式一(Windows):双击 `启动.bat`
 
 方式二:命令行
 ```bash
-C:\Users\chacezhang\.workbuddy\binaries\python\envs\gupiao\Scripts\python.exe main.py
+python main.py
 ```
 
 ## 核心功能
@@ -100,8 +114,3 @@ ALL_STRATEGIES = {
 ```
 
 参数会自动在界面上生成滑块,并自动纳入「买入参数寻优」的搜索空间,无需改 UI 代码。
-
-## 关于你 clone 的 G:\imgui
-
-本项目走 Python 路线,DearPyGui 已内置 imgui,`G:\imgui` 源码本项目不直接使用,
-可作为学习 ImGui 原生 C++ API 的参考保留。
