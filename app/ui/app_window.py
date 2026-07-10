@@ -697,7 +697,7 @@ def _render_results(df):
         with dpg.table_row(parent="result_table"):
             _sel = dpg.add_selectable(
                 label=code, span_columns=False, user_data=code,
-                callback=_on_code_click,   # 双击代码 → 跳K线页
+                callback=_on_result_click,   # 同页,单击即画K线
             )
             dpg.add_text(r["name"])
             dpg.add_text(imap.get(code, "-"))
@@ -1370,6 +1370,13 @@ def _on_code_click(sender, app_data, user_data):
     STATE["_last_click_ts"] = now
     if code == last_code and (now - last_ts) <= 0.40:
         STATE["_last_click_ts"] = 0.0   # 重置,避免三连击误判
+        _on_pick_code(code)
+
+
+def _on_result_click(sender, app_data, user_data):
+    """选股结果表专用:选股结果和K线本就在同一页,无需跳转,单击即画K线。"""
+    code = user_data
+    if code:
         _on_pick_code(code)
 
 
