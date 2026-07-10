@@ -1,0 +1,35 @@
+# ===== 运行时数据 / 产物(不入库) =====
+# 本地行情数据库(体积大,克隆后自行拉取)
+data_cache/
+# 生成的选股报告(HTML/Excel)
+reports/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+ENV/
+
+# ===== 调试 / 临时文件 =====
+_t.py
+_verify_*.py
+*.log
+*.tmp
+
+# ===== 编辑器 / 系统 =====
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

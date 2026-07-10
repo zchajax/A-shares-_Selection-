@@ -1,0 +1,4 @@
+dearpygui>=1.11
+pandas>=2.0
+akshare>=1.12
+numpy>=1.24
