@@ -428,6 +428,21 @@ def load_fundamental_map() -> dict:
     return out
 
 
+def get_fundamental(code: str) -> dict:
+    """返回单只股票的基本面 {pe_ttm,pb,ps_ttm,total_mv,roe,updated_at};无则 None。"""
+    with get_conn() as conn:
+        try:
+            r = conn.execute(
+                "SELECT pe_ttm,pb,ps_ttm,total_mv,roe,updated_at "
+                "FROM fundamental WHERE code=?", (code,)).fetchone()
+        except Exception:
+            return None
+    if not r:
+        return None
+    return {"pe_ttm": r[0], "pb": r[1], "ps_ttm": r[2],
+            "total_mv": r[3], "roe": r[4], "updated_at": r[5]}
+
+
 def codes_without_fundamental(codes: list = None) -> list:
     """返回还没有基本面数据的股票代码(用于增量补齐)。"""
     with get_conn() as conn:

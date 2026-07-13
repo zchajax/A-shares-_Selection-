@@ -4,6 +4,9 @@ data_cache/
 # 生成的选股报告(HTML/Excel)
 reports/
 
+# ===== 密钥配置(含 API Key,绝不入库;参考 config.example.json) =====
+config.json
+
 # ===== Python =====
 __pycache__/
 *.py[cod]

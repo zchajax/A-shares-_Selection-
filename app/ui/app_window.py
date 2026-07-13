@@ -28,6 +28,7 @@ from app.strategy import ranking
 from app.strategy import optimizer
 from app.strategy import funda
 from app.strategy.market import MarketTrend
+from app.ai import commentary as ai_commentary, is_configured as ai_configured, config_hint as ai_config_hint
 from app.strategy.base import ALL_STRATEGIES
 from app.report import exporter
 
@@ -1235,11 +1236,15 @@ def _draw_intraday(code, incremental=False):
             STATE["intraday_code"] = None
         return
 
-    # 昨收:用日线最后一根收盘价作参考(判断涨跌上色)
-    prev_close = None
-    kl = db.load_kline(code)
-    if kl is not None and not kl.empty:
-        prev_close = float(kl.iloc[-1]["close"])
+    # 昨收基准(判断涨跌上色 + 算涨跌幅):
+    # 优先用分时接口返回的"真昨收"(上一交易日最后一分钟收盘)——同源、
+    # 且必是真实上一交易日,不受本地日线是否已更新到最新影响。
+    # 仅在接口未给出时才回退本地日线最后一根收盘(可能过时,会导致涨跌幅算错)。
+    prev_close = df.attrs.get("prev_close")
+    if not prev_close:
+        kl = db.load_kline(code)
+        if kl is not None and not kl.empty:
+            prev_close = float(kl.iloc[-1]["close"])
 
     times = df["time"].tolist()
     xs = list(range(len(df)))
@@ -1580,6 +1585,48 @@ def show_kline(code, period=None):
     _set_status(f"已绘制 {label} 的{pname}图表")
 
 
+def on_ai_comment(sender=None, app_data=None, user_data=None):
+    """对当前 K 线标的生成 AI 技术面点评(后台线程,不阻塞界面)。
+
+    AI 仅把本地算好的指标翻译成人话+提示风险,不给买卖建议(见 app/ai)。
+    """
+    code = STATE.get("cur_code")
+    if not code:
+        dpg.set_value("ai_comment_text", "请先在左侧或搜索选中一只股票再点评。")
+        dpg.configure_item("ai_comment_win", show=True)
+        return
+    # 未配置模型:直接给引导,不发起请求
+    if not ai_configured():
+        dpg.set_value("ai_comment_text", ai_config_hint())
+        dpg.configure_item("ai_comment_disclaimer", show=False)
+        dpg.configure_item("ai_comment_win", show=True)
+        return
+
+    nm = db.name_of(code) or ""
+    dpg.configure_item("ai_comment_win", show=True)
+    dpg.configure_item("ai_comment_disclaimer", show=False)
+    dpg.set_value("ai_comment_text", f"正在为 {code} {nm} 生成 AI 点评,请稍候...")
+    dpg.configure_item("ai_comment_btn", enabled=False, label="点评中...")
+
+    def worker():
+        res = ai_commentary.comment_stock(code)
+        try:
+            if res.get("ok"):
+                f = res["facts"]
+                head = f"【{f['code']} {f['name']}】{f['industry']}\n"
+                dpg.set_value("ai_comment_text", head + res["text"])
+                dpg.set_value("ai_comment_disclaimer", res["disclaimer"])
+                dpg.configure_item("ai_comment_disclaimer", show=True)
+            else:
+                dpg.set_value("ai_comment_text", f"点评失败:\n{res.get('error', '未知错误')}")
+                dpg.configure_item("ai_comment_disclaimer", show=False)
+        finally:
+            if dpg.does_item_exist("ai_comment_btn"):
+                dpg.configure_item("ai_comment_btn", enabled=True, label="AI点评")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def _on_kline_hover(sender, app_data):
     """鼠标在K线主图移动:定位到最近的蜡烛,更新悬停提示(真实日期+OHLC)。"""
     bars = STATE.get("kl_bars")
@@ -1747,6 +1794,21 @@ def build_ui():
                                            callback=lambda: _switch_period("MIN"))
                             dpg.add_text("(分时自动每5秒刷新,仅拉当前这只)",
                                          color=(130, 130, 130))
+                            dpg.add_button(label="AI点评", width=68, height=26,
+                                           tag="ai_comment_btn",
+                                           callback=on_ai_comment)
+                        # AI 点评结果面板(默认隐藏,点评时展开)
+                        with dpg.child_window(tag="ai_comment_win", height=132,
+                                              border=True, show=False):
+                            with dpg.group(horizontal=True):
+                                dpg.add_text("AI 技术面点评", color=(160, 200, 255))
+                                dpg.add_button(label="关闭", width=48, height=22,
+                                               callback=lambda: dpg.configure_item(
+                                                   "ai_comment_win", show=False))
+                            dpg.add_text("", tag="ai_comment_text", wrap=820,
+                                         color=(230, 230, 230))
+                            dpg.add_text("", tag="ai_comment_disclaimer", wrap=820,
+                                         color=(150, 150, 150), show=False)
                         dpg.add_text("K线 / 成交额 / MACD", tag="kline_title")
                         dpg.add_child_window(tag="chart_area", border=False, height=-1)
 

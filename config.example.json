@@ -1,0 +1,8 @@
+{
+  "ai": {
+    "base_url": "https://tokenhub.tencentmaas.com/v1",
+    "api_key": "YOUR_API_KEY_HERE",
+    "model": "hy3",
+    "timeout": 40
+  }
+}

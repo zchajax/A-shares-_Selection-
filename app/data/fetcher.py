@@ -121,8 +121,21 @@ def fetch_intraday(code: str, period: str = "1") -> pd.DataFrame:
 
     df = raw.copy()
     df["day"] = pd.to_datetime(df["day"])
+    # 新浪分钟接口返回最近若干个交易日的分钟线。
+    # 真昨收 = 上一交易日最后一分钟的收盘价(比本地日线可靠:同源、
+    # 且必是真实的上一交易日,不受本地日线是否已更新到最新影响)。
+    all_days = sorted(df["day"].dt.date.unique())
+    last_day = all_days[-1]
+    prev_close = None
+    if len(all_days) >= 2:
+        prev_rows = df[df["day"].dt.date == all_days[-2]]
+        prev_rows = prev_rows[pd.to_numeric(prev_rows["close"], errors="coerce").notna()]
+        if not prev_rows.empty:
+            try:
+                prev_close = float(prev_rows.iloc[-1]["close"])
+            except Exception:  # noqa
+                prev_close = None
     # 只保留最后一个交易日(当天)的分钟
-    last_day = df["day"].dt.date.max()
     df = df[df["day"].dt.date == last_day].copy()
     if df.empty:
         return pd.DataFrame()
@@ -142,6 +155,7 @@ def fetch_intraday(code: str, period: str = "1") -> pd.DataFrame:
     keep = ["time", "price", "avg", "volume", "amount"]
     out = df[[c for c in keep if c in df.columns]].reset_index(drop=True)
     out.attrs["trade_date"] = str(last_day)
+    out.attrs["prev_close"] = prev_close  # 真昨收(上一交易日收盘);拿不到为 None
     return out
 
 
