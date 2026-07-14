@@ -395,10 +395,13 @@ def _baidu_latest(code: str, indicator: str):
 
 def _fetch_one_fundamental(code: str) -> dict:
     """
-    查单只股票的基本面/估值指标(百度估值 + 巨潮 ROE)。
+    查单只股票的基本面/估值 + 成长/质量指标(百度估值 + 巨潮财务指标)。
     这些接口【不可高并发】(会被限流),必须串行,每只约 1-2s。
-    返回 {pe_ttm, pb, ps_ttm, total_mv, roe},取不到的字段为 None。
+    返回 {pe_ttm, pb, ps_ttm, total_mv, roe, gross_margin, net_margin,
+          rev_yoy, profit_yoy, debt_ratio, dividend_ratio, report_date},
+    取不到的字段为 None。
       · total_mv 百度返回单位为亿元,直接沿用。
+      · 成长/质量字段来自巨潮同一张财务分析指标表,与 ROE 同源同一次调用。
     """
     d = {
         "pe_ttm": _baidu_latest(code, "市盈率(TTM)"),
@@ -406,17 +409,43 @@ def _fetch_one_fundamental(code: str) -> dict:
         "ps_ttm": _baidu_latest(code, "市销率(TTM)"),
         "total_mv": _baidu_latest(code, "总市值"),
         "roe": None,
+        "gross_margin": None, "net_margin": None,
+        "rev_yoy": None, "profit_yoy": None,
+        "debt_ratio": None, "dividend_ratio": None,
+        "report_date": None,
     }
-    # ROE:巨潮财务分析指标最新一期的"净资产收益率(%)"(非加权)
+    # 巨潮财务分析指标:最新一期同时取 ROE + 毛利率/净利率/营收增速/净利增速/
+    # 资产负债率/股息发放率(同一次调用,不额外增加请求)
     try:
         fin = _retry(lambda: ak.stock_financial_analysis_indicator(
             symbol=code, start_year="2023"), tries=2)
         if fin is not None and not fin.empty:
-            roe_cols = [c for c in fin.columns
-                        if "净资产收益率" in c and "加权" not in c]
-            if roe_cols:
-                val = fin.sort_values("日期").iloc[-1][roe_cols[0]]
-                d["roe"] = float(val) if pd.notna(val) else None
+            row = fin.sort_values("日期").iloc[-1]
+
+            def _pick(keys, exclude=None):
+                """按列名关键词取最新一期的值(容错列名差异)。"""
+                for col in fin.columns:
+                    if exclude and exclude in col:
+                        continue
+                    if all(k in col for k in keys):
+                        try:
+                            v = row[col]
+                            return float(v) if pd.notna(v) else None
+                        except Exception:
+                            return None
+                return None
+
+            d["roe"] = _pick(["净资产收益率"], exclude="加权")
+            d["gross_margin"] = _pick(["销售毛利率"])
+            d["net_margin"] = _pick(["销售净利率"])
+            d["rev_yoy"] = _pick(["主营业务收入增长率"])
+            d["profit_yoy"] = _pick(["净利润增长率"])
+            d["debt_ratio"] = _pick(["资产负债率"])
+            d["dividend_ratio"] = _pick(["股息发放率"])
+            try:
+                d["report_date"] = str(row["日期"])
+            except Exception:
+                pass
     except Exception:
         pass
     return d

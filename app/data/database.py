@@ -129,10 +129,26 @@ def init_db():
                 ps_ttm     REAL,           -- 市销率(TTM)
                 total_mv   REAL,           -- 总市值(亿元)
                 roe        REAL,           -- 净资产收益率(%)
+                gross_margin REAL,         -- 销售毛利率(%)
+                net_margin   REAL,         -- 销售净利率(%)
+                rev_yoy      REAL,         -- 主营业务收入增长率(%)
+                profit_yoy   REAL,         -- 净利润增长率(%)
+                debt_ratio   REAL,         -- 资产负债率(%)
+                dividend_ratio REAL,       -- 股息发放率(%)
+                report_date  TEXT,         -- 财务指标所属报告期(如 2025-03-31)
                 updated_at TEXT
             )
             """
         )
+        # 旧库兼容:早期 fundamental 只有估值5字段,缺成长/质量列时补上
+        _fund_cols = [r[1] for r in
+                      cur.execute("PRAGMA table_info(fundamental)").fetchall()]
+        for _c, _t in (("gross_margin", "REAL"), ("net_margin", "REAL"),
+                       ("rev_yoy", "REAL"), ("profit_yoy", "REAL"),
+                       ("debt_ratio", "REAL"), ("dividend_ratio", "REAL"),
+                       ("report_date", "TEXT")):
+            if _c not in _fund_cols:
+                cur.execute(f"ALTER TABLE fundamental ADD COLUMN {_c} {_t}")
         # 价格预警:对个股设置涨跌幅/价位阈值,盘中实时行情触发时高亮提示
         cur.execute(
             """
@@ -377,7 +393,9 @@ def load_watchlist() -> pd.DataFrame:
 # ==================== 基本面 / 估值 ====================
 def save_fundamental(rows: dict):
     """
-    批量写入基本面数据。rows: {code: {pe_ttm, pb, ps_ttm, total_mv, roe}}。
+    批量写入基本面数据。rows: {code: {pe_ttm, pb, ps_ttm, total_mv, roe,
+      gross_margin, net_margin, rev_yoy, profit_yoy, debt_ratio,
+      dividend_ratio, report_date}}。
     UPSERT:已存在则更新非空字段(None 不覆盖旧值)。
     """
     if not rows:
@@ -387,31 +405,46 @@ def save_fundamental(rows: dict):
         for code, d in rows.items():
             conn.execute(
                 """
-                INSERT INTO fundamental (code, pe_ttm, pb, ps_ttm, total_mv, roe, updated_at)
-                VALUES (?,?,?,?,?,?,?)
+                INSERT INTO fundamental
+                    (code, pe_ttm, pb, ps_ttm, total_mv, roe,
+                     gross_margin, net_margin, rev_yoy, profit_yoy,
+                     debt_ratio, dividend_ratio, report_date, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(code) DO UPDATE SET
                     pe_ttm   = COALESCE(excluded.pe_ttm,   fundamental.pe_ttm),
                     pb       = COALESCE(excluded.pb,       fundamental.pb),
                     ps_ttm   = COALESCE(excluded.ps_ttm,   fundamental.ps_ttm),
                     total_mv = COALESCE(excluded.total_mv, fundamental.total_mv),
                     roe      = COALESCE(excluded.roe,       fundamental.roe),
+                    gross_margin   = COALESCE(excluded.gross_margin,   fundamental.gross_margin),
+                    net_margin     = COALESCE(excluded.net_margin,     fundamental.net_margin),
+                    rev_yoy        = COALESCE(excluded.rev_yoy,        fundamental.rev_yoy),
+                    profit_yoy     = COALESCE(excluded.profit_yoy,     fundamental.profit_yoy),
+                    debt_ratio     = COALESCE(excluded.debt_ratio,     fundamental.debt_ratio),
+                    dividend_ratio = COALESCE(excluded.dividend_ratio, fundamental.dividend_ratio),
+                    report_date    = COALESCE(excluded.report_date,    fundamental.report_date),
                     updated_at = excluded.updated_at
                 """,
                 (code, d.get("pe_ttm"), d.get("pb"), d.get("ps_ttm"),
-                 d.get("total_mv"), d.get("roe"), now),
+                 d.get("total_mv"), d.get("roe"),
+                 d.get("gross_margin"), d.get("net_margin"),
+                 d.get("rev_yoy"), d.get("profit_yoy"),
+                 d.get("debt_ratio"), d.get("dividend_ratio"),
+                 d.get("report_date"), now),
             )
 
 
 def load_fundamental() -> pd.DataFrame:
-    """读取全部基本面数据。"""
+    """读取全部基本面数据(含成长/质量字段)。"""
+    _cols = ["code", "pe_ttm", "pb", "ps_ttm", "total_mv", "roe",
+             "gross_margin", "net_margin", "rev_yoy", "profit_yoy",
+             "debt_ratio", "dividend_ratio", "report_date", "updated_at"]
     with get_conn() as conn:
         try:
             return pd.read_sql(
-                "SELECT code,pe_ttm,pb,ps_ttm,total_mv,roe,updated_at "
-                "FROM fundamental", conn)
+                "SELECT " + ",".join(_cols) + " FROM fundamental", conn)
         except Exception:
-            return pd.DataFrame(
-                columns=["code", "pe_ttm", "pb", "ps_ttm", "total_mv", "roe", "updated_at"])
+            return pd.DataFrame(columns=_cols)
 
 
 def load_fundamental_map() -> dict:
@@ -428,19 +461,64 @@ def load_fundamental_map() -> dict:
     return out
 
 
+def industry_valuation_percentile(code: str, metric: str = "pe_ttm") -> dict:
+    """计算某股某估值指标在其所属行业内的分位(0-100,越高越贵)。
+
+    仅用本地已缓存的 fundamental + 行业映射;同行业有效样本 < 5 时返回 None
+    (样本太少分位无意义)。返回 {percentile, industry, peers, value} 或 None。
+    """
+    fmap = load_fundamental_map()
+    if code not in fmap or fmap[code].get(metric) is None:
+        return None
+    try:
+        val = float(fmap[code][metric])
+    except Exception:
+        return None
+    if val <= 0:  # PE/PB 为负无比较意义
+        return None
+    try:
+        ind_map = load_industry_map()
+    except Exception:
+        return None
+    my_ind = ind_map.get(code)
+    if not my_ind:
+        return None
+    peers = []
+    for c, ind in ind_map.items():
+        if ind != my_ind or c == code:
+            continue
+        v = fmap.get(c, {}).get(metric)
+        try:
+            v = float(v)
+        except Exception:
+            continue
+        if v > 0:
+            peers.append(v)
+    if len(peers) < 5:  # 同行业有效样本太少,分位无意义
+        return None
+    below = sum(1 for v in peers if v < val)
+    pct = below / len(peers) * 100
+    return {"percentile": pct, "industry": my_ind,
+            "peers": len(peers), "value": val}
+
+
 def get_fundamental(code: str) -> dict:
-    """返回单只股票的基本面 {pe_ttm,pb,ps_ttm,total_mv,roe,updated_at};无则 None。"""
+    """返回单只股票的基本面(含成长/质量字段);无则 None。"""
     with get_conn() as conn:
         try:
             r = conn.execute(
-                "SELECT pe_ttm,pb,ps_ttm,total_mv,roe,updated_at "
+                "SELECT pe_ttm,pb,ps_ttm,total_mv,roe,gross_margin,net_margin,"
+                "rev_yoy,profit_yoy,debt_ratio,dividend_ratio,report_date,updated_at "
                 "FROM fundamental WHERE code=?", (code,)).fetchone()
         except Exception:
             return None
     if not r:
         return None
     return {"pe_ttm": r[0], "pb": r[1], "ps_ttm": r[2],
-            "total_mv": r[3], "roe": r[4], "updated_at": r[5]}
+            "total_mv": r[3], "roe": r[4], "gross_margin": r[5],
+            "net_margin": r[6], "rev_yoy": r[7], "profit_yoy": r[8],
+            "debt_ratio": r[9], "dividend_ratio": r[10],
+            "report_date": r[11], "updated_at": r[12]}
 
 
 def codes_without_fundamental(codes: list = None) -> list:

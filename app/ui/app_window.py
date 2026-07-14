@@ -29,6 +29,7 @@ from app.strategy import optimizer
 from app.strategy import funda
 from app.strategy.market import MarketTrend
 from app.ai import commentary as ai_commentary, is_configured as ai_configured, config_hint as ai_config_hint
+from app.ai import ranker as ai_ranker
 from app.strategy.base import ALL_STRATEGIES
 from app.report import exporter
 
@@ -71,6 +72,7 @@ STATE = {
     "kl_bars": None,            # 当前主图K线数据(用于鼠标悬停提示): list[dict]
     "_last_click_code": None,   # 上次点击的代码(双击判定)
     "_last_click_ts": 0.0,      # 上次点击时间戳(双击判定)
+    "ai_hint": None,            # 当前标的的策略上下文(AI点评 strategy_hint)
 }
 
 # 分时轮询间隔(秒):免费源限流,只盯 1 只,5 秒够用
@@ -692,12 +694,22 @@ def _render_results(df):
         except Exception:
             return "-"
 
+    # 当前策略名(作为 AI 点评的上下文备注)
+    try:
+        _strat_name = (type(STATE["current_strategy"]).name
+                       if STATE.get("current_strategy") else "")
+    except Exception:  # noqa
+        _strat_name = ""
+
     for _, r in df.iterrows():
         code = r["code"]
         fd = fmap.get(code, {})
+        _hint = (f"被『{_strat_name}』策略选中,得分{r['score']},"
+                 f"命中理由:{r['reason']}") if _strat_name else \
+                f"被量化策略选中,得分{r['score']},命中理由:{r['reason']}"
         with dpg.table_row(parent="result_table"):
             _sel = dpg.add_selectable(
-                label=code, span_columns=False, user_data=code,
+                label=code, span_columns=False, user_data=(code, _hint),
                 callback=_on_result_click,   # 同页,单击即画K线
             )
             dpg.add_text(r["name"])
@@ -722,6 +734,105 @@ def _add_watch_from(u):
     db.add_watch(code, name, buy_price=close, note=note[:40])
     _set_status(f"已加入自选: {code} {name} @ {close}")
     _refresh_watchlist()
+
+
+# ---------- AI 精排(路径B:对选股结果做二次优选排序) ----------
+def _rating_color(rating):
+    """评级 → 颜色(A股惯例:偏多=红, 偏空=绿, 中性=灰)。"""
+    if rating == "偏多":
+        return RED
+    if rating == "偏空":
+        return GREEN
+    return (170, 170, 170)
+
+
+def _risk_color(risk):
+    """风险等级 → 颜色(高=红醒目, 中=橙, 低=绿)。"""
+    if risk == "高":
+        return (230, 80, 80)
+    if risk == "中":
+        return (230, 170, 60)
+    if risk == "低":
+        return (120, 190, 120)
+    return (170, 170, 170)
+
+
+def on_ai_rank(sender=None, app_data=None, user_data=None):
+    """对当前选股结果做 AI 精排优选(后台线程,不阻塞界面)。
+
+    量化引擎已选出候选,这里让 AI 在候选内横向比较、排出 Top10 并给理由/评级。
+    AI 只在给定候选集合内排序,不产出新代码(见 app/ai/ranker)。
+    """
+    res = STATE.get("results")
+    if res is None or getattr(res, "empty", True):
+        dpg.set_value("ai_rank_hint", "请先执行选股,有结果后再精排")
+        return
+    if not ai_configured():
+        dpg.configure_item("ai_rank_win", show=True)
+        dpg.set_value("ai_rank_disclaimer", ai_config_hint())
+        dpg.delete_item("ai_rank_table", children_only=True)
+        for col in ["#", "代码", "名称", "行业", "评级", "风险", "入选理由"]:
+            dpg.add_table_column(label=col, parent="ai_rank_table")
+        return
+
+    codes = list(res["code"])[:ai_ranker.MAX_CANDIDATES]
+    try:
+        strat_name = (type(STATE["current_strategy"]).name
+                      if STATE.get("current_strategy") else "")
+    except Exception:  # noqa
+        strat_name = ""
+    hint = (f"由『{strat_name}』策略从全市场选出的候选,已按综合得分排序"
+            if strat_name else "由量化策略从全市场选出的候选")
+
+    dpg.configure_item("ai_rank_win", show=True)
+    dpg.set_value("ai_rank_hint", "")
+    dpg.set_value("ai_rank_disclaimer", "")
+    dpg.set_value("ai_rank_status", f"正在精排 {len(codes)} 只候选,请稍候...")
+    dpg.configure_item("ai_rank_btn", enabled=False, label="精排中...")
+
+    def worker():
+        try:
+            def pcb(d, t):
+                if dpg.does_item_exist("ai_rank_status"):
+                    dpg.set_value("ai_rank_status", f"收集事实 {d}/{t}...")
+            r = ai_ranker.rank_stocks(codes, top_n=10, strategy_hint=hint,
+                                      progress_cb=pcb)
+            dpg.delete_item("ai_rank_table", children_only=True)
+            for col in ["#", "代码", "名称", "行业", "评级", "风险", "入选理由"]:
+                dpg.add_table_column(label=col, parent="ai_rank_table")
+            if not r.get("ok"):
+                dpg.set_value("ai_rank_status", "")
+                dpg.set_value("ai_rank_disclaimer",
+                              f"精排失败: {r.get('error', '未知错误')}")
+                return
+            for i, it in enumerate(r["ranking"], 1):
+                with dpg.table_row(parent="ai_rank_table"):
+                    dpg.add_text(str(i))
+                    code = it["code"]
+                    dpg.add_selectable(label=code, span_columns=False,
+                                       user_data=code,
+                                       callback=lambda s, a, u: _on_pick_code(u))
+                    dpg.add_text(it.get("name", ""))
+                    dpg.add_text(it.get("industry", ""))
+                    dpg.add_text(it.get("rating") or "-",
+                                 color=_rating_color(it.get("rating")))
+                    dpg.add_text(it.get("risk") or "-",
+                                 color=_risk_color(it.get("risk")))
+                    dpg.add_text(it.get("reason") or "")
+            tag = "(解析降级:暂按量化得分序)" if r.get("degraded") else ""
+            dpg.set_value("ai_rank_status",
+                          f"完成,共 {r.get('n_candidates', 0)} 只候选 {tag}")
+            dpg.set_value("ai_rank_disclaimer", r.get("disclaimer", ""))
+        except Exception as e:  # noqa
+            dpg.set_value("ai_rank_status", "")
+            dpg.set_value("ai_rank_disclaimer", f"精排异常: {e}")
+        finally:
+            if dpg.does_item_exist("ai_rank_btn"):
+                dpg.configure_item("ai_rank_btn", enabled=True,
+                                   label="AI精排Top10")
+
+    threading.Thread(target=worker, daemon=True).start()
+
 
 
 def _add_watch_code(code, note="搜索添加"):
@@ -1347,10 +1458,15 @@ def _stop_poll():
         _set_status("已停止分时轮询")
 
 
-def _on_pick_code(code):
-    """点结果/榜单/自选表里的代码:跳到「选股 & K线」页并画K线;切换标的时停旧轮询、回到日线。"""
+def _on_pick_code(code, hint=None):
+    """点结果/榜单/自选表里的代码:跳到「选股 & K线」页并画K线;切换标的时停旧轮询、回到日线。
+
+    hint: 可选的策略上下文(如"多因子策略命中,得分85,理由:..."),记入 STATE
+          供 AI 点评作为 strategy_hint;换标的时无 hint 则清空,避免张冠李戴。
+    """
     _stop_poll()
     STATE["intraday_code"] = None   # 换标的:分时图需完整重建
+    STATE["ai_hint"] = hint          # 策略上下文(仅本次选中的标的有效)
     show_kline(code, "D")           # 先画好K线
     # 再切到「选股 & K线」tab(用 int id 最稳,别名字符串在部分DPG版本 set_value 不接受)
     try:
@@ -1379,10 +1495,16 @@ def _on_code_click(sender, app_data, user_data):
 
 
 def _on_result_click(sender, app_data, user_data):
-    """选股结果表专用:选股结果和K线本就在同一页,无需跳转,单击即画K线。"""
-    code = user_data
+    """选股结果表专用:选股结果和K线本就在同一页,无需跳转,单击即画K线。
+    user_data=(code, hint):hint 为该股命中的策略上下文,带给 AI 点评。"""
+    if not user_data:
+        return
+    if isinstance(user_data, (tuple, list)):
+        code, hint = (user_data + (None,))[:2]
+    else:
+        code, hint = user_data, None
     if code:
-        _on_pick_code(code)
+        _on_pick_code(code, hint=hint)
 
 
 def _bind_code_dbl(item):
@@ -1436,6 +1558,80 @@ def on_search_kline(sender=None, app_data=None, user_data=None):
                            callback=lambda s, a, u: _add_watch_code(u, "搜索添加"))
 
 
+def _fmt_num(x, nd=2, suffix=""):
+    """格式化数字;None/异常返回 '-'。"""
+    try:
+        if x is None:
+            return "-"
+        return f"{float(x):.{nd}f}{suffix}"
+    except Exception:  # noqa
+        return "-"
+
+
+def _compose_kline_info(code):
+    """把基本面 dict 拼成一行紧凑信息文本(供 K 线上方信息栏显示)。"""
+    f = ai_commentary.get_fundamental_ondemand(code)
+    if f.get("_source") == "none" and all(
+            f.get(k) is None for k in ("pe_ttm", "pb", "roe", "total_mv")):
+        return None   # 完全没取到,交由调用方决定提示
+    # 行业估值分位(样本足够才有)
+    pe_pct = db.industry_valuation_percentile(code, "pe_ttm")
+    parts = [
+        f"PE {_fmt_num(f.get('pe_ttm'))}",
+        f"PB {_fmt_num(f.get('pb'))}",
+        f"ROE {_fmt_num(f.get('roe'), 2, '%')}",
+        f"市值 {_fmt_num(f.get('total_mv'), 1)}亿",
+    ]
+    if f.get("gross_margin") is not None:
+        parts.append(f"毛利率 {_fmt_num(f.get('gross_margin'), 2, '%')}")
+    if f.get("net_margin") is not None:
+        parts.append(f"净利率 {_fmt_num(f.get('net_margin'), 2, '%')}")
+    if f.get("rev_yoy") is not None:
+        parts.append(f"营收同比 {_fmt_num(f.get('rev_yoy'), 2, '%')}")
+    if f.get("profit_yoy") is not None:
+        parts.append(f"净利同比 {_fmt_num(f.get('profit_yoy'), 2, '%')}")
+    if f.get("debt_ratio") is not None:
+        parts.append(f"负债率 {_fmt_num(f.get('debt_ratio'), 2, '%')}")
+    line = "   ".join(parts)
+    if pe_pct:
+        line += f"   |  PE高于{db.load_industry_map().get(code, '同行业')}约{pe_pct['percentile']:.0f}%的公司"
+    if f.get("report_date"):
+        line += f"   (财报期 {f['report_date']})"
+    return line
+
+
+def _update_kline_info(code):
+    """更新 K 线上方基本面信息栏。本地有秒显示,缺失则后台拉取回填,不卡界面。"""
+    if not dpg.does_item_exist("kline_info"):
+        return
+    # ETF 无个股基本面,直接隐藏信息栏
+    try:
+        if code in db.load_etf_codes():
+            dpg.set_value("kline_info", "")
+            return
+    except Exception:  # noqa
+        pass
+    row = db.get_fundamental(code)
+    has_local = row and any(
+        row.get(k) is not None
+        for k in ("pe_ttm", "pb", "roe", "total_mv", "gross_margin", "rev_yoy"))
+    if has_local:
+        # 本地已有,直接同步显示
+        line = _compose_kline_info(code)
+        dpg.set_value("kline_info", line or "")
+        return
+    # 本地缺失:先占位,后台现拉再回填(只回填仍在看这只票时)
+    dpg.set_value("kline_info", "基本面加载中...")
+
+    def worker(target):
+        line = _compose_kline_info(target)
+        # 用户可能已切换到别的票,回填前校验当前仍是这只
+        if STATE.get("cur_code") == target and dpg.does_item_exist("kline_info"):
+            dpg.set_value("kline_info", line or "该标的暂无基本面数据")
+
+    threading.Thread(target=worker, args=(code,), daemon=True).start()
+
+
 def show_kline(code, period=None):
     """
     绘制该标的图表。period: D/W/M 画蜡烛图(K线+成交额+MACD),MIN 画当日分时曲线。
@@ -1448,6 +1644,8 @@ def show_kline(code, period=None):
     STATE["cur_period"] = period
     # 高亮当前周期按钮
     _sync_period_buttons(period)
+    # 更新 K 线上方基本面信息栏(本地有秒显,缺失后台拉取回填)
+    _update_kline_info(code)
 
     if period == "MIN":
         _draw_intraday(code)
@@ -1585,10 +1783,11 @@ def show_kline(code, period=None):
     _set_status(f"已绘制 {label} 的{pname}图表")
 
 
-def on_ai_comment(sender=None, app_data=None, user_data=None):
-    """对当前 K 线标的生成 AI 技术面点评(后台线程,不阻塞界面)。
+def on_ai_comment(sender=None, app_data=None, user_data=None, force=False):
+    """对当前 K 线标的生成 AI 综合点评(后台线程,不阻塞界面)。
 
-    AI 仅把本地算好的指标翻译成人话+提示风险,不给买卖建议(见 app/ai)。
+    AI 把系统算好/实时拉取的技术面+基本面指标翻译成人话+提示风险+结构化评级,
+    不给买卖建议(见 app/ai)。force=True 时跳过当天缓存强制重新生成。
     """
     code = STATE.get("cur_code")
     if not code:
@@ -1603,13 +1802,24 @@ def on_ai_comment(sender=None, app_data=None, user_data=None):
         return
 
     nm = db.name_of(code) or ""
+    hint = STATE.get("ai_hint") or ""
     dpg.configure_item("ai_comment_win", show=True)
     dpg.configure_item("ai_comment_disclaimer", show=False)
-    dpg.set_value("ai_comment_text", f"正在为 {code} {nm} 生成 AI 点评,请稍候...")
+    for _b in ("ai_rating_badge", "ai_risk_badge", "ai_cache_badge"):
+        if dpg.does_item_exist(_b):
+            dpg.configure_item(_b, show=False)
+    tip = "重新生成中..." if force else "生成 AI 点评,请稍候..."
+    dpg.set_value("ai_comment_text", f"正在为 {code} {nm} {tip}")
     dpg.configure_item("ai_comment_btn", enabled=False, label="点评中...")
 
+    def _badge(tag, text, color):
+        if dpg.does_item_exist(tag):
+            dpg.set_value(tag, text)
+            dpg.configure_item(tag, color=color, show=True)
+
     def worker():
-        res = ai_commentary.comment_stock(code)
+        res = ai_commentary.comment_stock(code, strategy_hint=hint,
+                                          force_refresh=force)
         try:
             if res.get("ok"):
                 f = res["facts"]
@@ -1617,6 +1827,24 @@ def on_ai_comment(sender=None, app_data=None, user_data=None):
                 dpg.set_value("ai_comment_text", head + res["text"])
                 dpg.set_value("ai_comment_disclaimer", res["disclaimer"])
                 dpg.configure_item("ai_comment_disclaimer", show=True)
+                # 结构化评级彩色标签(A股惯例:偏多=红,偏空=绿)
+                rating = res.get("rating")
+                if rating == "偏多":
+                    _badge("ai_rating_badge", "  评级:偏多", (230, 60, 60))
+                elif rating == "偏空":
+                    _badge("ai_rating_badge", "  评级:偏空", (40, 170, 80))
+                elif rating == "中性":
+                    _badge("ai_rating_badge", "  评级:中性", (200, 180, 90))
+                risk = res.get("risk")
+                if risk == "高":
+                    _badge("ai_risk_badge", "  风险:高", (230, 60, 60))
+                elif risk == "中":
+                    _badge("ai_risk_badge", "  风险:中", (220, 160, 60))
+                elif risk == "低":
+                    _badge("ai_risk_badge", "  风险:低", (120, 180, 120))
+                if res.get("cached"):
+                    _badge("ai_cache_badge", "  (当日缓存,点刷新重生成)",
+                           (130, 130, 130))
             else:
                 dpg.set_value("ai_comment_text", f"点评失败:\n{res.get('error', '未知错误')}")
                 dpg.configure_item("ai_comment_disclaimer", show=False)
@@ -1753,13 +1981,36 @@ def build_ui():
                 with dpg.tab_bar(tag="main_tabs"):
                     # --- Tab 1: 选股 & K线 ---
                     with dpg.tab(label="选股 & K线", tag="tab_kline"):
-                        dpg.add_text("选股结果(点代码看K线,点+自选加入持仓跟踪)")
+                        with dpg.group(horizontal=True):
+                            dpg.add_text("选股结果(点代码看K线,点+自选加入持仓跟踪)")
+                            dpg.add_button(label="AI精排Top10", width=110, height=24,
+                                           tag="ai_rank_btn", callback=on_ai_rank)
+                            dpg.add_text("", tag="ai_rank_hint", color=(130, 130, 130))
                         with dpg.table(tag="result_table", header_row=True,
                                        resizable=True, policy=dpg.mvTable_SizingStretchProp,
                                        height=210, scrollY=True):
                             for col in ["代码", "名称", "行业", "现价", "PE", "PB",
                                         "ROE%", "市值亿", "得分", "说明", "操作"]:
                                 dpg.add_table_column(label=col)
+                        # --- AI 精排结果面板(默认隐藏,精排后展开) ---
+                        with dpg.child_window(tag="ai_rank_win", height=228,
+                                              border=True, show=False):
+                            with dpg.group(horizontal=True):
+                                dpg.add_text("AI 精排优选", color=(160, 200, 255))
+                                dpg.add_text("", tag="ai_rank_status",
+                                             color=(150, 150, 150))
+                                dpg.add_button(label="关闭", width=48, height=22,
+                                               callback=lambda: dpg.configure_item(
+                                                   "ai_rank_win", show=False))
+                            with dpg.table(tag="ai_rank_table", header_row=True,
+                                           resizable=True,
+                                           policy=dpg.mvTable_SizingStretchProp,
+                                           height=150, scrollY=True):
+                                for col in ["#", "代码", "名称", "行业",
+                                            "评级", "风险", "入选理由"]:
+                                    dpg.add_table_column(label=col)
+                            dpg.add_text("", tag="ai_rank_disclaimer",
+                                         wrap=820, color=(150, 150, 150))
                         dpg.add_separator()
                         # --- 搜索:在本地已拉取的股票/ETF 中模糊搜索(代码或名称) ---
                         with dpg.group(horizontal=True):
@@ -1798,10 +2049,19 @@ def build_ui():
                                            tag="ai_comment_btn",
                                            callback=on_ai_comment)
                         # AI 点评结果面板(默认隐藏,点评时展开)
-                        with dpg.child_window(tag="ai_comment_win", height=132,
+                        with dpg.child_window(tag="ai_comment_win", height=170,
                                               border=True, show=False):
                             with dpg.group(horizontal=True):
-                                dpg.add_text("AI 技术面点评", color=(160, 200, 255))
+                                dpg.add_text("AI 综合点评", color=(160, 200, 255))
+                                # 结构化评级彩色标签(点评后填充)
+                                dpg.add_text("", tag="ai_rating_badge", show=False)
+                                dpg.add_text("", tag="ai_risk_badge", show=False)
+                                dpg.add_text("", tag="ai_cache_badge",
+                                             color=(130, 130, 130), show=False)
+                                dpg.add_button(label="刷新", width=48, height=22,
+                                               tag="ai_refresh_btn",
+                                               callback=lambda: on_ai_comment(
+                                                   force=True))
                                 dpg.add_button(label="关闭", width=48, height=22,
                                                callback=lambda: dpg.configure_item(
                                                    "ai_comment_win", show=False))
@@ -1810,6 +2070,9 @@ def build_ui():
                             dpg.add_text("", tag="ai_comment_disclaimer", wrap=820,
                                          color=(150, 150, 150), show=False)
                         dpg.add_text("K线 / 成交额 / MACD", tag="kline_title")
+                        # 基本面信息栏(PE/PB/ROE/市值/成长性),紧贴图上方常驻显示
+                        dpg.add_text("", tag="kline_info", wrap=1050,
+                                     color=(200, 210, 225))
                         dpg.add_child_window(tag="chart_area", border=False, height=-1)
 
                     # --- Tab 2: 今日推荐 ---

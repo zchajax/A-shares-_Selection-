@@ -20,6 +20,7 @@
 
 import json
 import os
+import time
 import urllib.request
 import urllib.error
 
@@ -64,11 +65,14 @@ class AIError(Exception):
     """AI 调用相关异常(配置缺失、网络、接口错误统一抛出)。"""
 
 
-def chat(messages, temperature=0.4, max_tokens=600) -> str:
+def chat(messages, temperature=0.2, max_tokens=700, retries=2) -> str:
     """
     调用 OpenAI 兼容的 /chat/completions,返回第一条回复的文本内容。
 
     messages: [{"role": "system"/"user"/"assistant", "content": "..."}]
+    - temperature 默认 0.2:金融点评需稳定复现,低温更可靠。
+    - retries: 网络/5xx 错误时的额外重试次数(指数退避)。4xx(鉴权/参数)
+      不重试直接抛出,避免无谓等待。
     仅用标准库 urllib,无需安装 openai SDK。异常统一抛 AIError。
     """
     c = _load_config()
@@ -87,31 +91,42 @@ def chat(messages, temperature=0.4, max_tokens=600) -> str:
         "stream": False,
     }
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {c['api_key']}",
-        },
-    )
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:  # noqa
-        detail = ""
+    last_err = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(
+            url, data=data, method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {c['api_key']}",
+            },
+        )
         try:
-            detail = e.read().decode("utf-8")[:300]
-        except Exception:  # noqa
-            pass
-        raise AIError(f"接口返回错误 HTTP {e.code}: {detail or e.reason}")
-    except urllib.error.URLError as e:  # noqa
-        raise AIError(f"网络连接失败: {getattr(e, 'reason', e)}")
-    except Exception as e:  # noqa
-        raise AIError(f"调用异常: {e}")
-
-    try:
-        obj = json.loads(body)
-        return obj["choices"][0]["message"]["content"].strip()
-    except Exception as e:  # noqa
-        raise AIError(f"解析响应失败: {e}; 原文前200字: {body[:200]}")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8")
+            try:
+                obj = json.loads(body)
+                return obj["choices"][0]["message"]["content"].strip()
+            except Exception as e:  # noqa
+                raise AIError(f"解析响应失败: {e}; 原文前200字: {body[:200]}")
+        except urllib.error.HTTPError as e:  # noqa
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8")[:300]
+            except Exception:  # noqa
+                pass
+            # 4xx(鉴权/参数错误)重试无意义,直接抛;5xx 才重试
+            if e.code < 500 or attempt >= retries:
+                raise AIError(f"接口返回错误 HTTP {e.code}: {detail or e.reason}")
+            last_err = f"HTTP {e.code}: {detail or e.reason}"
+        except urllib.error.URLError as e:  # noqa
+            last_err = f"网络连接失败: {getattr(e, 'reason', e)}"
+            if attempt >= retries:
+                raise AIError(last_err)
+        except Exception as e:  # noqa
+            last_err = f"调用异常: {e}"
+            if attempt >= retries:
+                raise AIError(last_err)
+        # 指数退避后重试
+        time.sleep(1.2 * (attempt + 1))
+    raise AIError(last_err or "AI 调用失败")
