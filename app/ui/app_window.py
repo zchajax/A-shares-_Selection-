@@ -27,9 +27,11 @@ from app.strategy import backtest as bt
 from app.strategy import ranking
 from app.strategy import optimizer
 from app.strategy import funda
+from app.strategy import chip
 from app.strategy.market import MarketTrend
 from app.ai import commentary as ai_commentary, is_configured as ai_configured, config_hint as ai_config_hint
 from app.ai import ranker as ai_ranker
+from app.ai import nl_query as ai_nl
 from app.strategy.base import ALL_STRATEGIES
 from app.report import exporter
 
@@ -73,7 +75,14 @@ STATE = {
     "_last_click_code": None,   # 上次点击的代码(双击判定)
     "_last_click_ts": 0.0,      # 上次点击时间戳(双击判定)
     "ai_hint": None,            # 当前标的的策略上下文(AI点评 strategy_hint)
+    "cs_weights": None,         # L1横截面因子权重 dict(选中横截面策略时用)
+    "cs_neutralize": True,      # L1横截面 行业中性化开关
 }
+
+# L1 横截面多因子(智能版)在策略下拉框里的特殊 key。它不走逐股 evaluate,
+# 而是独立的全市场横截面打分路径(见 app/strategy/cross_section),故用 sentinel 区分。
+CROSS_SECTION_KEY = "__cross_section__"
+CROSS_SECTION_LABEL = "★ 横截面多因子(智能版)"
 
 # 分时轮询间隔(秒):免费源限流,只盯 1 只,5 秒够用
 POLL_INTERVAL = 5
@@ -107,6 +116,10 @@ def _make_bar_themes():
 # ---------- 业务回调 ----------
 def on_strategy_change(sender, app_data):
     """切换策略时,重建参数控件区。"""
+    # L1 横截面多因子(智能版):独立范式,渲染因子权重面板而非普通策略参数
+    if app_data == CROSS_SECTION_LABEL:
+        _render_cross_section_params()
+        return
     key = STRATEGY_LABEL2KEY[app_data]
     cls = ALL_STRATEGIES[key]
     STATE["current_strategy"] = cls()
@@ -121,6 +134,148 @@ def on_strategy_change(sender, app_data):
             callback=lambda s, a, u: STATE["current_strategy"].set_param(u, a),
             user_data=p.key,
         )
+
+
+def _cs_weights_path():
+    """横截面权重持久化文件路径(与数据库同目录)。"""
+    import os
+    from app.data import database as db
+    return os.path.join(os.path.dirname(db.DB_PATH), "cs_weights.json")
+
+
+def _load_saved_cs_weights():
+    """读取上次保存的横截面权重+中性化开关;无则返回 None。"""
+    import os, json
+    path = _cs_weights_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_cs_weights(weights, neutralize):
+    """把当前横截面权重+中性化开关落盘,下次打开自动恢复。"""
+    import json
+    try:
+        with open(_cs_weights_path(), "w", encoding="utf-8") as f:
+            json.dump({"weights": {k: float(v) for k, v in weights.items()},
+                       "neutralize": bool(neutralize)},
+                      f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def _render_cross_section_params():
+    """渲染 L1 横截面多因子(智能版)的因子权重面板 + 行业中性化开关。"""
+    from app.strategy import cross_section as cs
+    # 标记当前为横截面模式(current_strategy 置 None,执行时走独立路径)
+    STATE["current_strategy"] = None
+    # 优先恢复上次保存的权重,没有才用默认(解决"关闭后权重还原"问题)
+    _saved = _load_saved_cs_weights()
+    if _saved and isinstance(_saved.get("weights"), dict):
+        STATE["cs_weights"] = dict(cs.DEFAULT_WEIGHTS)
+        STATE["cs_weights"].update({k: float(v) for k, v in _saved["weights"].items()
+                                    if k in cs.DEFAULT_WEIGHTS})
+        STATE["cs_neutralize"] = bool(_saved.get("neutralize", True))
+    else:
+        STATE["cs_weights"] = dict(cs.DEFAULT_WEIGHTS)
+        STATE["cs_neutralize"] = True
+    dpg.delete_item("param_area", children_only=True)
+    dpg.add_text("全市场横截面打分:每个因子做z-score标准化+行业中性化,"
+                 "问『这只票在全市场/同行业里排第几』,而非用绝对阈值卡线。",
+                 parent="param_area", wrap=280, color=(150, 150, 150))
+    dpg.add_text("因子权重(0=关闭该因子):", parent="param_area",
+                 color=(180, 180, 120))
+    _cs_labels = {"momentum": "动量(近20日涨幅)", "trend": "趋势(均线发散度)",
+                  "volume": "量能(放量倍数)", "value": "低估(盈利收益率1/PE)",
+                  "quality": "质量(ROE)"}
+    for fk, flabel in _cs_labels.items():
+        dpg.add_slider_float(
+            label=flabel, parent="param_area",
+            default_value=float(STATE["cs_weights"].get(fk, cs.DEFAULT_WEIGHTS[fk])),
+            min_value=-100, max_value=100,
+            format="%.0f", width=170, tag=f"cs_w_{fk}",
+            callback=lambda s, a, u: STATE["cs_weights"].update({u: a}),
+            user_data=fk,
+        )
+    dpg.add_text("权重可为负:正=顺势用(越大越好),负=反向用(越小越好),0=关闭。",
+                 parent="param_area", wrap=280, color=(130, 130, 130))
+    dpg.add_checkbox(label="行业中性化(在同行业内排名,消除行业偏差)",
+                     parent="param_area",
+                     default_value=bool(STATE.get("cs_neutralize", True)),
+                     tag="cs_neutralize",
+                     callback=lambda s, a: STATE.update({"cs_neutralize": a}))
+    dpg.add_text("提示:开启中性化 → 选各行业内最强(分散);关闭 → 可能被强势板块霸屏。",
+                 parent="param_area", wrap=280, color=(130, 130, 130))
+    # 权重持久化:保存当前权重 / 恢复出厂默认(解决关闭软件后权重还原)
+    dpg.add_separator(parent="param_area")
+    with dpg.group(horizontal=True, parent="param_area"):
+        dpg.add_button(label="保存当前权重", width=122, height=26,
+                       callback=on_save_cs_weights)
+        dpg.add_button(label="恢复默认权重", width=122, height=26,
+                       callback=on_reset_cs_weights)
+    dpg.add_text("权重会自动记住:回填或手动保存后,下次开软件仍是这套权重。",
+                 parent="param_area", wrap=280, color=(130, 130, 130))
+    # L3 自适应权重入口:用历史 IC 反推"数据说了算"的权重,一键回填上面滑块
+    dpg.add_separator(parent="param_area")
+    dpg.add_button(label="✦ 用数据推荐权重 (L3 自适应)", parent="param_area",
+                   width=250, height=30, callback=on_open_adaptive_weights)
+    dpg.add_text("L3:跑历史 IC 反推技术因子权重(可能为负=反向),对比回测后一键回填。",
+                 parent="param_area", wrap=280, color=(130, 130, 130))
+    # L2 因子体检入口:检验这套技术因子在历史上到底有没有预测力
+    dpg.add_separator(parent="param_area")
+    dpg.add_button(label="因子体检 (IC + 分组回测)", parent="param_area",
+                   width=250, height=30, callback=on_open_factor_lab)
+    dpg.add_text("L2:用历史数据检验因子有没有预测力、这套打分能不能选出强票。",
+                 parent="param_area", wrap=280, color=(130, 130, 130))
+
+
+def _collect_cs_weights_from_ui():
+    """从当前滑块读回 5 个因子权重(以界面为准)。"""
+    from app.strategy import cross_section as cs
+    w = {}
+    for fk in cs.DEFAULT_WEIGHTS:
+        tag = f"cs_w_{fk}"
+        w[fk] = float(dpg.get_value(tag)) if dpg.does_item_exist(tag) \
+            else float(cs.DEFAULT_WEIGHTS[fk])
+    return w
+
+
+def on_save_cs_weights():
+    """手动保存当前横截面权重+中性化开关到磁盘。"""
+    w = _collect_cs_weights_from_ui()
+    neu = bool(dpg.get_value("cs_neutralize")) if dpg.does_item_exist("cs_neutralize") \
+        else bool(STATE.get("cs_neutralize", True))
+    STATE["cs_weights"] = dict(w)
+    STATE["cs_neutralize"] = neu
+    ok = _save_cs_weights(w, neu)
+    _set_status("已保存权重,下次打开自动恢复: "
+                + ", ".join(f"{k}={v:+.0f}" for k, v in w.items())
+                if ok else "保存失败,请检查磁盘权限")
+
+
+def on_reset_cs_weights():
+    """恢复出厂默认权重,并删除已保存的权重文件。"""
+    import os
+    from app.strategy import cross_section as cs
+    for fk, dv in cs.DEFAULT_WEIGHTS.items():
+        if dpg.does_item_exist(f"cs_w_{fk}"):
+            dpg.set_value(f"cs_w_{fk}", float(dv))
+    if dpg.does_item_exist("cs_neutralize"):
+        dpg.set_value("cs_neutralize", True)
+    STATE["cs_weights"] = dict(cs.DEFAULT_WEIGHTS)
+    STATE["cs_neutralize"] = True
+    try:
+        p = _cs_weights_path()
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+    _set_status("已恢复出厂默认权重(动量25/趋势25/量能15/低估20/质量15)")
 
 
 def _set_status(msg):
@@ -166,13 +321,18 @@ def on_update_data():
             n = min(int(dpg.get_value("update_count")), len(codes))
             _set_status(f"共 {len(codes)} 只,准备拉取前 {n} 只(主流股优先)日线...")
 
+            # 强制全量重拉:覆盖本地历史(用于修正旧脏数据),否则增量只补最新
+            force_full = bool(dpg.get_value("force_full"))
+            incr = not force_full
+            mode_tip = "全量重拉(覆盖历史)" if force_full else "增量"
+
             def cb(done, total, code):
-                _set_status(f"拉取日线 {done}/{n}  当前:{code}")
+                _set_status(f"[{mode_tip}]拉取日线 {done}/{n}  当前:{code}")
 
             # 首次全量从 2021 年起,保证回测有 4 年+样本;已有数据则自动增量
             # 腾讯源可并发,10 线程拉取,400 只约 3-5 分钟
             fetcher.update_all_kline(codes[:n], start_date="20210101",
-                                     incremental=True, progress_cb=cb, workers=10)
+                                     incremental=incr, progress_cb=cb, workers=10)
             # 顺带更新大盘指数(用于大盘趋势过滤)
             _set_status("拉取大盘指数(上证综指)...")
             fetcher.update_index_kline("sh000001", start_date="20210101")
@@ -201,9 +361,9 @@ def on_update_data():
                 etf_df = fetcher.update_etf_list(only_mainstream=True)
                 _set_status(f"拉取 ETF 日线 0/{len(etf_df)}...")
                 fetcher.update_all_etf_kline(
-                    start_date="20210101", incremental=True,
+                    start_date="20210101", incremental=incr,
                     progress_cb=lambda d, t, c: _set_status(
-                        f"拉取 ETF 日线 {d}/{t}  当前:{c}"))
+                        f"[{mode_tip}]拉取 ETF 日线 {d}/{t}  当前:{c}"))
             cached = db.list_cached_codes()
             _set_status(f"数据更新完成,已缓存 {len(cached)} 只")
             _refresh_cache_info()
@@ -216,7 +376,11 @@ def on_update_data():
 
 def on_run_scan():
     """后台线程:执行选股。"""
-    if STATE["current_strategy"] is None:
+    # 判断当前是否为 L1 横截面模式(下拉框选中智能版时 current_strategy 为 None 但 cs_weights 有值)
+    is_cross = (STATE["current_strategy"] is None
+                and dpg.does_item_exist("strategy_combo")
+                and dpg.get_value("strategy_combo") == CROSS_SECTION_LABEL)
+    if STATE["current_strategy"] is None and not is_cross:
         _set_status("请先选择策略")
         return
     if not db.list_cached_codes():
@@ -224,6 +388,9 @@ def on_run_scan():
         return
 
     def worker():
+        if is_cross:
+            _run_cross_section_scan()
+            return
         _set_status("正在扫描全市场...")
         res = scanner.scan(
             STATE["current_strategy"],
@@ -239,6 +406,96 @@ def on_run_scan():
             _set_status(f"选股完成,命中 {raw_n} 只,基本面过滤后剩 {kept} 只")
         else:
             _set_status(f"选股完成,共命中 {kept} 只")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _run_cross_section_scan():
+    """执行 L1 横截面多因子扫描(在 on_run_scan 的 worker 线程内调用)。"""
+    from app.strategy import cross_section as cs
+    _set_status("横截面打分:构建全市场因子矩阵...")
+    weights = STATE.get("cs_weights") or dict(cs.DEFAULT_WEIGHTS)
+    neutralize = bool(STATE.get("cs_neutralize", True))
+    top_n = 50
+    if dpg.does_item_exist("cs_top_n"):
+        try:
+            top_n = int(dpg.get_value("cs_top_n"))
+        except Exception:  # noqa
+            top_n = 50
+    res = cs.scan_cross_section(
+        weights=weights, top_n=top_n, neutralize=neutralize,
+        progress_cb=lambda d, t: _set_status(f"横截面打分 {d}/{t}"),
+    )
+    # 横截面结果自带 value/quality 因子,基本面过滤仍可叠加(按界面阈值)
+    raw_n = 0 if res is None else len(res)
+    res = _apply_funda_filter(res)
+    STATE["results"] = res
+    _render_results(res)
+    kept = 0 if res is None else len(res)
+    tag = "行业中性" if neutralize else "全市场"
+    if _funda_filter_on() and raw_n:
+        _set_status(f"横截面选股完成({tag}),Top{raw_n},基本面过滤后剩 {kept} 只")
+    else:
+        _set_status(f"横截面选股完成({tag}),共 {kept} 只(分数=全市场分位)")
+
+
+# ---------- 自然语言选股(路径A:一句人话 → AI 翻译成筛选参数 → 量化引擎执行) ----------
+def on_nl_scan(sender=None, app_data=None, user_data=None):
+    """自然语言选股:把一句人话交给 AI 翻译成『策略+参数+基本面过滤』,再由本地
+    量化引擎执行筛选。AI 只做翻译,不直接挑票,保证结果可复现(见 app/ai/nl_query)。
+    """
+    query = (dpg.get_value("nl_query_in") or "").strip()
+    if not query:
+        _set_status("请先在自然语言选股框里输入你的选股想法")
+        return
+    if not ai_configured():
+        dpg.set_value("nl_query_hint", "未配置 AI 模型,无法翻译。见左侧 AI 点评的配置说明。")
+        return
+    if not db.list_cached_codes():
+        _set_status("本地无数据,请先点『更新股票数据』")
+        return
+
+    dpg.configure_item("nl_scan_btn", enabled=False, label="翻译中...")
+    dpg.set_value("nl_query_hint", "正在把你的描述翻译成筛选条件...")
+
+    def worker():
+        try:
+            def pcb(d, t):
+                _set_status(f"AI选股扫描中 {d}/{t}")
+            r = ai_nl.run_nl_scan(query, progress_cb=pcb)
+            if not r.get("ok"):
+                dpg.set_value("nl_query_hint", f"翻译失败:{r.get('error', '未知错误')}")
+                _set_status("AI 选股未成功")
+                return
+            spec = r["spec"]
+            df = r["df"]
+            # 复用普通选股的结果表与后续流程(精排/点评/导出都能直接用)
+            STATE["results"] = df
+            _render_results(df)
+            # 展示 AI 的翻译结果,让用户看懂它把人话理解成了什么
+            strat_label = KEY2STRATEGY_LABEL.get(spec.get("strategy"),
+                                                 spec.get("strategy", ""))
+            parts = [f"策略={strat_label}"]
+            if spec.get("params"):
+                parts.append("参数=" + ", ".join(
+                    f"{k}:{v}" for k, v in spec["params"].items()))
+            if spec.get("funda"):
+                parts.append("基本面=" + ", ".join(
+                    f"{k}:{v}" for k, v in spec["funda"].items()))
+            parts.append(f"取前{spec.get('top_n')}只")
+            explain = spec.get("explain", "")
+            hint = "AI 理解为 → " + "; ".join(parts)
+            if explain:
+                hint += f"\n{explain}"
+            dpg.set_value("nl_query_hint", hint)
+            n = 0 if df is None else len(df)
+            _set_status(f"AI 选股完成,共 {n} 只(可精排/点评/导出)")
+        except Exception as e:  # noqa
+            dpg.set_value("nl_query_hint", f"AI 选股异常:{e}")
+            _set_status("AI 选股异常")
+        finally:
+            if dpg.does_item_exist("nl_scan_btn"):
+                dpg.configure_item("nl_scan_btn", enabled=True, label="AI 选股")
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -308,6 +565,398 @@ def on_open_report_dir():
         os.startfile(d)  # Windows 专用
     except Exception as e:
         _set_status(f"打开目录失败: {e}")
+
+
+# ---------- L3 自适应权重(用历史 IC 反推权重 + 对比回测) ----------
+# 缓存最近一次反推的权重,供"一键回填"按钮使用
+_ADAPTIVE_CACHE = {"weights": None}
+
+
+def on_open_adaptive_weights():
+    """打开 L3 自适应权重弹窗:跑历史 IC 反推权重,对比回测,一键回填 L1 滑块。"""
+    if not db.list_cached_codes():
+        _set_status("本地无数据,无法反推权重,请先更新数据")
+        return
+    if dpg.does_item_exist("aw_window"):
+        dpg.delete_item("aw_window")
+
+    with dpg.window(label="用数据推荐权重 (L3:市场自适应)", tag="aw_window",
+                    width=880, height=720, pos=(180, 60), modal=False):
+        dpg.add_text("这里帮你自动算出一套权重:拿近 5 年真实历史,看每个因子过去到底管不管用,"
+                     "据此给出建议权重,并当场用历史验证它比你现在的权重强多少。",
+                     wrap=840, color=(160, 200, 255))
+        dpg.add_text(
+            "只对有完整历史走势的 3 个技术因子(动量/趋势/量能)自动算权重。"
+            "低估、质量这两个基本面因子本地只有当前值、没有历史,没法验证,所以不动它们,保持你现在的设置。",
+            wrap=840, color=(200, 160, 100))
+        dpg.add_text(
+            "怎么算的:一个因子过去越能稳定预测涨跌,给的权重越大;如果它过去是\"反着走\"的"
+            "(得分高的反而后来跌),就给负权重表示反向使用;信号太弱、不够可信的,权重记 0、不参与。",
+            wrap=840, color=(130, 130, 130))
+        dpg.add_separator()
+
+        with dpg.group(horizontal=True):
+            dpg.add_input_int(label="预测未来几天(交易日)", default_value=5,
+                              min_value=2, max_value=60, width=150, tag="aw_fwd")
+            dpg.add_input_float(label="信号可信度要求(越大越严)", default_value=2.0,
+                                min_value=0.0, max_value=6.0, step=0.5,
+                                format="%.1f", width=170, tag="aw_tthr")
+            dpg.add_button(label="开始计算权重", callback=on_run_adaptive,
+                           width=160, height=30, tag="aw_run_btn")
+        dpg.add_text("准备就绪 (点上面按钮开始;读取全市场历史约需 15~30 秒)", tag="aw_status",
+                     color=(255, 200, 100))
+        dpg.add_separator()
+
+        # ---- ① 反推明细 ----
+        dpg.add_text("① 每个因子过去管不管用 → 该给多少权重", color=(120, 220, 160))
+        with dpg.table(tag="aw_detail_table", header_row=True, resizable=True,
+                       policy=dpg.mvTable_SizingStretchProp, height=130, scrollY=True):
+            for col in ["因子", "预测力(越偏离0越强)", "稳定性", "可信度",
+                        "是否采用", "建议权重", "使用方式"]:
+                dpg.add_table_column(label=col)
+        dpg.add_text("", tag="aw_note", wrap=840, color=(200, 200, 160))
+        dpg.add_separator()
+
+        # ---- ② 对比回测 ----
+        dpg.add_text("② 拿历史验证:你现在的权重 vs 系统建议的权重,哪个选股更强",
+                     color=(120, 220, 160))
+        dpg.add_text("下面数字是在近 5 年历史上模拟选股的表现(已剔除大盘涨跌因素);"
+                     "未扣手续费,只用来比较两套权重谁更强,不是保证能赚这么多。",
+                     wrap=840, color=(130, 130, 130))
+        with dpg.table(tag="aw_cmp_table", header_row=True, resizable=True,
+                       policy=dpg.mvTable_SizingStretchProp, height=150, scrollY=True):
+            for col in ["权重方案", "选股超额年化%", "稳定性(夏普)", "最大回撤%",
+                        "最强档年化%", "最弱档年化%"]:
+                dpg.add_table_column(label=col)
+        dpg.add_separator()
+
+        # ---- ③ 回填 ----
+        dpg.add_text("③ 采用建议", color=(120, 220, 160))
+        dpg.add_text("确认第②步里\"建议权重\"确实比你现在的强之后,点下面按钮,把这套权重填到左侧滑块上,"
+                     "然后直接点『开始选股』就能用了(基本面那两项不变)。",
+                     wrap=840, color=(130, 130, 130))
+        dpg.add_button(label="↩ 采用这套权重(填到左侧滑块)", callback=on_apply_adaptive,
+                       width=280, height=32, tag="aw_apply_btn", enabled=False)
+
+
+def on_run_adaptive():
+    """后台线程:构建面板 → 反推权重 → 默认/自适应双回测 → 渲染。"""
+    fwd = int(dpg.get_value("aw_fwd"))
+    tthr = float(dpg.get_value("aw_tthr"))
+
+    def worker():
+        from app.strategy import panel as pnl, factor_ic as fic
+        from app.strategy import adaptive_weights as aw, quantile_bt as qbt
+        dpg.configure_item("aw_run_btn", enabled=False)
+        dpg.configure_item("aw_apply_btn", enabled=False)
+        try:
+            dpg.set_value("aw_status", "构建全市场历史行情面板...")
+            p = pnl.build_panel(
+                fwd_days=fwd,
+                progress_cb=lambda d, t: dpg.set_value(
+                    "aw_status", f"读取历史行情 {d}/{t}"))
+            if p is None or p.empty:
+                dpg.set_value("aw_status", "没有足够的历史数据,请先更新数据")
+                return
+            dpg.set_value("aw_status", "计算各因子历史预测力,得出建议权重...")
+            summ, _ = fic.compute_ic(fwd_days=fwd, panel=p)
+            der = aw.derive_weights(fwd_days=fwd, t_threshold=tthr,
+                                    panel=p, ic_summary=summ)
+            adaptive_w = der["weights"]
+            dpg.set_value("aw_status", "历史验证:用你现在的权重模拟选股...")
+            default_w = {"momentum": 40.0, "trend": 40.0, "volume": 20.0}
+            res_def = qbt.run_quantile_backtest(
+                weights=default_w, fwd_days=fwd, panel=p)
+            dpg.set_value("aw_status", "历史验证:用系统建议的权重模拟选股...")
+            res_ada = (qbt.run_quantile_backtest(
+                weights=adaptive_w, fwd_days=fwd, panel=p)
+                if adaptive_w else None)
+            _render_adaptive(der, res_def, res_ada, default_w, adaptive_w, p)
+            _ADAPTIVE_CACHE["weights"] = adaptive_w
+            if adaptive_w:
+                dpg.configure_item("aw_apply_btn", enabled=True)
+            dpg.set_value(
+                "aw_status",
+                f"完成:用了 {len(p):,} 条历史记录 · {p['code'].nunique()} 只股票 · "
+                f"{p['date'].min()}~{p['date'].max()}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            dpg.set_value("aw_status", f"计算失败: {e}")
+        finally:
+            dpg.configure_item("aw_run_btn", enabled=True)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _render_adaptive(der, res_def, res_ada, default_w, adaptive_w, panel):
+    """渲染反推明细表 + 人话总结 + 默认/自适应对比表。"""
+    # ---- ① 反推明细 ----
+    dpg.delete_item("aw_detail_table", children_only=True)
+    for col in ["因子", "预测力(越偏离0越强)", "稳定性", "可信度",
+                "是否采用", "建议权重", "使用方式"]:
+        dpg.add_table_column(label=col, parent="aw_detail_table")
+    detail = der.get("detail")
+    if detail is not None and not detail.empty:
+        for _, r in detail.iterrows():
+            w = r["weight"]
+            selected = bool(r["selected"])
+            if not selected:
+                direction, dcolor = "信号太弱·不采用", (150, 150, 150)
+            elif w > 0:
+                direction, dcolor = "顺着用(得分越高越好)", RED
+            else:
+                direction, dcolor = "反着用(得分越低越好)", GREEN
+            with dpg.table_row(parent="aw_detail_table"):
+                dpg.add_text(str(r["factor_cn"]))
+                dpg.add_text(f"{r['ic_mean']:+.4f}")
+                dpg.add_text(f"{r['ic_ir']:+.3f}")
+                dpg.add_text(f"{r['t_stat']:+.2f}")
+                dpg.add_text("✓ 采用" if selected else "✗ 不用")
+                dpg.add_text(f"{w:+.1f}", color=dcolor)
+                dpg.add_text(direction, color=dcolor)
+    dpg.set_value("aw_note", der.get("note", ""))
+
+    # ---- ② 对比表 ----
+    dpg.delete_item("aw_cmp_table", children_only=True)
+    for col in ["权重方案", "选股超额年化%", "稳定性(夏普)", "最大回撤%",
+                "最强档年化%", "最弱档年化%"]:
+        dpg.add_table_column(label=col, parent="aw_cmp_table")
+
+    def _row(tag, w, res):
+        if res is None:
+            with dpg.table_row(parent="aw_cmp_table"):
+                dpg.add_text(tag)
+                for _ in range(5):
+                    dpg.add_text("—")
+            return None
+        ls = res.get("ls_name", "")
+        m_ls = res["metrics"].get(ls, {})
+        m_q5 = res["metrics"].get("Q5", {})
+        m_q1 = res["metrics"].get("Q1", {})
+        ann = m_ls.get("ann_return", float("nan"))
+        color = RED if (ann == ann and ann >= 0) else GREEN
+        with dpg.table_row(parent="aw_cmp_table"):
+            dpg.add_text(tag)
+            dpg.add_text(f"{ann*100:+.2f}", color=color)
+            dpg.add_text(f"{m_ls.get('sharpe', float('nan')):+.2f}", color=color)
+            dpg.add_text(f"{m_ls.get('max_drawdown', float('nan'))*100:+.2f}")
+            dpg.add_text(f"{m_q5.get('ann_return', float('nan'))*100:+.2f}")
+            dpg.add_text(f"{m_q1.get('ann_return', float('nan'))*100:+.2f}")
+        return m_ls.get("sharpe", float("nan"))
+
+    s_def = _row("你现在的权重", default_w, res_def)
+    s_ada = _row("系统建议的权重", adaptive_w, res_ada)
+    # 结论行
+    if res_ada is not None and s_def == s_def and s_ada == s_ada:
+        better = s_ada > s_def
+        verdict = ("✓ 历史验证:系统建议的权重更强,可以采用(注意这只是这段历史的结论)。"
+                   if better else
+                   "✗ 历史验证:系统建议的没比你现在的强,建议先别改,或换个预测天数再试。")
+        dpg.set_value("aw_note", dpg.get_value("aw_note") + "\n\n【一句话结论】" + verdict)
+
+
+def on_apply_adaptive():
+    """把反推的技术因子权重回填到 L1 滑块(基本面因子保持不变)。"""
+    w = _ADAPTIVE_CACHE.get("weights")
+    if not w:
+        _set_status("尚无可回填的权重,请先运行反推")
+        return
+    applied = []
+    for fk, val in w.items():
+        tag = f"cs_w_{fk}"
+        if dpg.does_item_exist(tag):
+            dpg.set_value(tag, float(val))
+            if STATE.get("cs_weights") is not None:
+                STATE["cs_weights"][fk] = float(val)
+            applied.append(f"{fk}={val:+.1f}")
+    _set_status("已采用系统建议的权重: " + ", ".join(applied) +
+                " (基本面因子不变,可直接点开始选股)")
+    # 回填即持久化:下次打开软件自动恢复这套权重,不必每次重跑 L3
+    try:
+        w_now = _collect_cs_weights_from_ui()
+        neu = bool(dpg.get_value("cs_neutralize")) \
+            if dpg.does_item_exist("cs_neutralize") \
+            else bool(STATE.get("cs_neutralize", True))
+        _save_cs_weights(w_now, neu)
+    except Exception:
+        pass
+
+
+# ---------- L2 因子体检(IC + 分位分组回测) ----------
+def on_open_factor_lab():
+    """打开 L2 因子体检弹窗:检验技术因子的历史预测力 + 分组回测。"""
+    if not db.list_cached_codes():
+        _set_status("本地无数据,无法体检,请先更新数据")
+        return
+    if dpg.does_item_exist("fl_window"):
+        dpg.delete_item("fl_window")
+
+    with dpg.window(label="因子体检 (L2:IC + 分组回测)", tag="fl_window",
+                    width=940, height=760, pos=(160, 50), modal=False):
+        dpg.add_text("拿近 5 年真实历史,检验\"动量/趋势/量能\"这几个选股指标过去到底管不管用,"
+                     "以及照这套打分选出来的票,是不是真能跑赢差的票。",
+                     wrap=900, color=(160, 200, 255))
+        dpg.add_text(
+            "只检验有完整历史走势的 3 个技术指标(动量/趋势/量能)。"
+            "低估、质量这两个基本面指标本地只有当前值、没有历史走势,拿它硬凑历史会\"偷看答案\"、结论不可信,所以这里不检验它们。",
+            wrap=900, color=(200, 160, 100))
+        dpg.add_separator()
+
+        with dpg.group(horizontal=True):
+            dpg.add_input_int(label="预测未来几天(交易日)", default_value=5,
+                              min_value=2, max_value=60, width=140, tag="fl_fwd")
+            dpg.add_input_int(label="分成几档", default_value=5, min_value=3,
+                              max_value=10, width=120, tag="fl_ngrp")
+        dpg.add_text("下面三个权重只用于\"分档打分\";每个指标单独的好坏检验(见①)跟权重无关:",
+                     color=(180, 180, 120))
+        with dpg.group(horizontal=True):
+            dpg.add_slider_float(label="动量", default_value=40, min_value=0,
+                                 max_value=100, format="%.0f", width=180, tag="fl_w_momentum")
+            dpg.add_slider_float(label="趋势", default_value=40, min_value=0,
+                                 max_value=100, format="%.0f", width=180, tag="fl_w_trend")
+            dpg.add_slider_float(label="量能", default_value=20, min_value=0,
+                                 max_value=100, format="%.0f", width=180, tag="fl_w_volume")
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="开始体检", callback=on_run_factor_lab,
+                           width=160, height=32, tag="fl_run_btn")
+        dpg.add_text("准备就绪 (点上面按钮开始;读取全市场历史约需 15~30 秒)", tag="fl_status",
+                     color=(255, 200, 100))
+        dpg.add_separator()
+
+        # ---- IC 结果 ----
+        dpg.add_text("① 每个指标过去到底管不管用", color=(120, 220, 160))
+        dpg.add_text("怎么看:预测力越偏离 0 越强;稳定性越高越可靠;可信度>2 才算真信号。"
+                     "如果是负的=这个指标\"反着走\"(得分高的后来反而跌,反着用可能更好)。",
+                     wrap=900, color=(130, 130, 130))
+        with dpg.table(tag="fl_ic_table", header_row=True, resizable=True,
+                       policy=dpg.mvTable_SizingStretchProp, height=130, scrollY=True):
+            for col in ["指标", "预测力(越偏离0越强)", "稳定性", "赢的比例", "可信度", "检验次数", "结论"]:
+                dpg.add_table_column(label=col)
+        dpg.add_separator()
+
+        # ---- 分组回测 ----
+        dpg.add_text("② 分档验证:把全市场按打分分成几档,看最强档能不能跑赢最弱档",
+                     color=(120, 220, 160))
+        dpg.add_text("下面的\"最强档减最弱档\"已经剔除了大盘涨跌,只看纯选股能力:正=能选出好票,负=方向反了。"
+                     "未扣手续费,是能力体检、不是保证能赚这么多。", wrap=900, color=(130, 130, 130))
+        with dpg.plot(tag="fl_nav_plot", height=200, width=-1, no_box_select=True):
+            dpg.add_plot_legend()
+            dpg.add_plot_axis(dpg.mvXAxis, label="第几次换仓", tag="fl_navx")
+            dpg.add_plot_axis(dpg.mvYAxis, label="累计涨了多少(起点1.0)", tag="fl_navy")
+        with dpg.table(tag="fl_bt_table", header_row=True, resizable=True,
+                       policy=dpg.mvTable_SizingStretchProp, height=180, scrollY=True):
+            for col in ["组别", "年化%", "夏普", "最大回撤%", "累计收益%"]:
+                dpg.add_table_column(label=col)
+
+
+def on_run_factor_lab():
+    """后台线程:构建面板 → 算 IC → 分组回测 → 渲染。"""
+    fwd = int(dpg.get_value("fl_fwd"))
+    ngrp = int(dpg.get_value("fl_ngrp"))
+    weights = {
+        "momentum": float(dpg.get_value("fl_w_momentum")),
+        "trend": float(dpg.get_value("fl_w_trend")),
+        "volume": float(dpg.get_value("fl_w_volume")),
+    }
+
+    def worker():
+        from app.strategy import panel as pnl, factor_ic as fic, quantile_bt as qbt
+        dpg.configure_item("fl_run_btn", enabled=False)
+        try:
+            dpg.set_value("fl_status", "构建全市场历史行情面板...")
+            p = pnl.build_panel(
+                fwd_days=fwd,
+                progress_cb=lambda d, t: dpg.set_value(
+                    "fl_status", f"读取历史行情 {d}/{t}"))
+            if p is None or p.empty:
+                dpg.set_value("fl_status", "没有足够的历史数据,请先更新数据")
+                return
+            dpg.set_value("fl_status", "检验每个指标的历史预测力...")
+            summ, series = fic.compute_ic(fwd_days=fwd, panel=p)
+            dpg.set_value("fl_status", "分档模拟选股...")
+            res = qbt.run_quantile_backtest(
+                weights=weights, fwd_days=fwd, n_groups=ngrp, panel=p)
+            _render_factor_lab(summ, res, p)
+            dpg.set_value(
+                "fl_status",
+                f"体检完成:用了 {len(p):,} 条历史记录 · {p['code'].nunique()} 只股票 · "
+                f"{p['date'].min()}~{p['date'].max()} · 换仓 {res['periods']} 次")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            dpg.set_value("fl_status", f"体检失败: {e}")
+        finally:
+            dpg.configure_item("fl_run_btn", enabled=True)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _render_factor_lab(summ, res, panel):
+    """渲染 IC 表 + 分组净值曲线 + 分组指标表。"""
+    # ---- ① IC 表 ----
+    dpg.delete_item("fl_ic_table", children_only=True)
+    for col in ["指标", "预测力(越偏离0越强)", "稳定性", "赢的比例", "可信度", "检验次数", "结论"]:
+        dpg.add_table_column(label=col, parent="fl_ic_table")
+    for fac in summ.index:
+        r = summ.loc[fac]
+        ic = r["ic_mean"]
+        t = r["t_stat"]
+        # 结论:方向 + 显著性
+        if abs(ic) < 0.02 or (t == t and abs(t) < 2):
+            verdict, vcolor = "太弱·没啥用", (150, 150, 150)
+        elif ic > 0:
+            verdict, vcolor = "有用·顺着用", RED
+        else:
+            verdict, vcolor = "反着走·反着用更好", GREEN
+        with dpg.table_row(parent="fl_ic_table"):
+            dpg.add_text(str(fac))
+            dpg.add_text(f"{ic:+.4f}")
+            dpg.add_text(f"{r['ic_ir']:+.3f}")
+            dpg.add_text(f"{r['positive_ratio']*100:.1f}%")
+            dpg.add_text(f"{t:+.2f}")
+            dpg.add_text(f"{int(r['n_periods'])}")
+            dpg.add_text(verdict, color=vcolor)
+
+    # ---- ② 分组净值曲线 ----
+    for tag in ("fl_navx", "fl_navy"):
+        dpg.delete_item(tag, children_only=True)
+    curves = res.get("group_curves", {})
+    ls_name = res.get("ls_name", "")
+    # 分组曲线:Q1..Qn 用冷→暖渐变,多空单独醒目色
+    n_groups = res.get("n_groups", 5)
+    for name, nav in curves.items():
+        ys = [float(v) for v in nav.values]
+        xs = list(range(len(ys)))
+        series = dpg.add_line_series(xs, ys, label=name, parent="fl_navy")
+        if name == ls_name:
+            # 多空曲线加粗醒目(主题:金色)
+            with dpg.theme() as th:
+                with dpg.theme_component(dpg.mvLineSeries):
+                    dpg.add_theme_color(dpg.mvPlotCol_Line, (255, 190, 60, 255),
+                                        category=dpg.mvThemeCat_Plots)
+                    dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, 3.0,
+                                        category=dpg.mvThemeCat_Plots)
+            dpg.bind_item_theme(series, th)
+    dpg.set_axis_limits_auto("fl_navx")
+    dpg.set_axis_limits_auto("fl_navy")
+
+    # ---- ② 分组指标表 ----
+    dpg.delete_item("fl_bt_table", children_only=True)
+    for col in ["档位", "年化%", "稳定性(夏普)", "最大回撤%", "累计收益%"]:
+        dpg.add_table_column(label=col, parent="fl_bt_table")
+    metrics = res.get("metrics", {})
+    for name in curves.keys():
+        m = metrics.get(name, {})
+        ann = m.get("ann_return", float("nan"))
+        # A股惯例:正收益红,负收益绿
+        color = RED if (ann == ann and ann >= 0) else GREEN
+        with dpg.table_row(parent="fl_bt_table"):
+            dpg.add_text(name, color=(255, 190, 60) if name == ls_name else None)
+            dpg.add_text(f"{ann*100:+.2f}", color=color)
+            dpg.add_text(f"{m.get('sharpe', float('nan')):.2f}")
+            dpg.add_text(f"{m.get('max_drawdown', float('nan'))*100:+.2f}")
+            dpg.add_text(f"{m.get('total_return', float('nan'))*100:+.2f}", color=color)
 
 
 # ---------- 回测 ----------
@@ -835,6 +1484,199 @@ def on_ai_rank(sender=None, app_data=None, user_data=None):
 
 
 
+# ---------- AI 批量点评(晨报) & 组合解读 ----------
+def _codes_from_source(source: str):
+    """按来源取一批代码 + 标题。source: 'results'(选股结果) / 'watch'(自选池)。"""
+    if source == "watch":
+        wl = db.load_watchlist()
+        if wl is None or wl.empty:
+            return [], "自选池"
+        col = "代码" if "代码" in wl.columns else ("code" if "code" in wl.columns else None)
+        codes = list(wl[col]) if col else []
+        return [str(c) for c in codes], "自选池"
+    # 默认:当前选股结果
+    res = STATE.get("results")
+    if res is None or res.empty:
+        return [], "选股结果"
+    return [str(c) for c in res["code"]], "选股结果"
+
+
+def on_ai_batch(source="results", sender=None, app_data=None, user_data=None):
+    """对一批股票(选股结果/自选池)逐只 AI 点评,汇总成 HTML 晨报并导出。"""
+    codes, title = _codes_from_source(source)
+    if not codes:
+        _set_status(f"{title}为空,先选股或加入自选再批量点评")
+        return
+    if not ai_configured():
+        dpg.set_value("ai_batch_text", ai_config_hint())
+        dpg.configure_item("ai_batch_win", show=True)
+        return
+    # 控制规模,避免一次点评过多(串行 + API 限流)
+    MAX_BATCH = 20
+    codes = codes[:MAX_BATCH]
+
+    dpg.configure_item("ai_batch_win", show=True)
+    dpg.set_value("ai_batch_title", f"批量点评 · {title}({len(codes)} 只)")
+    dpg.set_value("ai_batch_text", "正在逐只点评,请稍候...")
+    dpg.set_value("ai_batch_report", "")
+    dpg.configure_item("ai_batch_btn", enabled=False, label="点评中...")
+
+    def worker():
+        try:
+            def pcb(d, t, code):
+                if dpg.does_item_exist("ai_batch_text"):
+                    dpg.set_value("ai_batch_text",
+                                  f"点评进度 {d}/{t}(当前 {code})...")
+            r = ai_commentary.comment_batch(codes, progress_cb=pcb)
+            if not r.get("ok"):
+                dpg.set_value("ai_batch_text",
+                              f"批量点评失败:{r.get('error', '未知错误')}")
+                return
+            items = r["items"]
+            # 屏内摘要:每只一行(评级/风险)
+            lines = []
+            ok_n = 0
+            for it in items:
+                if it.get("error"):
+                    lines.append(f"× {it['code']} {it.get('name', '')} "
+                                 f"— {it['error']}")
+                else:
+                    ok_n += 1
+                    lines.append(f"· {it['code']} {it.get('name', '')} "
+                                 f"[{it.get('industry', '')}] "
+                                 f"评级:{it.get('rating') or '-'} / "
+                                 f"风险:{it.get('risk') or '-'}")
+            dpg.set_value("ai_batch_text", "\n".join(lines))
+            # 导出 HTML 晨报
+            try:
+                path = exporter.export_ai_report(
+                    items, title=f"AI 点评晨报 · {title}",
+                    disclaimer=r.get("disclaimer", ""))
+                STATE["last_report_dir"] = os.path.dirname(path)
+                STATE["last_ai_report"] = path
+                dpg.set_value("ai_batch_report",
+                              f"已生成晨报:{os.path.basename(path)}"
+                              f"(成功 {ok_n}/{len(items)} 只)· "
+                              f"点『打开目录』查看")
+            except Exception as e:  # noqa
+                dpg.set_value("ai_batch_report", f"晨报导出失败:{e}")
+        except Exception as e:  # noqa
+            dpg.set_value("ai_batch_text", f"批量点评异常:{e}")
+        finally:
+            if dpg.does_item_exist("ai_batch_btn"):
+                dpg.configure_item("ai_batch_btn", enabled=True,
+                                   label="批量点评(晨报)")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def on_ai_portfolio(source="results", sender=None, app_data=None, user_data=None):
+    """对一批股票(选股结果/自选池)做全局组合解读(板块集中度/估值/组合风险),流式展示。"""
+    codes, title = _codes_from_source(source)
+    if not codes:
+        _set_status(f"{title}为空,先选股或加入自选再做组合解读")
+        return
+    if not ai_configured():
+        dpg.set_value("ai_pf_text", ai_config_hint())
+        dpg.configure_item("ai_pf_win", show=True)
+        return
+
+    dpg.configure_item("ai_pf_win", show=True)
+    dpg.set_value("ai_pf_title", f"组合解读 · {title}({len(codes)} 只)")
+    dpg.set_value("ai_pf_text", "正在汇总组合画像并生成研判(边生成边显示)...")
+    dpg.configure_item("ai_pf_btn", enabled=False, label="解读中...")
+
+    # 流式:用可变缓冲累积,回调里刷新文本
+    buf = {"s": ""}
+
+    def _on_delta(piece):
+        buf["s"] += piece
+        if dpg.does_item_exist("ai_pf_text"):
+            dpg.set_value("ai_pf_text", buf["s"])
+
+    def worker():
+        try:
+            r = ai_commentary.comment_portfolio(codes, title=title,
+                                                on_delta=_on_delta)
+            if not r.get("ok"):
+                dpg.set_value("ai_pf_text",
+                              f"组合解读失败:{r.get('error', '未知错误')}")
+                return
+            # 末尾补免责声明(流式正文已在 buf 里)
+            dpg.set_value("ai_pf_text", r["text"])
+            dpg.set_value("ai_pf_disclaimer", r.get("disclaimer", ""))
+            dpg.configure_item("ai_pf_disclaimer", show=True)
+        except Exception as e:  # noqa
+            dpg.set_value("ai_pf_text", f"组合解读异常:{e}")
+        finally:
+            if dpg.does_item_exist("ai_pf_btn"):
+                dpg.configure_item("ai_pf_btn", enabled=True, label="组合解读")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def on_open_ai_history(sender=None, app_data=None, user_data=None):
+    """点评历史回看:弹窗展示 ai_commentary 表里存档的历史点评(最新在前)。"""
+    if dpg.does_item_exist("ai_hist_win"):
+        dpg.delete_item("ai_hist_win")
+    with dpg.window(label="AI 点评历史", tag="ai_hist_win",
+                    width=880, height=620, pos=(200, 70), modal=False):
+        with dpg.group(horizontal=True):
+            dpg.add_text("按代码筛选:")
+            dpg.add_input_text(tag="ai_hist_code", width=120,
+                               hint="留空=全部")
+            dpg.add_button(label="查询", width=64, height=26,
+                           callback=_refresh_ai_history)
+            dpg.add_button(label="全部", width=64, height=26,
+                           callback=lambda: (dpg.set_value("ai_hist_code", ""),
+                                             _refresh_ai_history()))
+            dpg.add_text("", tag="ai_hist_status", color=(255, 200, 100))
+        dpg.add_separator()
+        dpg.add_child_window(tag="ai_hist_box", border=False, height=-1)
+    _refresh_ai_history()
+
+
+def _refresh_ai_history(sender=None, app_data=None, user_data=None):
+    """读取并渲染 AI 点评历史列表。"""
+    if not dpg.does_item_exist("ai_hist_box"):
+        return
+    dpg.delete_item("ai_hist_box", children_only=True)
+    code = (dpg.get_value("ai_hist_code") or "").strip() if \
+        dpg.does_item_exist("ai_hist_code") else ""
+    try:
+        df = db.load_ai_commentary(code=code or None, limit=80)
+    except Exception as e:  # noqa
+        dpg.add_text(f"读取失败: {e}", parent="ai_hist_box",
+                     color=(230, 120, 120))
+        return
+    if df is None or df.empty:
+        dpg.set_value("ai_hist_status", "暂无历史(点评过股票后会自动存档)")
+        dpg.add_text("还没有任何点评存档。到『选股 & K线』页点 AI点评,"
+                     "或用批量点评后即可在此回看。",
+                     parent="ai_hist_box", wrap=830, color=(150, 150, 150))
+        return
+    dpg.set_value("ai_hist_status", f"共 {len(df)} 条")
+
+    def _rc(rating):
+        return {"偏多": (230, 60, 60), "偏空": (40, 170, 80),
+                "中性": (200, 180, 90)}.get(rating, (180, 180, 180))
+
+    for _, r in df.iterrows():
+        with dpg.group(parent="ai_hist_box"):
+            with dpg.group(horizontal=True):
+                dpg.add_text(f"{r['code']} {r.get('name', '')}",
+                             color=(160, 200, 255))
+                dpg.add_text(f"· {r.get('trade_date', '')}",
+                             color=(150, 150, 150))
+                if r.get("rating"):
+                    dpg.add_text(f"评级:{r['rating']}", color=_rc(r["rating"]))
+                if r.get("risk"):
+                    dpg.add_text(f"风险:{r['risk']}", color=(200, 160, 90))
+            dpg.add_text(str(r.get("text", "")), wrap=830,
+                         color=(220, 220, 220))
+            dpg.add_separator()
+
+
 def _add_watch_code(code, note="搜索添加"):
     """仅凭代码加入自选:名称取本地登记名,买入价取本地日线最新收盘价。"""
     name = db.name_of(code) or code
@@ -1344,6 +2186,10 @@ def _draw_intraday(code, incremental=False):
                 dpg.add_text("暂无分时数据(可能盘前未开盘或该标的当日无成交)",
                              color=(255, 200, 100))
             dpg.set_value("kline_title", f"分时 - {label}")
+            if dpg.does_item_exist("kline_title_chg"):
+                dpg.set_value("kline_title_chg", "")
+            if dpg.does_item_exist("kline_title_suffix"):
+                dpg.set_value("kline_title_suffix", "")
             STATE["intraday_code"] = None
         return
 
@@ -1418,10 +2264,20 @@ def _draw_intraday(code, incremental=False):
 
     tdate = df.attrs.get("trade_date", "")
     chg = ((last - base) / base * 100) if base else 0.0
-    dpg.set_value("kline_title",
-                  f"分时 {label}  {tdate}  现价 {last:.3f}  "
-                  f"{'+' if chg >= 0 else ''}{chg:.2f}%  "
-                  f"({'轮询中' if STATE.get('poll_on') else '已停'})")
+    dpg.set_value("kline_title", f"分时 {label}  {tdate}  现价 {last:.3f}  ")
+    # 涨跌幅单独上色:红涨绿跌(相对昨收),平盘用中性灰
+    if dpg.does_item_exist("kline_title_chg"):
+        dpg.set_value("kline_title_chg",
+                      f"{'+' if chg >= 0 else ''}{chg:.2f}%")
+        if chg > 0:
+            dpg.configure_item("kline_title_chg", color=RED)
+        elif chg < 0:
+            dpg.configure_item("kline_title_chg", color=GREEN)
+        else:
+            dpg.configure_item("kline_title_chg", color=(180, 180, 180))
+    if dpg.does_item_exist("kline_title_suffix"):
+        dpg.set_value("kline_title_suffix",
+                      f"  ({'轮询中' if STATE.get('poll_on') else '已停'})")
 
 
 def _poll_worker():
@@ -1568,46 +2424,170 @@ def _fmt_num(x, nd=2, suffix=""):
         return "-"
 
 
+# 信息栏配色:中性事实用淡灰白(不涂红绿,避免误导价值判断);
+# 好坏/涨跌型字段才用红涨绿跌
+INFO_NEUTRAL = (200, 210, 225)   # 中性事实值(PE/PB/市值/负债率)
+INFO_LABEL = (140, 148, 160)     # 字段标签(灰)
+
+
+def _seg_neutral(label, val_txt):
+    """中性事实字段:标签灰 + 数值淡白,不涂红绿。"""
+    return [(label + " ", INFO_LABEL), (val_txt, INFO_NEUTRAL)]
+
+
+def _seg_signed(label, val, nd=2, suffix="%", zero_is_good=True):
+    """好坏/涨跌型字段:正值涂红(好/涨),负值涂绿(差/跌),缺失灰显。"""
+    if val is None:
+        return [(label + " ", INFO_LABEL), ("-", INFO_NEUTRAL)]
+    try:
+        v = float(val)
+    except Exception:  # noqa
+        return [(label + " ", INFO_LABEL), ("-", INFO_NEUTRAL)]
+    color = RED if (v > 0 if zero_is_good else v >= 0) else GREEN
+    return [(label + " ", INFO_LABEL), (f"{v:.{nd}f}{suffix}", color)]
+
+
+# RSI 状态配色:超买(过热,追高风险)橙红警示;超卖(超跌,反弹机会)青绿提示;
+# 中间区间(健康/中性)用灰白,不喧宾夺主。这里的红/绿是"状态语义"(热/冷),
+# 非涨跌方向,故单独取色而非复用 RED/GREEN,避免与涨跌红绿混淆。
+RSI_OVERBOUGHT = (245, 130, 60)   # 超买:橙红(过热警示)
+RSI_OVERSOLD = (60, 200, 170)     # 超卖:青绿(超跌提示)
+
+
+def _latest_rsi(code, period, n=14):
+    """按当前周期(D/W/M)计算该标的最新一根 K 线的 RSI(14)。取不到返回 None。"""
+    try:
+        df = db.load_kline(code)
+        if df is None or df.empty:
+            return None
+        if period in ("W", "M"):
+            df = ind.resample_period(df, period)
+        s = ind.rsi(df["close"].astype(float), n).dropna()
+        if s.empty:
+            return None
+        v = float(s.iloc[-1])
+        return v if v == v else None   # 过滤 NaN
+    except Exception:  # noqa
+        return None
+
+
+def _seg_rsi(val):
+    """RSI 分段:超买橙红(>=70)、超卖青绿(<=30)、中间灰白,并附中文状态。"""
+    if val is None:
+        return [("RSI ", INFO_LABEL), ("-", INFO_NEUTRAL)]
+    if val >= 70:
+        color, state = RSI_OVERBOUGHT, "超买"
+    elif val <= 30:
+        color, state = RSI_OVERSOLD, "超卖"
+    else:
+        color, state = INFO_NEUTRAL, "中性"
+    return [("RSI ", INFO_LABEL), (f"{val:.1f}", color),
+            (f"({state})", color)]
+
+
 def _compose_kline_info(code):
-    """把基本面 dict 拼成一行紧凑信息文本(供 K 线上方信息栏显示)。"""
+    """
+    组装基本面信息栏的【分段】数据(供 K 线上方信息栏分色显示)。
+    返回 list[list[(text, color)]]:外层每项是一个字段,内层是该字段的文字分段。
+    完全没取到基本面时返回 None。
+    分色三类:①中性事实(PE/PB/市值/负债率)灰白;②越高越好(ROE/毛利/净利)正红负绿;
+    ③涨跌语义(营收/净利同比)增长红、下滑绿。
+    """
     f = ai_commentary.get_fundamental_ondemand(code)
     if f.get("_source") == "none" and all(
             f.get(k) is None for k in ("pe_ttm", "pb", "roe", "total_mv")):
         return None   # 完全没取到,交由调用方决定提示
-    # 行业估值分位(样本足够才有)
     pe_pct = db.industry_valuation_percentile(code, "pe_ttm")
-    parts = [
-        f"PE {_fmt_num(f.get('pe_ttm'))}",
-        f"PB {_fmt_num(f.get('pb'))}",
-        f"ROE {_fmt_num(f.get('roe'), 2, '%')}",
-        f"市值 {_fmt_num(f.get('total_mv'), 1)}亿",
+    fields = [
+        # ① 中性事实值:不涂红绿
+        _seg_neutral("PE", _fmt_num(f.get("pe_ttm"))),
+        _seg_neutral("PB", _fmt_num(f.get("pb"))),
+        # ② 越高越好:ROE 正红负绿
+        _seg_signed("ROE", f.get("roe")),
+        _seg_neutral("市值", _fmt_num(f.get("total_mv"), 1) + "亿"),
     ]
+    # 技术面:RSI(14) 按当前周期实时算,超买/超卖分色
+    rsi_val = _latest_rsi(code, STATE.get("cur_period", "D"))
+    fields.append(_seg_rsi(rsi_val))
+    # 筹码面:获利盘比例 + 平均成本(始终按日线算,价格维度指标)
+    try:
+        _cd = db.load_kline(code)
+        _chip = chip.compute_chip_distribution(_cd, total_mv=f.get("total_mv"))
+    except Exception:  # noqa
+        _chip = None
+    if _chip is not None:
+        pf = _chip["profit_ratio"] * 100
+        lc = _chip["last_close"]
+        ac = _chip["avg_cost"]
+        # 获利盘:高=浮盈多(潜在抛压),低=普遍套牢(超跌)。语义偏中性,用状态色
+        pf_col = RSI_OVERBOUGHT if pf >= 85 else (
+            RSI_OVERSOLD if pf <= 15 else INFO_NEUTRAL)
+        fields.append([("获利盘 ", INFO_LABEL), (f"{pf:.0f}%", pf_col)])
+        # 现价相对平均成本:上方红(强)、下方绿(弱)
+        ac_col = RED if lc >= ac else GREEN
+        fields.append([("平均成本 ", INFO_LABEL), (f"{ac:.2f}", ac_col)])
     if f.get("gross_margin") is not None:
-        parts.append(f"毛利率 {_fmt_num(f.get('gross_margin'), 2, '%')}")
+        fields.append(_seg_signed("毛利率", f.get("gross_margin")))
     if f.get("net_margin") is not None:
-        parts.append(f"净利率 {_fmt_num(f.get('net_margin'), 2, '%')}")
+        fields.append(_seg_signed("净利率", f.get("net_margin")))
+    # ③ 涨跌语义:营收/净利同比,增长红、下滑绿(最有信息量,重点分色)
     if f.get("rev_yoy") is not None:
-        parts.append(f"营收同比 {_fmt_num(f.get('rev_yoy'), 2, '%')}")
+        fields.append(_seg_signed("营收同比", f.get("rev_yoy")))
     if f.get("profit_yoy") is not None:
-        parts.append(f"净利同比 {_fmt_num(f.get('profit_yoy'), 2, '%')}")
+        fields.append(_seg_signed("净利同比", f.get("profit_yoy")))
+    # 负债率:中性偏事实(高未必坏,行业差异大),不涂红绿
     if f.get("debt_ratio") is not None:
-        parts.append(f"负债率 {_fmt_num(f.get('debt_ratio'), 2, '%')}")
-    line = "   ".join(parts)
+        fields.append(_seg_neutral("负债率",
+                                   _fmt_num(f.get("debt_ratio"), 2, "%")))
+    # 尾部补充:行业分位 + 财报期(灰显)
+    # 说明:percentile = 同行中比它更便宜(PE更低)的占比。低=便宜,高=贵。
+    # 直接用"比X%同行便宜"的正向措辞,避免"高于X%"字面歧义(见AI点评同源修复)。
+    tail = ""
     if pe_pct:
-        line += f"   |  PE高于{db.load_industry_map().get(code, '同行业')}约{pe_pct['percentile']:.0f}%的公司"
+        p = pe_pct["percentile"]
+        cheaper = 100.0 - p
+        vt = "偏低" if p <= 30 else ("偏高" if p >= 70 else "居中")
+        ind_name = db.load_industry_map().get(code, "同行业")
+        tail += (f" | 估值{vt}:{ind_name}内比约{cheaper:.0f}%同行更便宜")
     if f.get("report_date"):
-        line += f"   (财报期 {f['report_date']})"
-    return line
+        tail += f"  (财报期 {f['report_date']})"
+    if tail:
+        fields.append([(tail.strip(), INFO_LABEL)])
+    return fields
+
+
+def _render_info_segments(fields):
+    """把 _compose_kline_info 返回的分段数据渲染进横向信息栏容器。"""
+    if not dpg.does_item_exist("kline_info"):
+        return
+    dpg.delete_item("kline_info", children_only=True)
+    if not fields:
+        return
+    for i, field in enumerate(fields):
+        # 每个字段之间用一段间隔;同字段内的分段(标签+数值)紧挨
+        for text, color in field:
+            dpg.add_text(text, parent="kline_info", color=color)
+        if i < len(fields) - 1:
+            dpg.add_text("  ", parent="kline_info", color=INFO_LABEL)
+
+
+def _set_info_message(msg, color=INFO_LABEL):
+    """在信息栏显示一句提示文字(加载中/无数据等)。"""
+    if not dpg.does_item_exist("kline_info"):
+        return
+    dpg.delete_item("kline_info", children_only=True)
+    if msg:
+        dpg.add_text(msg, parent="kline_info", color=color)
 
 
 def _update_kline_info(code):
     """更新 K 线上方基本面信息栏。本地有秒显示,缺失则后台拉取回填,不卡界面。"""
     if not dpg.does_item_exist("kline_info"):
         return
-    # ETF 无个股基本面,直接隐藏信息栏
+    # ETF 无个股基本面,直接清空信息栏
     try:
         if code in db.load_etf_codes():
-            dpg.set_value("kline_info", "")
+            _set_info_message("")
             return
     except Exception:  # noqa
         pass
@@ -1617,17 +2597,19 @@ def _update_kline_info(code):
         for k in ("pe_ttm", "pb", "roe", "total_mv", "gross_margin", "rev_yoy"))
     if has_local:
         # 本地已有,直接同步显示
-        line = _compose_kline_info(code)
-        dpg.set_value("kline_info", line or "")
+        _render_info_segments(_compose_kline_info(code))
         return
     # 本地缺失:先占位,后台现拉再回填(只回填仍在看这只票时)
-    dpg.set_value("kline_info", "基本面加载中...")
+    _set_info_message("基本面加载中...")
 
     def worker(target):
-        line = _compose_kline_info(target)
+        fields = _compose_kline_info(target)
         # 用户可能已切换到别的票,回填前校验当前仍是这只
         if STATE.get("cur_code") == target and dpg.does_item_exist("kline_info"):
-            dpg.set_value("kline_info", line or "该标的暂无基本面数据")
+            if fields:
+                _render_info_segments(fields)
+            else:
+                _set_info_message("该标的暂无基本面数据")
 
     threading.Thread(target=worker, args=(code,), daemon=True).start()
 
@@ -1676,6 +2658,7 @@ def show_kline(code, period=None):
     closes = df["close"].astype(float).tolist()
     highs = df["high"].astype(float).tolist()
     lows = df["low"].astype(float).tolist()
+    rsis = df["rsi14"].tolist() if "rsi14" in df.columns else [None] * len(df)
     up_mask = df["close"] >= df["open"]
 
     # 相邻点间距恒为 1 → 蜡烛/柱固定宽度即可,无需按时间换算
@@ -1702,11 +2685,14 @@ def show_kline(code, period=None):
 
     dpg.delete_item("chart_area", children_only=True)
     with dpg.subplots(
-        3, 1, label="", width=-1, height=-1, parent="chart_area",
-        row_ratios=[3.0, 1.0, 1.2], link_all_x=True, no_title=True, tag="sp",
+        3, 2, label="", width=-1, height=-1, parent="chart_area",
+        row_ratios=[3.0, 1.0, 1.2], column_ratios=[8.0, 1.0],
+        link_rows=True, link_columns=True, column_major=True,
+        no_title=True, tag="sp",
     ):
         # 第1层: K线主图 + 均线
-        with dpg.plot(label=f"{pname} {label}", no_title=False, height=-1, tag="kplot"):
+        with dpg.plot(label=f"{pname} {label}", no_title=False, height=-1,
+                      tag="kplot", no_box_select=True):
             dpg.add_plot_legend()
             dpg.add_plot_axis(dpg.mvXAxis, tag="kx", no_tick_labels=True)
             ky = dpg.add_plot_axis(dpg.mvYAxis, label="价格", tag="ky")
@@ -1719,6 +2705,18 @@ def show_kline(code, period=None):
                 lx, ly = _line_xy(xs, df[col])
                 if lx:
                     dpg.add_line_series(lx, ly, label=lbl, parent=ky)
+            # 平均成本参考线(横贯K线主图,与右侧筹码栏同价位对齐)
+            try:
+                _cdf0 = db.load_kline(code)
+                _fm0 = db.get_fundamental(code) or {}
+                _chip0 = chip.compute_chip_distribution(
+                    _cdf0, total_mv=_fm0.get("total_mv"))
+            except Exception:  # noqa
+                _chip0 = None
+            if _chip0 is not None:
+                _ac0 = _chip0["avg_cost"]
+                dpg.add_line_series([xs[0], xs[-1]], [_ac0, _ac0], parent=ky,
+                                    label=f"平均成本 {_ac0:.2f}")
             # 自定义悬停提示(跟随鼠标定位到最近蜡烛),初始隐藏
             dpg.add_plot_annotation(
                 tag="kanno", label="", default_value=(0, 0),
@@ -1730,7 +2728,7 @@ def show_kline(code, period=None):
             dpg.fit_axis_data("ky")
 
         # 第2层: 成交额
-        with dpg.plot(label="成交额", no_title=False, height=-1):
+        with dpg.plot(label="成交额", no_title=False, height=-1, no_box_select=True):
             dpg.add_plot_axis(dpg.mvXAxis, tag="ax2", no_tick_labels=True)
             ay2 = dpg.add_plot_axis(dpg.mvYAxis, label="成交额(亿)", tag="ay2")
             amt_yi = (df["amount"].astype(float) / 1e8)
@@ -1749,7 +2747,8 @@ def show_kline(code, period=None):
             dpg.fit_axis_data("ay2")
 
         # 第3层: MACD
-        with dpg.plot(label="MACD (12,26,9)", no_title=False, height=-1):
+        with dpg.plot(label="MACD (12,26,9)", no_title=False, height=-1,
+                      no_box_select=True):
             dpg.add_plot_legend()
             dpg.add_plot_axis(dpg.mvXAxis, tag="ax3")
             ay3 = dpg.add_plot_axis(dpg.mvYAxis, label="MACD", tag="ay3")
@@ -1772,14 +2771,76 @@ def show_kline(code, period=None):
             dpg.fit_axis_data("ax3")
             dpg.fit_axis_data("ay3")
 
+        # === 右列(column_major): 筹码栏固定在窗口右侧,X轴独立不随K线缩放,
+        #     Y轴(价格)经 link_rows 与K线主图联动对齐 ===
+        # 右上: 筹码分布(成本分布)独立子图
+        with dpg.plot(label="筹码", no_title=True, height=-1, no_box_select=True,
+                      no_mouse_pos=True, tag="chipplot"):
+            dpg.add_plot_axis(dpg.mvXAxis, tag="chipx", no_tick_labels=True,
+                              no_gridlines=True)
+            # 价格刻度显示在筹码栏右侧(opposite),与K线主图价格联动对齐,
+            # 方便直接读出筹码峰对应的价位。
+            cy = dpg.add_plot_axis(dpg.mvYAxis, tag="chipy", opposite=True,
+                                   tick_format="%.2f")
+            try:
+                _cdf = db.load_kline(code)   # 用完整日线算成本沉淀
+                _fm = db.get_fundamental(code) or {}
+                _chip = chip.compute_chip_distribution(
+                    _cdf, total_mv=_fm.get("total_mv"))
+            except Exception:  # noqa
+                _chip = None
+            if _chip is not None and _chip["chips"].max() > 0:
+                _pr = _chip["prices"]
+                _ch = _chip["chips"]
+                _lc = _chip["last_close"]
+                _thick = float(_pr[1] - _pr[0]) if len(_pr) > 1 else 0.1
+                # 获利盘(成本≤现价)红,套牢盘(成本>现价)绿。横向柱从 x=0 向右
+                win_p = [float(p) for p, c in zip(_pr, _ch) if p <= _lc]
+                win_x = [float(c) for p, c in zip(_pr, _ch) if p <= _lc]
+                los_p = [float(p) for p, c in zip(_pr, _ch) if p > _lc]
+                los_x = [float(c) for p, c in zip(_pr, _ch) if p > _lc]
+                _pf = _chip["profit_ratio"] * 100
+                if win_x:
+                    bid = dpg.add_bar_series(
+                        win_x, win_p, parent=cy, horizontal=True,
+                        weight=_thick, label=f"获利盘 {_pf:.0f}%")
+                    dpg.bind_item_theme(bid, "bar_red")
+                if los_x:
+                    bid = dpg.add_bar_series(
+                        los_x, los_p, parent=cy, horizontal=True,
+                        weight=_thick, label=f"套牢盘 {100 - _pf:.0f}%")
+                    dpg.bind_item_theme(bid, "bar_green")
+                # 平均成本线(在筹码栏内也标一条,与左侧K线的成本线同价位)
+                _ac = _chip["avg_cost"]
+                _xm = float(max(_ch))
+                dpg.add_line_series([0.0, _xm], [_ac, _ac], parent=cy,
+                                    label=f"均本 {_ac:.2f}")
+                dpg.fit_axis_data("chipx")
+                dpg.fit_axis_data("chipy")
+
+        # 右中/右下: 占位空图(3×2网格补齐,不显示内容)
+        for _ph in ("chip_ph2", "chip_ph3"):
+            with dpg.plot(no_title=True, height=-1, no_box_select=True,
+                          no_menus=True, tag=_ph):
+                dpg.add_plot_axis(dpg.mvXAxis, no_tick_labels=True,
+                                  no_gridlines=True)
+                dpg.add_plot_axis(dpg.mvYAxis, no_tick_labels=True,
+                                  no_gridlines=True)
+
     # 缓存本次绘制的K线数据,供鼠标悬停提示回调按索引取值
     STATE["kl_bars"] = {
         "n": n,
         "dates": dates,
         "open": opens, "close": closes, "high": highs, "low": lows,
+        "rsi": rsis,
     }
 
     dpg.set_value("kline_title", f"{pname} / 成交额 / MACD - {label}")
+    # 切回 K 线:清空分时专用的涨跌幅/后缀,避免残留上一只票的红绿数字
+    if dpg.does_item_exist("kline_title_chg"):
+        dpg.set_value("kline_title_chg", "")
+    if dpg.does_item_exist("kline_title_suffix"):
+        dpg.set_value("kline_title_suffix", "")
     _set_status(f"已绘制 {label} 的{pname}图表")
 
 
@@ -1818,8 +2879,19 @@ def on_ai_comment(sender=None, app_data=None, user_data=None, force=False):
             dpg.configure_item(tag, color=color, show=True)
 
     def worker():
+        # 流式回调:边生成边把增量追加到点评文本(缓存命中时不会触发)
+        stream = {"buf": "", "head": ""}
+
+        def _on_delta(piece):
+            stream["buf"] += piece
+            if dpg.does_item_exist("ai_comment_text"):
+                dpg.set_value("ai_comment_text", stream["head"] + stream["buf"])
+
+        # 先算出 head 前缀(需要 facts,但流式回调早于 res 返回,故预取名称)
+        stream["head"] = f"【{code} {nm}】\n" if nm else f"【{code}】\n"
         res = ai_commentary.comment_stock(code, strategy_hint=hint,
-                                          force_refresh=force)
+                                          force_refresh=force,
+                                          on_delta=_on_delta)
         try:
             if res.get("ok"):
                 f = res["facts"]
@@ -1878,8 +2950,19 @@ def _on_kline_hover(sender, app_data):
     h, low = bars["high"][idx], bars["low"][idx]
     d = bars["dates"][idx]
     chg = ((c - o) / o * 100) if o else 0.0
+    # RSI(14):该根K线的相对强弱,附超买/超卖状态
+    rsi_line = ""
+    rv = bars.get("rsi", [None] * bars["n"])[idx]
+    try:
+        rv = float(rv)
+        if rv == rv:   # 非 NaN
+            st = "超买" if rv >= 70 else ("超卖" if rv <= 30 else "中性")
+            rsi_line = f"\nRSI {rv:.1f}({st})"
+    except (TypeError, ValueError):
+        pass
     txt = (f"{d}\n开 {o:.2f}  收 {c:.2f}\n"
-           f"高 {h:.2f}  低 {low:.2f}\n涨跌 {'+' if chg >= 0 else ''}{chg:.2f}%")
+           f"高 {h:.2f}  低 {low:.2f}\n涨跌 {'+' if chg >= 0 else ''}{chg:.2f}%"
+           f"{rsi_line}")
     # 提示框锚定到该蜡烛索引、Y 跟随鼠标,颜色随涨跌
     col = (230, 90, 90, 255) if c >= o else (90, 200, 120, 255)
     dpg.configure_item("kanno", label=txt, default_value=(idx, my),
@@ -1888,6 +2971,7 @@ def _on_kline_hover(sender, app_data):
 
 # ---------- 构建界面 ----------
 STRATEGY_LABEL2KEY = {cls.name: key for key, cls in ALL_STRATEGIES.items()}
+KEY2STRATEGY_LABEL = {key: cls.name for key, cls in ALL_STRATEGIES.items()}
 
 
 def build_ui():
@@ -1923,6 +3007,14 @@ def build_ui():
                                  default_value=False, tag="fetch_funda")
                 dpg.add_checkbox(label="同时拉取ETF(主流宽基+行业约50只)",
                                  default_value=False, tag="fetch_etf")
+                dpg.add_checkbox(label="强制全量重拉(覆盖历史,修复脏数据)",
+                                 default_value=False, tag="force_full",
+                                 callback=lambda s, a: dpg.configure_item(
+                                     "force_full_hint", show=bool(a)))
+                dpg.add_text("已勾选:将覆盖本地全部历史日线(而非只补最新)。\n"
+                             "用于修正旧的成交量/成交额脏数据,耗时与首次相当。",
+                             tag="force_full_hint", show=False,
+                             wrap=300, color=(255, 180, 90))
                 dpg.add_text("主流股(沪深300+中证500)优先,并发拉取并同步\n"
                              "大盘指数+行业。400只约3-5分钟;全A股(5000+)\n"
                              "首次约30-50分钟,选股/回测也更慢,按需选择。\n"
@@ -1931,11 +3023,34 @@ def build_ui():
                 dpg.add_separator()
 
                 dpg.add_text("2. 选择策略")
+                dpg.add_text("用一句话选股(AI 翻译成筛选条件,本地引擎执行):",
+                             color=(120, 220, 160), wrap=300)
+                dpg.add_input_text(
+                    tag="nl_query_in", width=280,
+                    hint="如:市值500亿以内的MACD金叉前8只",
+                    callback=on_nl_scan, on_enter=True)
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label="AI 选股", callback=on_nl_scan,
+                                   width=138, height=28, tag="nl_scan_btn")
+                    dpg.add_button(
+                        label="示例", width=138, height=28,
+                        callback=lambda: dpg.set_value(
+                            "nl_query_in", "低估值高ROE的白马股,PE不超过25,前10只"))
+                dpg.add_text("", tag="nl_query_hint", wrap=300,
+                             color=(160, 200, 255))
+                dpg.add_separator()
+
+                dpg.add_text("或手动选择策略")
                 dpg.add_combo(
-                    list(STRATEGY_LABEL2KEY.keys()),
+                    [CROSS_SECTION_LABEL] + list(STRATEGY_LABEL2KEY.keys()),
                     default_value=list(STRATEGY_LABEL2KEY.keys())[0],
                     callback=on_strategy_change, tag="strategy_combo", width=280,
                 )
+                with dpg.group(horizontal=True):
+                    dpg.add_text("取前N只(仅智能版):", color=(130, 130, 130))
+                    dpg.add_input_int(tag="cs_top_n", default_value=50,
+                                      min_value=1, max_value=300, width=90,
+                                      step=10)
                 dpg.add_child_window(tag="param_area", height=170, border=False)
                 dpg.add_separator()
 
@@ -1985,10 +3100,16 @@ def build_ui():
                             dpg.add_text("选股结果(点代码看K线,点+自选加入持仓跟踪)")
                             dpg.add_button(label="AI精排Top10", width=110, height=24,
                                            tag="ai_rank_btn", callback=on_ai_rank)
+                            dpg.add_button(label="批量点评(晨报)", width=120, height=24,
+                                           tag="ai_batch_btn",
+                                           callback=lambda: on_ai_batch("results"))
+                            dpg.add_button(label="组合解读", width=90, height=24,
+                                           tag="ai_pf_btn",
+                                           callback=lambda: on_ai_portfolio("results"))
                             dpg.add_text("", tag="ai_rank_hint", color=(130, 130, 130))
                         with dpg.table(tag="result_table", header_row=True,
                                        resizable=True, policy=dpg.mvTable_SizingStretchProp,
-                                       height=210, scrollY=True):
+                                       height=210, scrollY=True, freeze_rows=1):
                             for col in ["代码", "名称", "行业", "现价", "PE", "PB",
                                         "ROE%", "市值亿", "得分", "说明", "操作"]:
                                 dpg.add_table_column(label=col)
@@ -2011,6 +3132,35 @@ def build_ui():
                                     dpg.add_table_column(label=col)
                             dpg.add_text("", tag="ai_rank_disclaimer",
                                          wrap=820, color=(150, 150, 150))
+                        # --- AI 批量点评晨报面板(默认隐藏) ---
+                        with dpg.child_window(tag="ai_batch_win", height=200,
+                                              border=True, show=False):
+                            with dpg.group(horizontal=True):
+                                dpg.add_text("AI 批量点评晨报", tag="ai_batch_title",
+                                             color=(160, 200, 255))
+                                dpg.add_button(label="打开目录", width=76, height=22,
+                                               callback=on_open_report_dir)
+                                dpg.add_button(label="关闭", width=48, height=22,
+                                               callback=lambda: dpg.configure_item(
+                                                   "ai_batch_win", show=False))
+                            dpg.add_text("", tag="ai_batch_report",
+                                         wrap=820, color=(120, 220, 160))
+                            with dpg.child_window(height=120, border=False):
+                                dpg.add_text("", tag="ai_batch_text", wrap=810,
+                                             color=(225, 225, 225))
+                        # --- AI 组合解读面板(默认隐藏,流式) ---
+                        with dpg.child_window(tag="ai_pf_win", height=190,
+                                              border=True, show=False):
+                            with dpg.group(horizontal=True):
+                                dpg.add_text("AI 组合解读", tag="ai_pf_title",
+                                             color=(160, 200, 255))
+                                dpg.add_button(label="关闭", width=48, height=22,
+                                               callback=lambda: dpg.configure_item(
+                                                   "ai_pf_win", show=False))
+                            dpg.add_text("", tag="ai_pf_text", wrap=820,
+                                         color=(225, 225, 225))
+                            dpg.add_text("", tag="ai_pf_disclaimer", wrap=820,
+                                         color=(150, 150, 150), show=False)
                         dpg.add_separator()
                         # --- 搜索:在本地已拉取的股票/ETF 中模糊搜索(代码或名称) ---
                         with dpg.group(horizontal=True):
@@ -2069,10 +3219,17 @@ def build_ui():
                                          color=(230, 230, 230))
                             dpg.add_text("", tag="ai_comment_disclaimer", wrap=820,
                                          color=(150, 150, 150), show=False)
-                        dpg.add_text("K线 / 成交额 / MACD", tag="kline_title")
+                        # 标题行:横向 group,把"涨跌幅"单独拆出来上色(单 text 无法分段着色)
+                        with dpg.group(tag="kline_title_bar", horizontal=True,
+                                       horizontal_spacing=0):
+                            dpg.add_text("K线 / 成交额 / MACD", tag="kline_title")
+                            dpg.add_text("", tag="kline_title_chg")   # 涨跌幅,红涨绿跌
+                            dpg.add_text("", tag="kline_title_suffix",
+                                         color=(160, 160, 160))       # 后缀(轮询中/已停)
                         # 基本面信息栏(PE/PB/ROE/市值/成长性),紧贴图上方常驻显示
-                        dpg.add_text("", tag="kline_info", wrap=1050,
-                                     color=(200, 210, 225))
+                        # 用横向 group 容纳多个分色 text(单个 text 无法分字段着色)
+                        dpg.add_group(tag="kline_info", horizontal=True,
+                                      horizontal_spacing=0)
                         dpg.add_child_window(tag="chart_area", border=False, height=-1)
 
                     # --- Tab 2: 今日推荐 ---
@@ -2140,6 +3297,13 @@ def build_ui():
                             dpg.add_button(label="刷新实时行情", callback=on_refresh_realtime,
                                            width=140, height=30)
                             dpg.add_text("", tag="watch_status", color=(255, 200, 100), wrap=520)
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label="AI 点评自选(晨报)", width=150, height=28,
+                                           callback=lambda: on_ai_batch("watch"))
+                            dpg.add_button(label="AI 组合解读", width=120, height=28,
+                                           callback=lambda: on_ai_portfolio("watch"))
+                            dpg.add_button(label="点评历史", width=90, height=28,
+                                           callback=on_open_ai_history)
                         dpg.add_text("买入价默认记为加入时的现价;『刷新实时行情』拉全市场快照算"
                                      "当日涨跌+浮动盈亏并检查预警;点代码看K线",
                                      wrap=900, color=(130, 130, 130))

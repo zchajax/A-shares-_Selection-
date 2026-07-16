@@ -177,6 +177,26 @@ def init_db():
             )
             """
         )
+        # AI 点评历史存档:每次成功点评落一条,供历史回看("这只票上周AI怎么说")。
+        # 同一 code 保留多条(按时间),trade_date 标注点评所依据的交易日。
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_commentary (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                code       TEXT,
+                name       TEXT,
+                trade_date TEXT,               -- 点评所依据的交易日
+                rating     TEXT,               -- 偏多/中性/偏空
+                risk       TEXT,               -- 高/中/低
+                text       TEXT,               -- 点评全文
+                created_at TEXT
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ai_comm_code "
+            "ON ai_commentary(code, created_at)"
+        )
 
 
 def save_stock_list(df: pd.DataFrame):
@@ -673,6 +693,50 @@ def name_of(code: str) -> str:
             return (row[0] if row and row[0] else "") or ""
         except Exception:
             return ""
+
+
+# ==================== AI 点评历史存档 ====================
+def save_ai_commentary(code: str, name: str, trade_date: str,
+                       rating: str, risk: str, text: str):
+    """存一条 AI 点评历史。同 code+trade_date 已存在则更新(当天多次点评只留最新)。"""
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        try:
+            # 当天同一只票已有记录则更新,否则插入(避免历史表被同日重复点评灌满)
+            row = conn.execute(
+                "SELECT id FROM ai_commentary WHERE code=? AND trade_date=?",
+                (code, trade_date)).fetchone()
+            if row:
+                conn.execute(
+                    "UPDATE ai_commentary SET name=?,rating=?,risk=?,text=?,"
+                    "created_at=? WHERE id=?",
+                    (name, rating, risk, text, now, row[0]))
+            else:
+                conn.execute(
+                    "INSERT INTO ai_commentary "
+                    "(code,name,trade_date,rating,risk,text,created_at) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (code, name, trade_date, rating, risk, text, now))
+        except Exception:  # noqa 存档失败不影响点评本身
+            pass
+
+
+def load_ai_commentary(code: str = None, limit: int = 50) -> pd.DataFrame:
+    """读取 AI 点评历史。code=None 取全部(最新在前),否则只取该股。"""
+    cols = ["id", "code", "name", "trade_date", "rating", "risk",
+            "text", "created_at"]
+    with get_conn() as conn:
+        try:
+            if code:
+                return pd.read_sql(
+                    "SELECT " + ",".join(cols) + " FROM ai_commentary "
+                    "WHERE code=? ORDER BY created_at DESC LIMIT ?",
+                    conn, params=(code, limit))
+            return pd.read_sql(
+                "SELECT " + ",".join(cols) + " FROM ai_commentary "
+                "ORDER BY created_at DESC LIMIT ?", conn, params=(limit,))
+        except Exception:
+            return pd.DataFrame(columns=cols)
 
 
 def cache_summary() -> dict:

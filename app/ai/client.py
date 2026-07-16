@@ -130,3 +130,81 @@ def chat(messages, temperature=0.2, max_tokens=700, retries=2) -> str:
         # 指数退避后重试
         time.sleep(1.2 * (attempt + 1))
     raise AIError(last_err or "AI 调用失败")
+
+
+def chat_stream(messages, on_delta, temperature=0.2, max_tokens=700) -> str:
+    """
+    流式调用 OpenAI 兼容的 /chat/completions(stream=True),边生成边回调。
+
+    on_delta(piece): 每收到一小段增量文本就回调一次(UI 可即时追加显示)。
+    返回值: 完整拼接后的文本。
+    - 不做重试(流式中断难以续接);网络/接口错误统一抛 AIError。
+    - 若服务端不支持流式或首块解析失败,调用方可回退到普通 chat()。
+    仅用标准库 urllib,逐行解析 SSE(data: {...})。
+    """
+    c = _load_config()
+    if not (c.get("base_url") and c.get("api_key") and c.get("model")):
+        raise AIError(config_hint())
+
+    base_url = c["base_url"].rstrip("/")
+    url = base_url + "/chat/completions"
+    timeout = float(c.get("timeout", 40))
+
+    payload = {
+        "model": c["model"],
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {c['api_key']}",
+            "Accept": "text/event-stream",
+        },
+    )
+
+    full = []
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            for raw_line in resp:
+                try:
+                    line = raw_line.decode("utf-8").strip()
+                except Exception:  # noqa
+                    continue
+                if not line or not line.startswith("data:"):
+                    continue
+                chunk = line[len("data:"):].strip()
+                if chunk == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(chunk)
+                    delta = obj["choices"][0].get("delta", {})
+                    piece = delta.get("content") or ""
+                except Exception:  # noqa 单块解析失败跳过,不中断整体流
+                    continue
+                if piece:
+                    full.append(piece)
+                    try:
+                        on_delta(piece)
+                    except Exception:  # noqa 回调异常不影响接收
+                        pass
+    except urllib.error.HTTPError as e:  # noqa
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8")[:300]
+        except Exception:  # noqa
+            pass
+        raise AIError(f"接口返回错误 HTTP {e.code}: {detail or e.reason}")
+    except urllib.error.URLError as e:  # noqa
+        raise AIError(f"网络连接失败: {getattr(e, 'reason', e)}")
+    except Exception as e:  # noqa
+        raise AIError(f"流式调用异常: {e}")
+
+    text = "".join(full).strip()
+    if not text:
+        raise AIError("流式返回为空")
+    return text

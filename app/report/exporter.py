@@ -430,3 +430,77 @@ def export_all(snap: dict) -> tuple:
     xlsx = export_excel(snap)
     html = export_html(snap)
     return xlsx, html
+
+
+# ==================== AI 点评晨报导出 ====================
+_RATING_COLOR = {"偏多": "#d32029", "中性": "#8c8c8c", "偏空": "#389e0d"}
+_RISK_COLOR = {"高": "#d32029", "中": "#d46b08", "低": "#389e0d"}
+
+
+def export_ai_report(items: list, title: str = "AI 点评晨报",
+                     disclaimer: str = "", path: str = None) -> str:
+    """把一批 AI 点评(comment_batch 的 items)导出为自包含 HTML 晨报。
+
+    items: [{code,name,industry,rating,risk,text} 或 {code,name,error}]。
+    涨红跌绿(A股习惯):偏多=红、偏空=绿。返回生成的文件路径。
+    """
+    _ensure_dir()
+    path = path or os.path.join(REPORT_DIR, f"AI点评晨报_{_ts()}.html")
+    gen_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cards = []
+    for it in (items or []):
+        code = it.get("code", "")
+        name = it.get("name", "")
+        if it.get("error"):
+            cards.append(
+                f'<div class="card err"><div class="hd">{code} {name}</div>'
+                f'<div class="body">点评失败: {it["error"]}</div></div>')
+            continue
+        rating = it.get("rating") or "-"
+        risk = it.get("risk") or "-"
+        rc = _RATING_COLOR.get(rating, "#8c8c8c")
+        kc = _RISK_COLOR.get(risk, "#8c8c8c")
+        industry = it.get("industry", "")
+        # 点评正文按行显示(保留【综合】【技术面】等分段)
+        body = (it.get("text", "") or "").replace("&", "&amp;") \
+            .replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+        cards.append(
+            f'<div class="card">'
+            f'<div class="hd"><span class="code">{code}</span> '
+            f'<span class="name">{name}</span> '
+            f'<span class="ind">{industry}</span>'
+            f'<span class="badge" style="background:{rc}">评级 {rating}</span>'
+            f'<span class="badge" style="background:{kc}">风险 {risk}</span>'
+            f'</div><div class="body">{body}</div></div>')
+
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>
+  body{{font-family:-apple-system,"Microsoft YaHei",sans-serif;background:#f5f5f5;
+       margin:0;padding:24px;color:#1f1f1f}}
+  h1{{font-size:22px;margin:0 0 4px}}
+  .meta{{color:#8c8c8c;font-size:13px;margin-bottom:18px}}
+  .card{{background:#fff;border-radius:10px;padding:16px 18px;margin-bottom:14px;
+         box-shadow:0 1px 4px rgba(0,0,0,.08)}}
+  .card.err{{border-left:4px solid #d32029}}
+  .hd{{font-size:16px;margin-bottom:10px;display:flex;align-items:center;
+       flex-wrap:wrap;gap:8px}}
+  .code{{font-weight:700}}
+  .name{{font-weight:600}}
+  .ind{{color:#8c8c8c;font-size:13px}}
+  .badge{{color:#fff;font-size:12px;padding:2px 10px;border-radius:10px}}
+  .body{{font-size:14px;line-height:1.8;color:#333}}
+  .disc{{color:#bfbfbf;font-size:12px;margin-top:20px;text-align:center}}
+</style></head><body>
+<h1>{title}</h1>
+<div class="meta">生成时间 {gen_at} &nbsp;|&nbsp; 共 {len(items or [])} 只</div>
+{''.join(cards)}
+<div class="disc">{disclaimer}</div>
+</body></html>"""
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return path

@@ -38,7 +38,13 @@ def apply_filter(df: pd.DataFrame, thresholds: dict) -> pd.DataFrame:
       roe_min    净资产收益率(%) 下限
       mv_min     总市值(亿) 下限
       mv_max     总市值(亿) 上限
-      drop_missing 缺失基本面数据的票是否剔除(默认 False:数据缺失不误杀)
+      drop_missing 是否额外剔除"缺任一基本面数据"的票(默认 False)
+
+    缺失值语义(重要):
+      · 当某项门槛被启用(如设了 pe_max),而该标的缺失对应指标(如 ETF 没有 PE)时,
+        它无法证明自己满足门槛 -> 直接视为不达标剔除。这符合选股器直觉:
+        "限制了 PE,就不该混进没有 PE 的标的"。
+      · drop_missing=True 时更严格:只要缺任一基本面字段就剔除(无论是否设了对应门槛)。
 
     返回过滤后的 df(已补基本面列),保持原排序。
     """
@@ -47,52 +53,43 @@ def apply_filter(df: pd.DataFrame, thresholds: dict) -> pd.DataFrame:
     out = enrich_with_fundamental(df)
     drop_missing = bool(thresholds.get("drop_missing", False))
 
+    def _missing(v) -> bool:
+        return v is None or pd.isna(v)
+
     def keep(row) -> bool:
         pe = row.get("pe_ttm")
         pb = row.get("pb")
         roe = row.get("roe")
         mv = row.get("total_mv")
 
+        # drop_missing:缺任一基本面字段即剔除(最严格)
+        if drop_missing and any(_missing(v) for v in (pe, pb, roe, mv)):
+            return False
+
         pe_max = thresholds.get("pe_max")
         if pe_max and pe_max > 0:
-            if pe is None or pd.isna(pe):
-                if drop_missing:
-                    return False
-            else:
-                # 负PE(亏损)在启用PE上限时视为不达标剔除
-                if pe <= 0 or pe > pe_max:
-                    return False
+            # 缺 PE 无法满足 PE 门槛 -> 剔除;负PE(亏损)同样不达标
+            if _missing(pe) or pe <= 0 or pe > pe_max:
+                return False
 
         pb_max = thresholds.get("pb_max")
         if pb_max and pb_max > 0:
-            if pb is None or pd.isna(pb):
-                if drop_missing:
-                    return False
-            elif pb > pb_max:
+            if _missing(pb) or pb > pb_max:
                 return False
 
         roe_min = thresholds.get("roe_min")
         if roe_min is not None and roe_min != 0:
-            if roe is None or pd.isna(roe):
-                if drop_missing:
-                    return False
-            elif roe < roe_min:
+            if _missing(roe) or roe < roe_min:
                 return False
 
         mv_min = thresholds.get("mv_min")
         if mv_min and mv_min > 0:
-            if mv is None or pd.isna(mv):
-                if drop_missing:
-                    return False
-            elif mv < mv_min:
+            if _missing(mv) or mv < mv_min:
                 return False
 
         mv_max = thresholds.get("mv_max")
         if mv_max and mv_max > 0:
-            if mv is None or pd.isna(mv):
-                if drop_missing:
-                    return False
-            elif mv > mv_max:
+            if _missing(mv) or mv > mv_max:
                 return False
 
         return True

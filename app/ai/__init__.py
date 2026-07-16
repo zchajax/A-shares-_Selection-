@@ -9,5 +9,5 @@
   可自由切换 DeepSeek / 通义 / 智谱 / OpenAI 等,key 绝不进 git。
 """
 
-from .client import chat, is_configured, config_hint      # noqa: F401
+from .client import chat, chat_stream, is_configured, config_hint  # noqa: F401
 from .commentary import comment_stock, build_facts          # noqa: F401

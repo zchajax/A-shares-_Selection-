@@ -227,12 +227,17 @@ def _fetch_daily_raw(sina_symbol: str, start_date: str, adjust: str) -> pd.DataF
         ), tries=2)
         if df is not None and not df.empty:
             df = df.rename(columns=str.lower).copy()
-            # 腾讯列: date open close high low amount (无 volume)
+            # 腾讯列: date open close high low amount
+            # 注意!! 腾讯这个 amount 列实际是"成交量(单位:手)",不是成交额(元)。
+            #   实测: 工行 amount=6507835 ×100 = 6.5亿股 ≈ 新浪真实 volume,完全吻合。
             df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
             for c in ["open", "high", "low", "close", "amount"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
-            # 无成交量,用 成交额/收盘价 估算(单位:股),够指标计算用
-            df["volume"] = (df["amount"] / df["close"].replace(0, pd.NA)).fillna(0.0)
+            # amount(手) → volume(股): ×100
+            df["volume"] = (df["amount"].fillna(0.0) * 100).astype(float)
+            # 腾讯源无真实成交额,用 成交量(股)×收盘价 估算(元)。
+            #   大盘股 close≈日内均价,误差极小(工行估49亿 vs 真实48.6亿,<1%)。
+            df["amount"] = (df["volume"] * df["close"]).astype(float)
             return df[["date", "open", "high", "low", "close", "volume", "amount"]]
     except Exception as e:  # noqa
         print(f"[info] 腾讯源 {sina_symbol} 失败,回退新浪: {e}")
