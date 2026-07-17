@@ -21,6 +21,8 @@ from app.strategy import indicators as ind
 from .client import chat, chat_stream, AIError
 
 DISCLAIMER = "以上为 AI 依据技术与基本面指标生成的解读,仅供参考,不构成任何投资建议。"
+# ETF 无个股基本面,免责声明改用基金语境(技术面 + 折溢价等指标)。
+ETF_DISCLAIMER = "以上为 AI 依据技术面与折溢价等指标生成的解读,仅供参考,不构成任何投资建议。"
 
 SYSTEM_PROMPT = (
     "你是一名严谨的 A 股分析助手。用户会给你某只股票由系统算好/实时拉取的客观事实,"
@@ -30,8 +32,12 @@ SYSTEM_PROMPT = (
     "标注两项评级,便于程序解析:  评级:偏多/中性/偏空 | 风险:高/中/低\n"
     "【技术面】2-3 句:趋势、量能、动能强弱;若给出【多周期】信息,须结合日线与"
     "周线是否共振(大小周期同向更可靠,背离需警惕短期反弹或回调);若给出【筹码结构】,"
-    "可结合获利盘/平均成本/成本密集区判断上方套牢抛压或下方支撑(筹码为本地估算,只作"
-    "定性参考,不得报精确套牢比例);\n"
+    "切忌仅凭获利盘比例高低下结论(获利盘高≠必然获利了结、低≠必然抛压严重):获利盘只是"
+    "'燃料量',须联合筹码密集/分散(以事实行给出的定性标签为准,不要自行从集中度数值推方向)"
+    "与价格位置综合研判——筹码密集时持仓者浮盈相近、抛压弱、易同涨同跌(常是主升浪特征),"
+    "筹码分散且下方堆积获利盘时了结冲动才强;现价处于筹码峰顶部(上方几乎无套牢盘)则'抛压"
+    "严重'无从谈起,现价上方压着又近又厚的套牢盘才构成实打实的反弹阻力。据此定性判断上方"
+    "抛压或下方支撑(筹码为本地估算,只作定性参考,不得报精确套牢比例);\n"
     "【基本面】2-3 句:估值高低(结合行业分位)、盈利能力(ROE/毛利率/净利率)、"
     "成长性(营收/净利增速)、负债水平;数据缺失就说明未获取到,不得编造;\n"
     "【风险】1-2 条客观风险点(如超买、放量滞涨、指标背离、临近压力位、估值高于行业、"
@@ -40,6 +46,41 @@ SYSTEM_PROMPT = (
     "不得编造事实里没有给出的信息(尤其不得虚构财报数字、消息面、新闻)。"
     "语气客观中立,总字数控制在 260 字内。"
 )
+
+# ETF 是指数基金,没有个股的 PE/PB/ROE/财报/筹码套牢盘等概念,
+# 因此用一套基金语境的提示词:聚焦跟踪指数的价格趋势、折溢价、规模流动性。
+ETF_SYSTEM_PROMPT = (
+    "你是一名严谨的 A 股 ETF(交易所交易基金)分析助手。用户会给你某只 ETF 由系统"
+    "算好/实时拉取的客观事实,包含【技术面】(趋势/量能/动能/位置)与【ETF专属指标】"
+    "(折溢价率/IOPV估值/基金规模/换手率/资金流)。\n"
+    "重要认知:ETF 是一篮子成分股组成的指数基金,跟踪某个指数或行业主题,"
+    "本身【没有】个股的市盈率/市净率/ROE/营收利润/财报,也【不存在】个股意义上的"
+    "'套牢盘/获利盘'(ETF 靠一二级市场申赎套利,价格锚定净值)。因此严禁套用个股"
+    "财务或筹码套牢逻辑,更不要说'未获取到基本面数据'这类话——对 ETF 而言这些指标"
+    "本就不适用,属正常。\n"
+    "你的输出必须严格分为四部分,顺序与标签固定:\n"
+    "【综合】先给一句总定性(如'跟踪某行业指数、当前趋势偏弱的行业ETF'),再在同一行"
+    "末尾用固定格式标注两项评级,便于程序解析:  评级:偏多/中性/偏空 | 风险:高/中/低\n"
+    "【技术面】2-3 句:结合均线/MACD/RSI/量能判断趋势与动能强弱;若给出【多周期】,"
+    "须结合日线与周线是否共振(同向更可靠,背离需警惕);说明当前处于近60日区间的高/低位。\n"
+    "【资金与折溢价】2-3 句:①折溢价——折价率为正=现价低于净值(场内买相对划算),"
+    "为负=溢价(现价高于净值,追高需谨慎,溢价过高有回归风险);②基金规模——规模越大"
+    "流动性越好、越不易被边缘化(规模过小如低于2亿有清盘/流动性风险);③换手率/资金流"
+    "反映交投活跃度与主力动向。数据缺失就说明未获取到,不得编造。\n"
+    "【风险】1-2 条客观风险点(如高位偏热、放量滞涨、日周共振向下、溢价偏高存回归风险、"
+    "规模偏小流动性弱、跟踪指数系统性回调等)。\n"
+    "严格禁止:不得给出'买入/卖出/加仓/减仓'等操作建议,不得预测目标价或涨跌幅,"
+    "不得编造事实里没有给出的信息;不得虚构成分股、跟踪指数名称或净值数字。"
+    "语气客观中立,总字数控制在 260 字内。"
+)
+
+
+def _is_etf(code: str) -> bool:
+    """判断是否为 ETF(以本地已登记的 etf_list 为准,可靠且不联网)。"""
+    try:
+        return str(code).zfill(6) in db.load_etf_codes()
+    except Exception:  # noqa
+        return False
 
 
 def _fmt(x, nd=2):
@@ -103,6 +144,26 @@ def get_fundamental_ondemand(code: str) -> dict:
             out["_source"] = "fetched"
             return out
     except Exception:  # noqa 无网络/未装 akshare 等
+        pass
+    return {**{k: None for k in _keys}, "_source": "none"}
+
+
+def get_etf_metrics_ondemand(code: str) -> dict:
+    """取单只 ETF 的专属指标(折溢价/规模/换手/资金流),实时拉取一次。
+
+    返回含 iopv/discount_rate/turnover/vol_ratio/scale_yi/main_inflow_yi/
+    main_inflow_pct 及 _source。失败降级 _source="none",不抛异常。
+    """
+    _keys = ("iopv", "discount_rate", "turnover", "vol_ratio",
+             "scale_yi", "main_inflow_yi", "main_inflow_pct")
+    try:
+        from app.data import fetcher as ft
+        d = ft.fetch_etf_metrics(code)
+        if d and any(d.get(k) is not None for k in _keys):
+            out = {k: d.get(k) for k in _keys}
+            out["_source"] = "fetched"
+            return out
+    except Exception:  # noqa 无网络/接口变更等
         pass
     return {**{k: None for k in _keys}, "_source": "none"}
 
@@ -243,6 +304,47 @@ def build_facts(code: str) -> dict:
     low_20 = float(last["low_20"])
     pos_60 = (close - low_20) / (high_60 - low_20) * 100 if high_60 > low_20 else 50.0
 
+    is_etf = _is_etf(code)
+
+    # ETF 走基金专属分支:没有个股估值/财报/筹码套牢盘概念,
+    # 改注入 ETF 专属指标(折溢价/规模/换手/资金流),其余技术面字段与股票共用。
+    if is_etf:
+        etfm = get_etf_metrics_ondemand(code)
+        base = {
+            "code": code,
+            "name": name,
+            "industry": industry or "ETF/指数基金",
+            "is_etf": True,
+            "close": close,
+            "price_source": price_source,
+            "trade_date": rt.get("trade_date") if rt.get("_ok") else None,
+            "day_chg": day_chg,
+            "chg_5": float(last["chg_5"]),
+            "chg_20": float(last["chg_20"]),
+            "ma_state": ma_state,
+            "macd_state": macd_state,
+            "weekly_state": weekly["state"] if weekly else None,
+            "resonance": _resonance(ma_state, weekly),
+            "rsi": rsi,
+            "rsi_state": rsi_state,
+            "vol_ratio": vol_ratio,
+            "vol_state": vol_state,
+            "pos_60": pos_60,
+            "high_60": high_60,
+            "boll_up": float(last["boll_up"]),
+            "boll_low": float(last["boll_low"]),
+            # ETF 专属
+            "etf_iopv": etfm.get("iopv"),
+            "etf_discount_rate": etfm.get("discount_rate"),
+            "etf_turnover": etfm.get("turnover"),
+            "etf_vol_ratio": etfm.get("vol_ratio"),
+            "etf_scale_yi": etfm.get("scale_yi"),
+            "etf_inflow_yi": etfm.get("main_inflow_yi"),
+            "etf_inflow_pct": etfm.get("main_inflow_pct"),
+            "etf_metrics_source": etfm.get("_source", "none"),
+        }
+        return base
+
     # 基本面:本地有则用,缺失则实时拉取一次(失败降级为空)
     fund = get_fundamental_ondemand(code)
 
@@ -268,6 +370,7 @@ def build_facts(code: str) -> dict:
         "code": code,
         "name": name,
         "industry": industry or "未知",
+        "is_etf": False,
         "close": close,
         "price_source": price_source,
         "trade_date": rt.get("trade_date") if rt.get("_ok") else None,
@@ -396,6 +499,76 @@ def _fundamental_lines(f: dict) -> str:
     return "\n".join(lines)
 
 
+def _etf_metrics_lines(f: dict) -> str:
+    """ETF 专属指标要点:折溢价/规模/换手/资金流。整体缺失时明确说明未获取到。"""
+    keys = ("etf_iopv", "etf_discount_rate", "etf_turnover",
+            "etf_scale_yi", "etf_inflow_yi")
+    if all(f.get(k) is None for k in keys):
+        return ("- ETF专属指标: 未获取到折溢价/规模等数据(可能非交易时段或网络问题,"
+                "请在分析中说明缺失,不得编造)")
+    lines = []
+
+    dr = f.get("etf_discount_rate")
+    iopv = f.get("etf_iopv")
+    if dr is not None:
+        # 东财"基金折价率":正=折价(现价<净值,买相对划算),负=溢价(现价>净值)
+        if dr > 0.3:
+            dr_tag = "折价(现价低于净值,场内买入相对划算)"
+        elif dr < -0.3:
+            dr_tag = "溢价(现价高于净值,追高需谨慎、有向净值回归的风险)"
+        else:
+            dr_tag = "基本贴近净值(折溢价很小)"
+        iopv_s = f"、IOPV实时估值≈{_fmt(iopv, 3)}" if iopv is not None else ""
+        lines.append(f"- 折溢价: 折价率{_fmt(dr)}%{iopv_s}({dr_tag})")
+
+    sc = f.get("etf_scale_yi")
+    if sc is not None:
+        if sc < 2:
+            sc_tag = "规模偏小(低于2亿,存在流动性弱/清盘风险)"
+        elif sc < 10:
+            sc_tag = "规模中等"
+        else:
+            sc_tag = "规模较大(流动性较好)"
+        lines.append(f"- 基金规模: 约{_fmt(sc)}亿元({sc_tag})")
+
+    flow_parts = []
+    tv = f.get("etf_turnover")
+    if tv is not None:
+        flow_parts.append(f"换手率={_fmt(tv)}%")
+    inflow = f.get("etf_inflow_yi")
+    ipct = f.get("etf_inflow_pct")
+    if inflow is not None:
+        direction = "净流入" if inflow >= 0 else "净流出"
+        pct_s = f"(占比{_fmt(ipct)}%)" if ipct is not None else ""
+        flow_parts.append(f"主力{direction}{_fmt(abs(inflow))}亿{pct_s}")
+    if flow_parts:
+        lines.append("- 交投/资金: " + "; ".join(flow_parts))
+
+    return "\n".join(lines)
+
+
+def _etf_facts_to_lines(f: dict) -> str:
+    """ETF 专属事实拼装:技术面与股票共用,基本面/筹码替换为 ETF 专属指标。"""
+    price_tag = "当日实时" if f.get("price_source") == "realtime" else "本地日线收盘"
+    reson = ""
+    if f.get("resonance"):
+        wk = f.get("weekly_state") or ""
+        reson = f"- 多周期: 周线趋势={wk}; {f['resonance']}\n"
+    return (
+        f"- ETF: {f['code']} {f['name']}(交易所交易基金/指数基金,无个股财报与筹码套牢盘概念)\n"
+        f"- 最新价({price_tag}): {_fmt(f['close'], 3)}  当日涨跌: {_fmt(f['day_chg'])}%\n"
+        f"- 近5日涨跌: {_fmt(f['chg_5'])}%  近20日涨跌: {_fmt(f['chg_20'])}%\n"
+        f"- 均线形态(日线): {f['ma_state']}\n"
+        f"- 动能: {f['macd_state']}; RSI(14)={_fmt(f['rsi'],1)}({f['rsi_state']})\n"
+        f"{reson}"
+        f"- 量能: 量比={_fmt(f['vol_ratio'])}({f['vol_state']})\n"
+        f"- 位置: 处于近60日区间约 {_fmt(f['pos_60'],0)}% 分位"
+        f"(60日高={_fmt(f['high_60'], 3)})\n"
+        f"- 布林带: 上轨={_fmt(f['boll_up'], 3)} 下轨={_fmt(f['boll_low'], 3)}\n"
+        f"{_etf_metrics_lines(f)}"
+    )
+
+
 def _chip_line(f: dict) -> str:
     """筹码结构要点。定位为辅助参考:说清获利盘/成本区/集中度的"趋势含义",
     并明确告诉模型这是本地估算(股本近似)、只可定性、禁止编造精确数字。"""
@@ -438,7 +611,9 @@ def _chip_line(f: dict) -> str:
 
 
 def facts_to_lines(f: dict) -> str:
-    """把事实 dict 拼成给模型看的要点列表(纯文本)。"""
+    """把事实 dict 拼成给模型看的要点列表(纯文本)。ETF 走基金专属分支。"""
+    if f.get("is_etf"):
+        return _etf_facts_to_lines(f)
     price_tag = "当日实时" if f.get("price_source") == "realtime" else "本地日线收盘"
     reson = ""
     if f.get("resonance"):
@@ -461,8 +636,21 @@ def facts_to_lines(f: dict) -> str:
 
 
 def build_prompt(f: dict, strategy_hint: str = "") -> list:
-    """构造 messages。strategy_hint: 可选,说明该股被哪个策略选中/命中。"""
+    """构造 messages。strategy_hint: 可选,说明该股被哪个策略选中/命中。
+    ETF 走基金专属提示词与段落结构。"""
     extra = f"\n- 量化系统备注: {strategy_hint}" if strategy_hint else ""
+    if f.get("is_etf"):
+        user = (
+            "请解读以下这只 ETF(交易所交易基金,以下均为系统算好/实时拉取的客观事实,"
+            "含技术面与 ETF 专属指标):\n\n"
+            f"{facts_to_lines(f)}{extra}\n\n"
+            "请严格按【综合】【技术面】【资金与折溢价】【风险】四段输出,"
+            "并在【综合】行尾用固定格式标注:  评级:偏多/中性/偏空 | 风险:高/中/低"
+        )
+        return [
+            {"role": "system", "content": ETF_SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+        ]
     user = (
         "请解读以下这只股票(以下均为系统算好/实时拉取的客观事实,"
         "含技术面、基本面与行业对比):\n\n"
@@ -566,7 +754,8 @@ def comment_stock(code: str, strategy_hint: str = "",
     r = parse_rating(text)
     result = {"ok": True, "facts": facts, "text": text,
               "rating": r["rating"], "risk": r["risk"],
-              "cached": False, "disclaimer": DISCLAIMER}
+              "cached": False,
+              "disclaimer": ETF_DISCLAIMER if facts.get("is_etf") else DISCLAIMER}
     with _CACHE_LOCK:
         _CACHE[key] = result
     # 落历史存档(失败不影响点评返回)
@@ -787,3 +976,535 @@ def comment_portfolio(codes: list, title: str = "组合", on_delta=None) -> dict
 
     return {"ok": True, "profile": profile, "text": text,
             "disclaimer": DISCLAIMER}
+
+
+# ==================== 大盘/行业点评(对整个市场做研判) ====================
+MARKET_SYSTEM_PROMPT = (
+    "你是一名严谨的 A 股大盘分析助手。用户会给你当前大盘由系统实时拉取的客观事实,"
+    "包含【指数行情】(上证/深证/创业板/科创50/沪深300 等涨跌幅)、【市场情绪】"
+    "(涨跌家数、涨停跌停、赚钱效应/活跃度、两市成交额)、【行业板块】"
+    "(领涨/领跌行业及其涨跌幅、资金净额)。\n"
+    "请从整体市场视角输出研判,严格分四部分,顺序与标签固定:\n"
+    "【大盘】2-3 句:先给一句总定性(如'指数分化、量能萎缩的普跌格局'),说明主要"
+    "指数强弱、成交量水平;并在本段末尾用固定格式标注情绪评级,便于程序解析:"
+    "  情绪:偏暖/中性/偏冷\n"
+    "【市场情绪】2-3 句:结合涨跌家数与赚钱效应判断个股普涨还是普跌、是否存在"
+    "'指数失真'(少数权重护盘但多数个股下跌);涨停跌停家数反映的多空强度;\n"
+    "【热点板块】2-3 句:今日领涨与领跌的行业方向、是否有明确主线,结合资金净额"
+    "说明资金流向(注意:净额为全单口径流入−流出,方向可参考但数值偏小,非主力资金);\n"
+    "【风险提示】1-2 条客观风险点(如量能不足、赚钱效应低迷、指数与个股背离、"
+    "板块普跌无主线、涨停跌停比恶化等)。\n"
+    "严格禁止:不得给出'加仓/减仓/满仓/空仓/买入/卖出'等操作建议,不得预测"
+    "点位或涨跌幅,不得编造事实里没有给出的信息(尤其不得虚构消息面、政策、新闻)。"
+    "语气客观中立,总字数控制在 300 字内。"
+)
+
+
+def _market_facts_lines(snapshot: dict) -> str:
+    """把行情页已拉取的快照(指数/情绪/总貌/板块)统计成给 AI 的客观事实文本。
+
+    snapshot 结构(全部来自 UI 已展示的同一份数据,保证'点评'与'屏幕'一致):
+      {
+        "indexes": [{"name","chg_pct","price"}...],   # 核心指数
+        "sh_amount","sz_amount","total_amount": 元,    # 两市成交额
+        "activity": {上涨/下跌/平盘/涨停/真实涨停/跌停/真实跌停/停牌/活跃度...},
+        "boards": [{"name","chg_pct","net_inflow"}...] # 行业板块(已按涨幅降序)
+      }
+    纯本地拼装,不发网络请求。
+    """
+    lines = []
+
+    # ---- 指数行情 ----
+    idx = snapshot.get("indexes") or []
+    if idx:
+        parts = []
+        for r in idx:
+            cp = r.get("chg_pct")
+            cps = f"{cp:+.2f}%" if (cp is not None and cp == cp) else "-"
+            parts.append(f"{r.get('name', '')} {cps}")
+        lines.append("- 主要指数涨跌: " + "; ".join(parts))
+
+    # ---- 两市成交额 ----
+    tot = snapshot.get("total_amount")
+    sh = snapshot.get("sh_amount")
+    sz = snapshot.get("sz_amount")
+
+    def _yi(v):
+        try:
+            x = float(v)
+        except Exception:  # noqa
+            return None
+        if x != x:
+            return None
+        return x / 1e8
+
+    tot_yi, sh_yi, sz_yi = _yi(tot), _yi(sh), _yi(sz)
+    if tot_yi is not None:
+        amt_line = f"- 两市成交额: {tot_yi:,.0f} 亿"
+        if sh_yi is not None and sz_yi is not None:
+            amt_line += f"(沪 {sh_yi:,.0f} 亿 + 深 {sz_yi:,.0f} 亿)"
+        # 量能定性(经验阈值,仅作粗略参考)
+        if tot_yi >= 12000:
+            amt_line += ";量能较活跃"
+        elif tot_yi <= 7000:
+            amt_line += ";量能偏低迷"
+        else:
+            amt_line += ";量能中等"
+        lines.append(amt_line)
+
+    # ---- 市场情绪/涨跌家数 ----
+    act = snapshot.get("activity") or {}
+
+    def _int(k):
+        try:
+            return int(float(act.get(k)))
+        except Exception:  # noqa
+            return None
+    up, down, flat = _int("上涨"), _int("下跌"), _int("平盘")
+    zt, zt_real = _int("涨停"), _int("真实涨停")
+    dt, dt_real = _int("跌停"), _int("真实跌停")
+    if up is not None and down is not None:
+        total_ud = up + down + (flat or 0)
+        ratio = (up / (up + down) * 100) if (up + down) > 0 else None
+        line = f"- 涨跌家数: 上涨 {up} / 下跌 {down}"
+        if flat is not None:
+            line += f" / 平盘 {flat}"
+        if ratio is not None:
+            line += f"(上涨占比约 {ratio:.0f}%)"
+        lines.append(line)
+    zt_parts = []
+    if zt is not None:
+        zt_parts.append(f"涨停 {zt}" + (f"(真实 {zt_real})"
+                                        if zt_real is not None else ""))
+    if dt is not None:
+        zt_parts.append(f"跌停 {dt}" + (f"(真实 {dt_real})"
+                                        if dt_real is not None else ""))
+    if zt_parts:
+        lines.append("- 涨跌停: " + " / ".join(zt_parts))
+    active = act.get("活跃度")
+    if active is not None:
+        lines.append(f"- 赚钱效应(活跃度): {active}"
+                     "(即上涨股票占比,越高市场越普涨;<40% 偏冷,>60% 偏暖)")
+
+    # ---- 行业板块:领涨 / 领跌 各取若干 ----
+    boards = snapshot.get("boards") or []
+    if boards:
+        # boards 已按涨跌幅降序;取头尾
+        def _bd(r):
+            cp = r.get("chg_pct")
+            cps = f"{cp:+.2f}%" if (cp is not None and cp == cp) else "-"
+            ni = r.get("net_inflow")
+            nis = ""
+            if ni is not None and ni == ni:
+                nis = f",净额 {ni / 1e8:+.1f} 亿"
+            return f"{r.get('name', '')} {cps}{nis}"
+        up_n = min(6, len(boards))
+        down_n = min(6, len(boards))
+        top = [b for b in boards
+               if (b.get("chg_pct") == b.get("chg_pct"))][:up_n]
+        bottom = [b for b in boards
+                  if (b.get("chg_pct") == b.get("chg_pct"))][-down_n:]
+        n_boards = len(boards)
+        n_up = sum(1 for b in boards
+                   if (b.get("chg_pct") or 0) > 0
+                   and b.get("chg_pct") == b.get("chg_pct"))
+        lines.append(f"- 行业板块共 {n_boards} 个,其中上涨 {n_up} 个、"
+                     f"下跌 {n_boards - n_up} 个")
+        if top:
+            lines.append("- 领涨行业: " + "; ".join(_bd(b) for b in top))
+        if bottom:
+            lines.append("- 领跌行业: "
+                         + "; ".join(_bd(b) for b in reversed(bottom)))
+
+    return "\n".join(lines) if lines else "- (未能获取到有效的大盘数据)"
+
+
+def build_market_facts(snapshot: dict) -> dict:
+    """校验 snapshot 是否含足够数据。返回 {"ok":bool, "lines":str, "error":str}。"""
+    if not snapshot or not isinstance(snapshot, dict):
+        return {"ok": False, "error": "没有可用的行情数据,请先在行情页点『刷新行情』"}
+    has = bool(snapshot.get("indexes") or snapshot.get("activity")
+               or snapshot.get("boards"))
+    if not has:
+        return {"ok": False, "error": "行情数据为空,请先在行情页点『刷新行情』再点评"}
+    return {"ok": True, "lines": _market_facts_lines(snapshot)}
+
+
+def comment_market(snapshot: dict, on_delta=None) -> dict:
+    """对当前大盘 + 行业做整体 AI 研判。
+
+    - 事实全部来自 UI 已拉取的行情快照(不发网络请求),保证与屏幕显示一致;
+    - on_delta 提供时走流式(边生成边回调),失败自动回退普通调用;
+    - 调用方(UI)负责放到后台线程执行。
+    返回 {"ok":True, "text":..., "sentiment":偏暖/中性/偏冷, "disclaimer":...}
+        或 {"ok":False, "error":...}。
+    """
+    fb = build_market_facts(snapshot)
+    if not fb.get("ok"):
+        return {"ok": False, "error": fb.get("error", "行情数据不足")}
+
+    facts_text = fb["lines"]
+    prompt = [
+        {"role": "system", "content": MARKET_SYSTEM_PROMPT},
+        {"role": "user",
+         "content": ("以下是当前 A 股大盘由系统实时拉取的客观事实,"
+                     "请做大盘 + 行业层面的整体研判:\n\n"
+                     f"{facts_text}\n\n"
+                     "请严格按【大盘】【市场情绪】【热点板块】【风险提示】四段输出,"
+                     "并在【大盘】段末尾用固定格式标注:  情绪:偏暖/中性/偏冷")},
+    ]
+    try:
+        if on_delta is not None:
+            try:
+                text = chat_stream(prompt, on_delta, max_tokens=700)
+            except AIError:  # noqa
+                text = chat(prompt, max_tokens=700)
+        else:
+            text = chat(prompt, max_tokens=700)
+    except AIError as e:  # noqa
+        return {"ok": False, "error": str(e)}
+
+    # 解析情绪评级(供彩色标签)
+    sentiment = None
+    m = re.search(r"情绪[:：]\s*(偏暖|中性|偏冷)", text)
+    if m:
+        sentiment = m.group(1)
+    return {"ok": True, "text": text, "sentiment": sentiment,
+            "facts": facts_text, "disclaimer": DISCLAIMER}
+
+
+# ==================== 持仓点评(结合买入价给持有/加减仓倾向) ====================
+# 与 comment_stock 的关键区别: 这是"我已经持有"的视角,带入买入成本,
+# 允许给出持有/加仓/减仓的倾向性判断(仍基于客观事实、列明风险、标注仅供参考)。
+HOLDING_SYSTEM_PROMPT = (
+    "你是一名严谨的 A 股持仓顾问。用户【已经持有】某只股票,会给你该股由系统"
+    "算好/实时拉取的客观事实(技术面/基本面/行业对比/筹码结构),以及用户的"
+    "【买入成本价、当前浮动盈亏】。请站在'持有者该如何管理这笔仓位'的角度输出,"
+    "严格分四部分,顺序与标签固定,【四段缺一不可,尤其不得省略最后的【风险】段】:\n"
+    "【持仓诊断】2-3 句:结合买入价与现价,说明当前是浮盈还是浮亏、盈亏幅度大小,"
+    "以及现价相对成本、相对近期趋势所处的位置(如成本已被套牢盘覆盖、或已有安全垫)。"
+    "严格区分两个不同概念,切勿混用:'买入价'是用户这一笔的个人持仓成本,只用于算用户的"
+    "浮动盈亏;'平均成本/成本区'是筹码结构里全市场持仓者的平均成本,用于判断整体套牢/浮盈"
+    "格局。谈用户盈亏时引用买入价,谈市场筹码位置时引用平均成本,不得把买入价当成平均成本;\n"
+    "【技术面】2-3 句:趋势、量能、动能强弱;若给出【多周期】须结合日线与周线是否共振;"
+    "若给出【筹码结构】,切忌仅凭获利盘比例高低就下减仓或持有的结论(获利盘高不必然要止盈、"
+    "低不必然因抛压而离场):获利盘只是'燃料量',须联合筹码密集/分散(以事实行给出的定性标签"
+    "为准,不要自行从集中度数值推方向)与价格位置综合研判——筹码密集且现价站上成本区,浮盈"
+    "相近、抛压弱,即便获利盘高也常是主升浪、可继续持有;筹码分散、下方堆积大量低成本获利盘"
+    "且已拉开距离,才需警惕获利了结;现价处于筹码峰顶部(上方几乎无套牢盘)则上方抛压小,现价"
+    "上方压着又近又厚的套牢盘才构成反弹阻力、对浮亏仓位尤其不利(筹码为本地估算,只作定性"
+    "参考);\n"
+    "【操作倾向】给出明确但审慎的仓位管理倾向,在'继续持有 / 考虑减仓(止盈或止损)"
+    "/ 逢低加仓 / 观望'中选择并说明理由,理由必须落在前面列出的客观事实上。"
+    "两条硬约束:(1)【归因纪律】'接近60日高点/处于高分位'本身是【高位】信号,不得反向"
+    "解读成'还有上涨空间/上行空间'('上涨空间''上行空间'在高位语境下为禁用表述,一律不得"
+    "出现);位置高低只陈述事实,是否有空间需另有依据(如刚突破、"
+    "缩量回踩不破等),不得凭'接近高点'就推涨。(2)【高位禁加仓】当同时出现高位(近60日≥80%"
+    "分位)与偏热(RSI≥65)且已有相当浮盈时,不得主动建议加仓或把回调说成'加仓良机',此种情形"
+    "只能在'继续持有 / 考虑减仓止盈 / 观望'中选择;\n"
+    "【风险】此段【必须独立输出、不得省略或留空,至少给满 2 条】客观风险点(如高位放量"
+    "滞涨、指标背离、临近压力位、估值偏高、浮亏扩大跌破关键支撑等)。当出现下列偏热/高位"
+    "信号时必须在此点出、不得因浮盈而回避:RSI 明显偏高(≥65 偏热、≥70 超买)、位置处于近60日"
+    "高分位(≥80%)、获利盘比例很高(≥85%)叠加已积累相当浮盈、估值偏贵或公司当前亏损(PE 为负)"
+    "——此类情形应提示短线追高谨防获利回吐;若当日实为收跌或滞涨,也不得把当日描述成上涨/"
+    "动能增强。\n"
+    "在【操作倾向】段末尾用固定格式标注,便于程序解析:  操作:持有/加仓/减仓/观望 | 风险:高/中/低\n"
+    "重要边界:你可以给出倾向性的仓位管理建议(这是持仓顾问的职责),但必须审慎、"
+    "基于事实、附带风险提示;不得预测精确目标价或涨跌幅;不得编造事实里没有的信息"
+    "(尤其不得虚构财报数字、消息面、新闻);不得承诺收益。语气客观务实,"
+    "总字数控制在 300 字内。"
+)
+
+# ETF 持仓点评专用:持有者视角 + 基金语境(无个股财报/筹码套牢盘)。
+# 与股票版 HOLDING_SYSTEM_PROMPT 段落结构一致(便于 UI 解析),仅内容换成基金逻辑。
+ETF_HOLDING_SYSTEM_PROMPT = (
+    "你是一名严谨的 A 股 ETF(交易所交易基金)持仓顾问。用户【已经持有】某只 ETF,"
+    "会给你该 ETF 由系统算好/实时拉取的客观事实——【技术面】(趋势/量能/动能/位置)"
+    "与【ETF专属指标】(折溢价率/IOPV估值/基金规模/换手率/资金流),以及用户的"
+    "【买入成本价、当前浮动盈亏】。请站在'持有者该如何管理这笔仓位'的角度输出。\n"
+    "重要认知:ETF 是一篮子成分股组成的指数基金,跟踪某指数或行业主题,本身【没有】"
+    "个股的市盈率/市净率/ROE/营收利润/财报,也【不存在】个股意义上的'套牢盘/获利盘/"
+    "平均成本区'(ETF 靠一二级市场申赎套利,价格锚定净值)。因此严禁套用个股财务或"
+    "筹码套牢逻辑,更不得出现'上方套牢盘压制''筹码结构''获利盘''安全垫(以筹码论)'"
+    "'未获取到基本面数据'这类话——对 ETF 而言这些概念本就不适用。谈用户盈亏只用"
+    "'买入价 vs 现价',谈估值贵贱只用'折溢价率(现价 vs 基金净值IOPV)'。\n"
+    "严格分四部分,顺序与标签固定,【四段缺一不可,尤其不得省略最后的【风险】段】:\n"
+    "【持仓诊断】2-3 句:结合买入价与现价,说明当前是浮盈还是浮亏、盈亏幅度大小;"
+    "并结合折溢价率说明现价相对基金净值是偏贵(溢价)还是偏便宜(折价)。\n"
+    "【技术面】2-3 句:结合均线/MACD/RSI/量能判断趋势与动能强弱;若给出【多周期】"
+    "须结合日线与周线是否共振(同向更可靠);说明当前处于近60日区间的高/低位。\n"
+    "【操作倾向】给出明确但审慎的仓位管理倾向,在'继续持有 / 考虑减仓(止盈或止损)"
+    "/ 逢低加仓 / 观望'中选择并说明理由,理由必须落在前面列出的客观事实上(趋势方向、"
+    "折溢价、规模流动性、资金流、位置高低)。硬约束:'处于近60日高分位'本身是【高位】"
+    "信号,不得反向解读成'还有上涨空间';溢价偏高时不得建议追高加仓。\n"
+    "【风险】此段【必须独立输出、不得省略,至少给满 2 条】客观风险点,如:日周线共振"
+    "向下趋势偏弱、溢价偏高存在向净值回归的风险、基金规模偏小(低于2亿)有流动性/清盘"
+    "风险、所跟踪指数或行业系统性回调、浮亏扩大跌破关键支撑等。切勿用'套牢盘'措辞。\n"
+    "在【操作倾向】段末尾用固定格式标注,便于程序解析:  操作:持有/加仓/减仓/观望 | 风险:高/中/低\n"
+    "重要边界:你可以给出倾向性的仓位管理建议(这是持仓顾问的职责),但必须审慎、"
+    "基于事实、附带风险提示;不得预测精确目标价或涨跌幅;不得编造事实里没有的信息"
+    "(尤其不得虚构成分股、跟踪指数名称、净值数字、消息面);不得承诺收益。语气客观"
+    "务实,总字数控制在 300 字内。"
+)
+
+_HOLD_ACTION_MAP = {"持有": "持有", "加仓": "加仓", "减仓": "减仓", "观望": "观望"}
+
+
+def parse_holding_action(text: str) -> dict:
+    """从持仓点评文本里解析 操作倾向 与 风险等级。"""
+    action, risk = None, None
+    m = re.search(r"操作[:：]\s*(持有|加仓|减仓|观望)", text)
+    if m:
+        action = m.group(1)
+    m = re.search(r"风险[:：]\s*(高|中|低)", text)
+    if m:
+        risk = m.group(1)
+    # 兜底:未按固定格式时从正文关键词推断操作
+    if action is None:
+        if "减仓" in text or "止盈" in text or "止损" in text:
+            action = "减仓"
+        elif "加仓" in text:
+            action = "加仓"
+        elif "观望" in text:
+            action = "观望"
+        elif "持有" in text or "继续持有" in text:
+            action = "持有"
+    if risk is None:
+        if re.search(r"风险\s*(较?高|偏高|高企)", text) or "风险高" in text:
+            risk = "高"
+        elif re.search(r"风险\s*(较?低|偏低)", text) or "风险低" in text:
+            risk = "低"
+        elif "风险" in text:
+            risk = "中"
+    return {"action": action, "risk": risk}
+
+
+def _has_risk_section(text: str) -> bool:
+    """判断文本是否含【风险】段且该段有实际内容(非空、非仅标签)。"""
+    m = re.search(r"【风险】([\s\S]*)$", text or "")
+    if not m:
+        return False
+    # 去掉尾部固定标注/免责声明行后,看是否还有正文
+    body = m.group(1)
+    body = re.split(r"操作[:：]", body)[0]
+    body = re.sub(r"[\s\u3000·。、,,;;]+", "", body)
+    return len(body) >= 6  # 至少要有一句实质内容
+
+
+def _fnum(v):
+    """安全取 float:None/NaN 返回 None。"""
+    try:
+        if v is None or v != v:
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _auto_risk_lines(facts: dict) -> str:
+    """当 AI 漏掉【风险】段时,依据客观事实程序补一段标准风险提示。
+    覆盖高位偏热(追高回吐)与低位空头(下行套牢)两类场景,只陈述事实里
+    已有的信号,不编造。ETF 走基金语境分支(无套牢盘概念)。"""
+    if facts.get("is_etf"):
+        return _auto_risk_lines_etf(facts)
+    pts = []
+    rsi = _fnum(facts.get("rsi"))
+    pos = _fnum(facts.get("pos_60"))
+    cpr = _fnum(facts.get("chip_profit_ratio"))
+    pe = _fnum(facts.get("pe_ttm"))
+    ma = str(facts.get("ma_state") or "")
+    macd = str(facts.get("macd_state") or "")
+    weekly = str(facts.get("weekly_state") or "")
+
+    # —— 高位/偏热类(追高、获利回吐)——
+    if rsi is not None and rsi >= 65:
+        lvl = "超买" if rsi >= 70 else "偏热"
+        pts.append(f"RSI(14)={rsi:.1f} 已{lvl}(≥65),短线追高需防获利回吐")
+    if pos is not None and pos >= 80:
+        pts.append(f"价格处于近60日 {pos:.0f}% 高分位,属相对高位,谨防冲高回落")
+    if cpr is not None and cpr >= 0.85:
+        pts.append(f"获利盘约 {cpr * 100:.0f}%,一旦风吹草动易引发集中获利了结")
+
+    # —— 低位/空头类(下行、套牢)——
+    if "空头" in ma:
+        pts.append("日线呈空头排列,均线系统压制,短期仍有下行压力")
+    if "空头" in weekly:
+        pts.append("周线亦为空头,中期趋势偏弱,反弹易受上方套牢盘压制")
+    elif "空头" in macd and "空头" not in ma:
+        pts.append("MACD 位于空头区,动能偏弱,反弹持续性存疑")
+    if pos is not None and pos <= 20:
+        pts.append(f"价格处于近60日 {pos:.0f}% 低位,弱势中抄底需防'越跌越买'扩大浮亏")
+    if cpr is not None and cpr <= 0.10:
+        pts.append(f"获利盘仅约 {cpr * 100:.0f}%,几乎全员套牢,上方抛压沉重、反弹阻力大")
+
+    # —— 估值类(多空通用)——
+    if pe is not None and pe < 0:
+        pts.append(f"公司当前 PE 为负({pe:.1f},处于亏损),估值缺乏盈利支撑")
+
+    # 去重并保序,不足 2 条补一句通用纪律
+    seen, uniq = set(), []
+    for p in pts:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    if len(uniq) < 2:
+        uniq.append("需关注大盘系统性风险及个股自身波动,严守个人止盈止损纪律")
+    return "【风险】\n" + "".join(f"- {p};\n" for p in uniq)
+
+
+def _auto_risk_lines_etf(facts: dict) -> str:
+    """ETF 版风险兜底:基金语境,不使用'套牢盘/获利盘'措辞,
+    改用趋势/折溢价/规模/位置等 ETF 适用维度。只陈述事实,不编造。"""
+    pts = []
+    rsi = _fnum(facts.get("rsi"))
+    pos = _fnum(facts.get("pos_60"))
+    ma = str(facts.get("ma_state") or "")
+    macd = str(facts.get("macd_state") or "")
+    weekly = str(facts.get("weekly_state") or "")
+    dr = _fnum(facts.get("etf_discount_rate"))
+    scale = _fnum(facts.get("etf_scale_yi"))
+
+    # —— 趋势/动能类 ——
+    if "空头" in ma:
+        pts.append("日线呈空头排列,均线系统压制,短期仍有下行压力")
+    if "空头" in weekly:
+        pts.append("周线亦为空头,中期趋势偏弱,反弹动能有限")
+    elif "空头" in macd and "空头" not in ma:
+        pts.append("MACD 位于空头区,动能偏弱,反弹持续性存疑")
+    # —— 位置类 ——
+    if pos is not None and pos <= 20:
+        pts.append(f"价格处于近60日 {pos:.0f}% 低位,弱势中抄底需防'越跌越买'扩大浮亏")
+    if rsi is not None and rsi >= 65:
+        lvl = "超买" if rsi >= 70 else "偏热"
+        pts.append(f"RSI(14)={rsi:.1f} 已{lvl}(≥65),短线追高需防冲高回落")
+    if pos is not None and pos >= 80:
+        pts.append(f"价格处于近60日 {pos:.0f}% 高分位,属相对高位,谨防回落")
+    # —— ETF 专属:折溢价 / 规模 ——
+    if dr is not None and dr <= -0.5:
+        pts.append(f"当前溢价约 {abs(dr):.2f}%(现价高于净值),存在向净值回归的风险")
+    if scale is not None and scale < 2.0:
+        pts.append(f"基金规模仅约 {scale:.2f} 亿,偏小,存在流动性不足或清盘风险")
+    # —— 通用 ——
+    pts.append("ETF 净值随所跟踪指数/行业波动,需关注板块系统性回调风险")
+
+    seen, uniq = set(), []
+    for p in pts:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    if len(uniq) < 2:
+        uniq.append("需关注大盘系统性风险及标的自身波动,严守个人止盈止损纪律")
+    return "【风险】\n" + "".join(f"- {p};\n" for p in uniq)
+
+
+def _ensure_risk_section(text: str, facts: dict):
+    """保证输出含【风险】段。缺失则程序补一段,返回 (新文本, 补充片段或None)。
+    补充片段用于流式场景补推给 UI。"""
+    if _has_risk_section(text):
+        return text, None
+    supp = "\n\n" + _auto_risk_lines(facts).rstrip("\n")
+    # 若原文末尾已有'操作:.. | 风险:..'标注行,把补充段插到该标注行之前
+    m = re.search(r"\n?\s*操作[:：]\s*(持有|加仓|减仓|观望)\s*[|｜]\s*风险",
+                  text or "")
+    if m:
+        idx = m.start()
+        new_text = text[:idx].rstrip() + supp + "\n" + text[idx:].lstrip("\n")
+    else:
+        new_text = (text or "").rstrip() + supp
+    return new_text, supp
+
+
+def _holding_position_line(f: dict, buy_price) -> str:
+    """构造持仓上下文行(买入价/现价/浮盈)。buy_price 无效时返回空。"""
+    try:
+        bp = float(buy_price)
+    except (TypeError, ValueError):
+        bp = 0.0
+    if bp <= 0:
+        return ""
+    cur = f.get("close")
+    try:
+        cur = float(cur)
+    except (TypeError, ValueError):
+        return f"- 持仓成本: 买入价={_fmt(bp)}(现价未取到,无法计算浮动盈亏)\n"
+    pnl = (cur - bp) / bp * 100 if bp else 0.0
+    zt = "浮盈" if pnl > 0 else ("浮亏" if pnl < 0 else "持平")
+    return (f"- 持仓成本: 买入价={_fmt(bp)}  当前价={_fmt(cur)}  "
+            f"浮动盈亏={_fmt(pnl)}%({zt})\n")
+
+
+def comment_holding(code: str, buy_price=0.0, on_delta=None) -> dict:
+    """对【已持仓】的单只股票生成 AI 点评,结合买入成本给持有/加减仓倾向。
+
+    返回 {"ok":True, "facts":..., "text":..., "action":持有/加仓/减仓/观望,
+          "risk":高/中/低, "buy_price":.., "pnl":.., "disclaimer":...}
+      或 {"ok":False, "error":...}。
+    - 不做当天缓存(浮盈随实时价变,且带用户成本,不宜跨次复用);
+    - on_delta 提供时走流式,失败自动回退普通调用;
+    - 调用方(UI)负责放到后台线程执行。
+    """
+    facts = build_facts(code)
+    if "error" in facts:
+        return {"ok": False, "error": facts["error"]}
+
+    pos_line = _holding_position_line(facts, buy_price)
+    try:
+        bp = float(buy_price)
+    except (TypeError, ValueError):
+        bp = 0.0
+    cur = facts.get("close")
+    try:
+        cur = float(cur)
+    except (TypeError, ValueError):
+        cur = None
+    pnl = ((cur - bp) / bp * 100) if (cur and bp > 0) else None
+
+    is_etf = bool(facts.get("is_etf"))
+    if is_etf:
+        user = (
+            "我【已经持有】下面这只 ETF,请结合我的买入成本,帮我诊断这笔仓位并给出"
+            "仓位管理倾向(以下均为系统算好/实时拉取的客观事实):\n\n"
+            f"{pos_line}{facts_to_lines(facts)}\n\n"
+            "请严格按【持仓诊断】【技术面】【操作倾向】【风险】四段输出,ETF 无个股财报与"
+            "筹码套牢盘概念,谈估值贵贱只用折溢价率,"
+            "并在【操作倾向】段末尾用固定格式标注:  操作:持有/加仓/减仓/观望 | 风险:高/中/低"
+        )
+        sys_prompt = ETF_HOLDING_SYSTEM_PROMPT
+    else:
+        user = (
+            "我【已经持有】下面这只股票,请结合我的买入成本,帮我诊断这笔仓位并给出"
+            "仓位管理倾向(以下均为系统算好/实时拉取的客观事实):\n\n"
+            f"{pos_line}{facts_to_lines(facts)}\n\n"
+            "请严格按【持仓诊断】【技术面】【操作倾向】【风险】四段输出,"
+            "并在【操作倾向】段末尾用固定格式标注:  操作:持有/加仓/减仓/观望 | 风险:高/中/低"
+        )
+        sys_prompt = HOLDING_SYSTEM_PROMPT
+    prompt = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": user},
+    ]
+    try:
+        if on_delta is not None:
+            try:
+                text = chat_stream(prompt, on_delta)
+            except AIError:  # noqa
+                text = chat(prompt)
+        else:
+            text = chat(prompt)
+    except AIError as e:  # noqa
+        return {"ok": False, "error": str(e), "facts": facts}
+
+    # 兜底:AI 偶尔漏掉独立【风险】段(纯提示词压不住采样波动),
+    # 缺失则依据客观事实程序补一段,保证结构 100% 有风险提示。
+    text, supp = _ensure_risk_section(text, facts)
+    if supp and on_delta is not None:
+        try:
+            on_delta(supp)   # 流式场景把补充段也推给 UI,保持显示一致
+        except Exception:
+            pass
+
+    r = parse_holding_action(text)
+    return {"ok": True, "facts": facts, "text": text,
+            "action": r["action"], "risk": r["risk"],
+            "buy_price": bp, "pnl": pnl,
+            "disclaimer": ETF_DISCLAIMER if is_etf else DISCLAIMER}

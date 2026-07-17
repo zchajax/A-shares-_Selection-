@@ -115,10 +115,18 @@ def init_db():
                 name       TEXT,
                 add_date   TEXT,           -- 加入日期
                 buy_price  REAL,           -- 买入价(0=仅观察,未持仓)
-                note       TEXT            -- 备注(来源策略等)
+                note       TEXT,           -- 备注(来源策略等)
+                last_price REAL,           -- 最近一次实时/刷新到的现价(持久化,重开软件不丢)
+                last_price_time TEXT       -- 该现价的时间戳
             )
             """
         )
+        # 旧库兼容:早期 watchlist 无 last_price/last_price_time,缺列时补上
+        _wl_cols = [r[1] for r in
+                    cur.execute("PRAGMA table_info(watchlist)").fetchall()]
+        for _c, _t in (("last_price", "REAL"), ("last_price_time", "TEXT")):
+            if _c not in _wl_cols:
+                cur.execute(f"ALTER TABLE watchlist ADD COLUMN {_c} {_t}")
         # 基本面 / 估值:每只股票一行,长期缓存(季报/估值变动不频繁,增量补齐)
         cur.execute(
             """
@@ -393,6 +401,29 @@ def add_watch(code: str, name: str = "", buy_price: float = 0.0, note: str = "")
         )
 
 
+def update_buy_price(code: str, buy_price: float):
+    """只更新买入价(不动加入日/备注/现价)。用户手动改买入价时用。"""
+    with get_conn() as conn:
+        conn.execute("UPDATE watchlist SET buy_price = ? WHERE code = ?",
+                     (float(buy_price or 0.0), code))
+
+
+def save_watch_prices(prices: dict):
+    """
+    批量持久化自选的最近现价(重开软件不丢)。
+    prices: {code: price(float)}。只更新已在自选里的 code。
+    """
+    if not prices:
+        return
+    ts = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        conn.executemany(
+            "UPDATE watchlist SET last_price = ?, last_price_time = ? "
+            "WHERE code = ?",
+            [(float(p), ts, c) for c, p in prices.items()
+             if p is not None and float(p) > 0])
+
+
 def remove_watch(code: str):
     """移除自选。"""
     with get_conn() as conn:
@@ -400,14 +431,17 @@ def remove_watch(code: str):
 
 
 def load_watchlist() -> pd.DataFrame:
-    """读取自选列表。"""
+    """读取自选列表(含持久化的最近现价 last_price)。"""
+    cols = ["code", "name", "add_date", "buy_price", "note",
+            "last_price", "last_price_time"]
     with get_conn() as conn:
         try:
             return pd.read_sql(
-                "SELECT code,name,add_date,buy_price,note FROM watchlist "
+                "SELECT code,name,add_date,buy_price,note,"
+                "last_price,last_price_time FROM watchlist "
                 "ORDER BY add_date DESC", conn)
         except Exception:
-            return pd.DataFrame(columns=["code", "name", "add_date", "buy_price", "note"])
+            return pd.DataFrame(columns=cols)
 
 
 # ==================== 基本面 / 估值 ====================

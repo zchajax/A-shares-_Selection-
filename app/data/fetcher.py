@@ -620,6 +620,75 @@ def fetch_etf_spot(only_registered: bool = True) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+# ETF 专属指标(折溢价/规模/换手/资金流)的全市场快照进程内缓存,
+# 避免同一次点评/连点多只时重复拉取(东财一次返回全市场 ~1000 只)。
+_ETF_METRICS_CACHE = {"ts": 0.0, "df": None}
+_ETF_METRICS_TTL = 60.0   # 秒;盘中 60s 内复用同一份快照
+
+
+def fetch_etf_metrics(code: str) -> dict:
+    """取单只 ETF 的专属指标(个股没有、基金才有的维度)。
+
+    数据源:东财 fund_etf_spot_em(),一次返回全市场 ETF 实时快照,含
+    IOPV实时估值/基金折价率/换手率/量比/规模(总市值)/主力净流入等。
+    进程内缓存 60s,避免连点多只 ETF 时反复全市场拉取。
+
+    返回 dict(缺失字段为 None);拉取失败降级返回 {}。字段:
+      iopv           IOPV 实时估值(基金净值的盘中估算)
+      discount_rate  基金折价率(%);正=折价(现价低于净值,买便宜),负=溢价
+      turnover       换手率(%)
+      vol_ratio      量比
+      scale_yi       规模(总市值,亿元)
+      main_inflow_yi 主力净流入(亿元)
+      main_inflow_pct 主力净流入占比(%)
+    """
+    _check_ak()
+    code = str(code).zfill(6)
+    now = time.time()
+    df = None
+    if (_ETF_METRICS_CACHE["df"] is not None
+            and now - _ETF_METRICS_CACHE["ts"] < _ETF_METRICS_TTL):
+        df = _ETF_METRICS_CACHE["df"]
+    else:
+        try:
+            raw = _retry(lambda: ak.fund_etf_spot_em(), tries=2)
+            if raw is not None and not raw.empty:
+                raw = raw.copy()
+                raw["_code"] = raw["代码"].astype(str).str.replace(
+                    r"^(sh|sz|bj)", "", regex=True).str.zfill(6)
+                _ETF_METRICS_CACHE["df"] = raw
+                _ETF_METRICS_CACHE["ts"] = now
+                df = raw
+        except Exception as e:  # noqa 无网络/接口变更等,降级
+            print(f"[warn] ETF 指标快照拉取失败: {e}")
+            return {}
+    if df is None or df.empty:
+        return {}
+    hit = df[df["_code"] == code]
+    if hit.empty:
+        return {}
+    r = hit.iloc[0]
+
+    def _num(col):
+        try:
+            v = pd.to_numeric(r.get(col), errors="coerce")
+            return None if pd.isna(v) else float(v)
+        except Exception:  # noqa
+            return None
+
+    mv = _num("总市值")
+    inflow = _num("主力净流入-净额")
+    return {
+        "iopv": _num("IOPV实时估值"),
+        "discount_rate": _num("基金折价率"),
+        "turnover": _num("换手率"),
+        "vol_ratio": _num("量比"),
+        "scale_yi": (mv / 1e8) if mv is not None else None,
+        "main_inflow_yi": (inflow / 1e8) if inflow is not None else None,
+        "main_inflow_pct": _num("主力净流入-净占比"),
+    }
+
+
 def update_etf_kline(code: str, start_date: str = "20230101",
                      incremental: bool = True) -> pd.DataFrame:
     """

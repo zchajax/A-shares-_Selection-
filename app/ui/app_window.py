@@ -21,6 +21,7 @@ import dearpygui.dearpygui as dpg
 from app.data import database as db
 from app.data import fetcher
 from app.data import realtime
+from app.data import market as market_data
 from app.strategy import indicators as ind
 from app.strategy import scanner
 from app.strategy import backtest as bt
@@ -38,6 +39,13 @@ from app.report import exporter
 # A 股配色:涨=红 跌=绿
 RED = (220, 40, 40, 255)
 GREEN = (0, 170, 90, 255)
+# 列表行悬停高亮色(中性蓝,不与涨红跌绿冲突):hover 较亮,选中/按下稍暗
+ROW_HOVER = (58, 96, 150, 170)
+ROW_ACTIVE = (70, 116, 180, 200)
+ROW_SELECT = (48, 78, 122, 130)
+# 持仓表专用:单元格背景高亮色(用于 highlight_table_cell,只染背景不抢点击,
+# 故按钮/输入框仍可点)。alpha 适中,盖背景但不遮文字。
+WATCH_CELL_HL = (58, 96, 150, 90)
 
 
 # ---------- 中文字体 ----------
@@ -77,6 +85,13 @@ STATE = {
     "ai_hint": None,            # 当前标的的策略上下文(AI点评 strategy_hint)
     "cs_weights": None,         # L1横截面因子权重 dict(选中横截面策略时用)
     "cs_neutralize": True,      # L1横截面 行业中性化开关
+    "mkt_poll_on": False,       # 行情页定时刷新开关
+    "mkt_poll_thread": None,    # 行情页定时刷新线程
+    "mkt_board_df": None,       # 热门板块最近一次数据(DataFrame),供排序切换复用
+    "mkt_board_sort": "chg_pct",  # 热门板块当前排序字段
+    "mkt_idx_df": None,         # 核心指数最近一次数据(DataFrame),供AI大盘点评复用
+    "mkt_act": None,            # 涨跌家数/情绪最近一次数据(dict),供AI大盘点评复用
+    "mkt_summ": None,           # 两市总貌最近一次数据(dict),供AI大盘点评复用
 }
 
 # L1 横截面多因子(智能版)在策略下拉框里的特殊 key。它不走逐股 evaluate,
@@ -86,6 +101,9 @@ CROSS_SECTION_LABEL = "★ 横截面多因子(智能版)"
 
 # 分时轮询间隔(秒):免费源限流,只盯 1 只,5 秒够用
 POLL_INTERVAL = 5
+
+# 行情页定时刷新间隔(秒):指数实时接口约 3s,大盘概览无需太频繁,10 秒足够
+MKT_POLL_INTERVAL = 10
 
 
 # ---------- 柱状图红/绿主题(涨红跌绿) ----------
@@ -104,6 +122,13 @@ def _make_bar_themes():
         with dpg.theme_component(dpg.mvButton):
             dpg.add_theme_color(dpg.mvThemeCol_Button, (40, 110, 200))
             dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (55, 130, 220))
+    # 列表行悬停高亮主题:绑定到跨列 selectable(span_columns=True),
+    # 鼠标悬停整行变亮,选中/按下时略深。用于所有股票/ETF 列表。
+    with dpg.theme(tag="row_hover"):
+        with dpg.theme_component(dpg.mvSelectable):
+            dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, ROW_HOVER)
+            dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, ROW_ACTIVE)
+            dpg.add_theme_color(dpg.mvThemeCol_Header, ROW_SELECT)
     # 分时价格线红/绿主题(轮询增量更新时复用,避免反复新建 theme)
     with dpg.theme(tag="line_red"):
         with dpg.theme_component(dpg.mvLineSeries):
@@ -1358,9 +1383,10 @@ def _render_results(df):
                 f"被量化策略选中,得分{r['score']},命中理由:{r['reason']}"
         with dpg.table_row(parent="result_table"):
             _sel = dpg.add_selectable(
-                label=code, span_columns=False, user_data=(code, _hint),
+                label=code, span_columns=True, user_data=(code, _hint),
                 callback=_on_result_click,   # 同页,单击即画K线
             )
+            dpg.bind_item_theme(_sel, "row_hover")
             dpg.add_text(r["name"])
             dpg.add_text(imap.get(code, "-"))
             dpg.add_text(str(r["close"]))
@@ -1458,9 +1484,10 @@ def on_ai_rank(sender=None, app_data=None, user_data=None):
                 with dpg.table_row(parent="ai_rank_table"):
                     dpg.add_text(str(i))
                     code = it["code"]
-                    dpg.add_selectable(label=code, span_columns=False,
+                    _sel = dpg.add_selectable(label=code, span_columns=True,
                                        user_data=code,
                                        callback=lambda s, a, u: _on_pick_code(u))
+                    dpg.bind_item_theme(_sel, "row_hover")
                     dpg.add_text(it.get("name", ""))
                     dpg.add_text(it.get("industry", ""))
                     dpg.add_text(it.get("rating") or "-",
@@ -1501,35 +1528,66 @@ def _codes_from_source(source: str):
     return [str(c) for c in res["code"]], "选股结果"
 
 
+def _ai_ui_tags(source):
+    """按来源返回该展示哪一套 AI 面板的 tag。
+
+    盯盘页(source='watch')用自己的面板 watch_ai_*,结果就地显示,不再跳到选股页;
+    其余(选股结果)用选股页的 ai_batch_*/ai_pf_* 面板。
+    """
+    if source == "watch":
+        return {"batch_win": "watch_ai_win", "batch_title": "watch_ai_title",
+                "batch_text": "watch_ai_text", "batch_report": "watch_ai_report",
+                "pf_win": "watch_ai_win", "pf_title": "watch_ai_title",
+                "pf_text": "watch_ai_text", "pf_disclaimer": "watch_ai_disclaimer",
+                "batch_btn": None, "pf_btn": None}
+    return {"batch_win": "ai_batch_win", "batch_title": "ai_batch_title",
+            "batch_text": "ai_batch_text", "batch_report": "ai_batch_report",
+            "pf_win": "ai_pf_win", "pf_title": "ai_pf_title",
+            "pf_text": "ai_pf_text", "pf_disclaimer": "ai_pf_disclaimer",
+            "batch_btn": "ai_batch_btn", "pf_btn": "ai_pf_btn"}
+
+
 def on_ai_batch(source="results", sender=None, app_data=None, user_data=None):
-    """对一批股票(选股结果/自选池)逐只 AI 点评,汇总成 HTML 晨报并导出。"""
+    """对一批股票(选股结果/自选池)逐只 AI 点评,汇总成 HTML 晨报并导出。
+
+    结果显示在对应页面自己的面板里(盯盘页不再跳到选股页)。
+    """
     codes, title = _codes_from_source(source)
+    T = _ai_ui_tags(source)
     if not codes:
         _set_status(f"{title}为空,先选股或加入自选再批量点评")
         return
     if not ai_configured():
-        dpg.set_value("ai_batch_text", ai_config_hint())
-        dpg.configure_item("ai_batch_win", show=True)
+        dpg.set_value(T["batch_text"], ai_config_hint())
+        if T.get("batch_report") and dpg.does_item_exist(T["batch_report"]):
+            dpg.set_value(T["batch_report"], "")
+        if T.get("pf_disclaimer") and dpg.does_item_exist(T["pf_disclaimer"]):
+            dpg.configure_item(T["pf_disclaimer"], show=False)
+        dpg.configure_item(T["batch_win"], show=True)
         return
     # 控制规模,避免一次点评过多(串行 + API 限流)
     MAX_BATCH = 20
     codes = codes[:MAX_BATCH]
 
-    dpg.configure_item("ai_batch_win", show=True)
-    dpg.set_value("ai_batch_title", f"批量点评 · {title}({len(codes)} 只)")
-    dpg.set_value("ai_batch_text", "正在逐只点评,请稍候...")
-    dpg.set_value("ai_batch_report", "")
-    dpg.configure_item("ai_batch_btn", enabled=False, label="点评中...")
+    dpg.configure_item(T["batch_win"], show=True)
+    dpg.set_value(T["batch_title"], f"批量点评 · {title}({len(codes)} 只)")
+    dpg.set_value(T["batch_text"], "正在逐只点评,请稍候...")
+    if T.get("batch_report") and dpg.does_item_exist(T["batch_report"]):
+        dpg.set_value(T["batch_report"], "")
+    if T.get("pf_disclaimer") and dpg.does_item_exist(T["pf_disclaimer"]):
+        dpg.configure_item(T["pf_disclaimer"], show=False)
+    if T.get("batch_btn") and dpg.does_item_exist(T["batch_btn"]):
+        dpg.configure_item(T["batch_btn"], enabled=False, label="点评中...")
 
     def worker():
         try:
             def pcb(d, t, code):
-                if dpg.does_item_exist("ai_batch_text"):
-                    dpg.set_value("ai_batch_text",
+                if dpg.does_item_exist(T["batch_text"]):
+                    dpg.set_value(T["batch_text"],
                                   f"点评进度 {d}/{t}(当前 {code})...")
             r = ai_commentary.comment_batch(codes, progress_cb=pcb)
             if not r.get("ok"):
-                dpg.set_value("ai_batch_text",
+                dpg.set_value(T["batch_text"],
                               f"批量点评失败:{r.get('error', '未知错误')}")
                 return
             items = r["items"]
@@ -1546,7 +1604,7 @@ def on_ai_batch(source="results", sender=None, app_data=None, user_data=None):
                                  f"[{it.get('industry', '')}] "
                                  f"评级:{it.get('rating') or '-'} / "
                                  f"风险:{it.get('risk') or '-'}")
-            dpg.set_value("ai_batch_text", "\n".join(lines))
+            dpg.set_value(T["batch_text"], "\n".join(lines))
             # 导出 HTML 晨报
             try:
                 path = exporter.export_ai_report(
@@ -1554,63 +1612,166 @@ def on_ai_batch(source="results", sender=None, app_data=None, user_data=None):
                     disclaimer=r.get("disclaimer", ""))
                 STATE["last_report_dir"] = os.path.dirname(path)
                 STATE["last_ai_report"] = path
-                dpg.set_value("ai_batch_report",
-                              f"已生成晨报:{os.path.basename(path)}"
-                              f"(成功 {ok_n}/{len(items)} 只)· "
-                              f"点『打开目录』查看")
+                if dpg.does_item_exist(T["batch_report"]):
+                    dpg.set_value(T["batch_report"],
+                                  f"已生成晨报:{os.path.basename(path)}"
+                                  f"(成功 {ok_n}/{len(items)} 只)· "
+                                  f"点『打开目录』查看")
             except Exception as e:  # noqa
-                dpg.set_value("ai_batch_report", f"晨报导出失败:{e}")
+                if dpg.does_item_exist(T["batch_report"]):
+                    dpg.set_value(T["batch_report"], f"晨报导出失败:{e}")
         except Exception as e:  # noqa
-            dpg.set_value("ai_batch_text", f"批量点评异常:{e}")
+            dpg.set_value(T["batch_text"], f"批量点评异常:{e}")
         finally:
-            if dpg.does_item_exist("ai_batch_btn"):
-                dpg.configure_item("ai_batch_btn", enabled=True,
+            if T.get("batch_btn") and dpg.does_item_exist(T["batch_btn"]):
+                dpg.configure_item(T["batch_btn"], enabled=True,
                                    label="批量点评(晨报)")
 
     threading.Thread(target=worker, daemon=True).start()
 
 
 def on_ai_portfolio(source="results", sender=None, app_data=None, user_data=None):
-    """对一批股票(选股结果/自选池)做全局组合解读(板块集中度/估值/组合风险),流式展示。"""
+    """对一批股票(选股结果/自选池)做全局组合解读(板块集中度/估值/组合风险),流式展示。
+
+    结果显示在对应页面自己的面板里(盯盘页不再跳到选股页)。
+    """
     codes, title = _codes_from_source(source)
+    T = _ai_ui_tags(source)
     if not codes:
         _set_status(f"{title}为空,先选股或加入自选再做组合解读")
         return
     if not ai_configured():
-        dpg.set_value("ai_pf_text", ai_config_hint())
-        dpg.configure_item("ai_pf_win", show=True)
+        dpg.set_value(T["pf_text"], ai_config_hint())
+        dpg.configure_item(T["pf_win"], show=True)
         return
 
-    dpg.configure_item("ai_pf_win", show=True)
-    dpg.set_value("ai_pf_title", f"组合解读 · {title}({len(codes)} 只)")
-    dpg.set_value("ai_pf_text", "正在汇总组合画像并生成研判(边生成边显示)...")
-    dpg.configure_item("ai_pf_btn", enabled=False, label="解读中...")
+    dpg.configure_item(T["pf_win"], show=True)
+    dpg.set_value(T["pf_title"], f"组合解读 · {title}({len(codes)} 只)")
+    dpg.set_value(T["pf_text"], "正在汇总组合画像并生成研判(边生成边显示)...")
+    if T.get("batch_report") and dpg.does_item_exist(T["batch_report"]):
+        dpg.set_value(T["batch_report"], "")
+    if T.get("pf_btn") and dpg.does_item_exist(T["pf_btn"]):
+        dpg.configure_item(T["pf_btn"], enabled=False, label="解读中...")
 
     # 流式:用可变缓冲累积,回调里刷新文本
     buf = {"s": ""}
 
     def _on_delta(piece):
         buf["s"] += piece
-        if dpg.does_item_exist("ai_pf_text"):
-            dpg.set_value("ai_pf_text", buf["s"])
+        if dpg.does_item_exist(T["pf_text"]):
+            dpg.set_value(T["pf_text"], buf["s"])
 
     def worker():
         try:
             r = ai_commentary.comment_portfolio(codes, title=title,
                                                 on_delta=_on_delta)
             if not r.get("ok"):
-                dpg.set_value("ai_pf_text",
+                dpg.set_value(T["pf_text"],
                               f"组合解读失败:{r.get('error', '未知错误')}")
                 return
             # 末尾补免责声明(流式正文已在 buf 里)
-            dpg.set_value("ai_pf_text", r["text"])
-            dpg.set_value("ai_pf_disclaimer", r.get("disclaimer", ""))
-            dpg.configure_item("ai_pf_disclaimer", show=True)
+            dpg.set_value(T["pf_text"], r["text"])
+            if T.get("pf_disclaimer") and dpg.does_item_exist(T["pf_disclaimer"]):
+                dpg.set_value(T["pf_disclaimer"], r.get("disclaimer", ""))
+                dpg.configure_item(T["pf_disclaimer"], show=True)
         except Exception as e:  # noqa
-            dpg.set_value("ai_pf_text", f"组合解读异常:{e}")
+            dpg.set_value(T["pf_text"], f"组合解读异常:{e}")
         finally:
-            if dpg.does_item_exist("ai_pf_btn"):
-                dpg.configure_item("ai_pf_btn", enabled=True, label="组合解读")
+            if T.get("pf_btn") and dpg.does_item_exist(T["pf_btn"]):
+                dpg.configure_item(T["pf_btn"], enabled=True, label="组合解读")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def on_ai_hold_comment(sender=None, app_data=None, user_data=None):
+    """对单只【已持仓】自选股做 AI 持仓点评(结合买入成本给持有/加减仓倾向)。
+
+    user_data = (code, buy_price)。结果流式显示在盯盘页 watch_ai_win 面板,
+    带操作倾向(持有/加仓/减仓/观望)与风险彩色标签。
+    """
+    if not user_data:
+        return
+    code, buy_price = (user_data if isinstance(user_data, (tuple, list))
+                       else (user_data, 0.0))
+    code = str(code)
+    nm = db.name_of(code) or ""
+    if not ai_configured():
+        dpg.set_value("watch_ai_text", ai_config_hint())
+        dpg.set_value("watch_ai_title", "AI 持仓点评")
+        if dpg.does_item_exist("watch_ai_report"):
+            dpg.set_value("watch_ai_report", "")
+        for _b in ("watch_ai_action", "watch_ai_risk"):
+            if dpg.does_item_exist(_b):
+                dpg.configure_item(_b, show=False)
+        dpg.configure_item("watch_ai_win", show=True)
+        return
+
+    dpg.configure_item("watch_ai_win", show=True)
+    try:
+        bp = float(buy_price)
+    except (TypeError, ValueError):
+        bp = 0.0
+    bp_txt = f"买入价 {bp:.2f}" if bp > 0 else "无买入价(按观察处理)"
+    dpg.set_value("watch_ai_title", f"AI 持仓点评 · {code} {nm}({bp_txt})")
+    if dpg.does_item_exist("watch_ai_report"):
+        dpg.set_value("watch_ai_report", "")
+    if dpg.does_item_exist("watch_ai_disclaimer"):
+        dpg.configure_item("watch_ai_disclaimer", show=False)
+    for _b in ("watch_ai_action", "watch_ai_risk"):
+        if dpg.does_item_exist(_b):
+            dpg.configure_item(_b, show=False)
+    dpg.set_value("watch_ai_text", f"正在为 {code} {nm} 生成持仓点评(边生成边显示)...")
+
+    def _badge(tag, text, color):
+        if dpg.does_item_exist(tag):
+            dpg.set_value(tag, text)
+            dpg.configure_item(tag, color=color, show=True)
+
+    def worker():
+        stream = {"buf": "", "head": f"【{code} {nm}】\n" if nm else f"【{code}】\n"}
+
+        def _on_delta(piece):
+            stream["buf"] += piece
+            if dpg.does_item_exist("watch_ai_text"):
+                dpg.set_value("watch_ai_text", stream["head"] + stream["buf"])
+
+        try:
+            res = ai_commentary.comment_holding(code, buy_price=bp,
+                                                on_delta=_on_delta)
+            if res.get("ok"):
+                f = res["facts"]
+                head = f"【{f['code']} {f['name']}】{f['industry']}\n"
+                pnl = res.get("pnl")
+                if pnl is not None:
+                    head += f"买入价 {res['buy_price']:.2f} · 浮动盈亏 {pnl:+.2f}%\n"
+                dpg.set_value("watch_ai_text", head + res["text"])
+                if dpg.does_item_exist("watch_ai_disclaimer"):
+                    dpg.set_value("watch_ai_disclaimer", res["disclaimer"])
+                    dpg.configure_item("watch_ai_disclaimer", show=True)
+                # 操作倾向彩色标签(加仓=红,减仓=绿,持有=黄,观望=灰;A股惯例)
+                act = res.get("action")
+                if act == "加仓":
+                    _badge("watch_ai_action", "  操作:加仓", (230, 60, 60))
+                elif act == "减仓":
+                    _badge("watch_ai_action", "  操作:减仓", (40, 170, 80))
+                elif act == "持有":
+                    _badge("watch_ai_action", "  操作:持有", (200, 180, 90))
+                elif act == "观望":
+                    _badge("watch_ai_action", "  操作:观望", (150, 150, 150))
+                risk = res.get("risk")
+                if risk == "高":
+                    _badge("watch_ai_risk", "  风险:高", (230, 60, 60))
+                elif risk == "中":
+                    _badge("watch_ai_risk", "  风险:中", (220, 160, 60))
+                elif risk == "低":
+                    _badge("watch_ai_risk", "  风险:低", (120, 180, 120))
+            else:
+                dpg.set_value("watch_ai_text",
+                              f"持仓点评失败:\n{res.get('error', '未知错误')}")
+                if dpg.does_item_exist("watch_ai_disclaimer"):
+                    dpg.configure_item("watch_ai_disclaimer", show=False)
+        except Exception as e:  # noqa
+            dpg.set_value("watch_ai_text", f"持仓点评异常:{e}")
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -1739,8 +1900,9 @@ def _render_etf():
         price = getattr(r, "price", None)
         chg = getattr(r, "chg_pct", None)
         with dpg.table_row(parent="etf_table"):
-            _sel = dpg.add_selectable(label=code, span_columns=False, user_data=code,
+            _sel = dpg.add_selectable(label=code, span_columns=True, user_data=code,
                                       callback=_on_code_click)   # 双击代码 → 跳K线页
+            dpg.bind_item_theme(_sel, "row_hover")
             dpg.add_text(str(name))
             dpg.add_text(f"{price:.3f}" if price and price > 0 else "-")
             if chg is not None and not pd.isna(chg):
@@ -1905,9 +2067,10 @@ def _render_picks(df):
         code = r["code"]
         with dpg.table_row(parent="picks_table"):
             _sel = dpg.add_selectable(
-                label=code, span_columns=False, user_data=code,
+                label=code, span_columns=True, user_data=code,
                 callback=_on_code_click,   # 双击代码 → 跳K线页
             )
+            dpg.bind_item_theme(_sel, "row_hover")
             dpg.add_text(str(r["name"]))
             dpg.add_text(imap.get(code, "-"))
             dpg.add_text(str(r["close"]))
@@ -1957,6 +2120,7 @@ def _refresh_watchlist(use_realtime=False):
         return
     cols = ["代码", "名称", "加入日", "买入价", "现价", "今日涨跌%", "浮动盈亏%", "备注", "操作"]
     dpg.delete_item("watch_table", children_only=True)
+    STATE["_watch_hl_row"] = None   # 行重建后旧高亮索引失效,重置避免误清/越界
     for col in cols:
         dpg.add_table_column(label=col, parent="watch_table")
     wl = db.load_watchlist()
@@ -1965,27 +2129,40 @@ def _refresh_watchlist(use_realtime=False):
         return
 
     spot = STATE.get("spot") if use_realtime else None
-    # 判断快照是否"陈旧"(盘前/午休/停牌:最新价为0,已用昨收兜底)。
-    # 只要有任一票带 stale 标记,就说明当前非连续竞价时段。
-    is_stale = bool(spot) and any(
-        (v or {}).get("stale") for v in spot.values()) if spot else False
-    if use_realtime and spot:
-        src_txt = "昨收(未开盘/休市)" if is_stale else "实时"
-    else:
-        src_txt = "本地收盘"
+    # 陈旧判断必须【按自选票各自】判断:每只票的 stale 标记表示它自己是否用了昨收兜底
+    # (盘前/午休/停牌)。不能拿全市场 any(stale) 一刀切——全市场几乎永远有停牌票,
+    # 会导致所有票都被误判为陈旧、实时价永远不落库。
     total_pnl = []
+    live_prices = {}   # 本次拿到的【真实时价】(非昨收兜底),批量写库持久化
+    n_saved = 0        # 用到库存历史现价的只数
+    n_live = 0         # 拿到真实时价的只数(用于表头标签)
     for _, r in wl.iterrows():
         code = r["code"]
         q = spot.get(code) if spot else None
         cur = None
         chg = None
+        price_src = None   # live=实时/快照, saved=库存历史现价, kline=本地日线
         if q and q.get("price") is not None:
             cur = float(q["price"])
             chg = q.get("chg_pct")  # stale(盘前/停牌)时为 None
+            price_src = "live"
+            q_stale = bool(q.get("stale"))   # 这只票是否用了昨收兜底
+            if cur > 0 and not q_stale:
+                live_prices[code] = cur   # 只把真实时价(非昨收兜底)写库
+                n_live += 1
         else:
-            kl = db.load_kline(code)
-            if kl is not None and not kl.empty:
-                cur = float(kl.iloc[-1]["close"])
+            # 无实时快照:优先用库里持久化的最近现价(重开软件不丢),
+            # 没有再退回本地日线收盘价
+            saved = r.get("last_price") if "last_price" in r.index else None
+            if saved is not None and saved == saved and float(saved) > 0:
+                cur = float(saved)
+                price_src = "saved"
+                n_saved += 1
+            else:
+                kl = db.load_kline(code)
+                if kl is not None and not kl.empty:
+                    cur = float(kl.iloc[-1]["close"])
+                    price_src = "kline"
         buy = float(r["buy_price"] or 0.0)
         # 现价有效(>0)且有买入价才算浮动盈亏,否则留空,避免拉不到价时误显示 -100%
         has_cur = cur is not None and cur > 0
@@ -1993,13 +2170,24 @@ def _refresh_watchlist(use_realtime=False):
         if pnl is not None:
             total_pnl.append(pnl)
         with dpg.table_row(parent="watch_table"):
+            # 注:此表行内含"持仓点评/移除"按钮与"买入价"输入框,不能用
+            # span_columns=True(跨列 selectable 会铺满整行并抢占点击,导致
+            # 同行按钮/输入框点不动)。故此表只高亮代码格,保留行内交互。
             _sel = dpg.add_selectable(label=code, span_columns=False, user_data=code,
                                       callback=_on_code_click)   # 双击代码 → 跳K线页
+            dpg.bind_item_theme(_sel, "row_hover")
             dpg.add_text(str(r["name"]))
             dpg.add_text(str(r["add_date"]))
-            dpg.add_text(f"{buy:.2f}" if buy > 0 else "-")
+            # 买入价:内联可编辑(加入价不一定是真实买入价)。改完即存库并重算盈亏
+            dpg.add_input_float(default_value=buy, width=90, step=0,
+                                format="%.2f", tag=f"watch_buy_{code}",
+                                user_data=code, on_enter=True,
+                                callback=_on_edit_buy_price)
             if has_cur:
-                dpg.add_text(f"{cur:.2f}")
+                # 库存历史价(saved)标灰,提示这不是最新实时价
+                dpg.add_text(f"{cur:.2f}",
+                             color=(150, 150, 150) if price_src == "saved"
+                             else (230, 230, 230))
             else:
                 dpg.add_text("-", color=(150, 150, 150))
             if chg is not None:
@@ -2013,14 +2201,92 @@ def _refresh_watchlist(use_realtime=False):
             else:
                 dpg.add_text("观察", color=(150, 150, 150))
             dpg.add_text(str(r["note"]))
-            dpg.add_button(label="移除", width=60,
-                           callback=lambda s, a, u: _remove_watch(u), user_data=code)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="持仓点评", width=76,
+                               callback=on_ai_hold_comment,
+                               user_data=(code, buy))
+                dpg.add_button(label="移除", width=54,
+                               callback=lambda s, a, u: _remove_watch(u),
+                               user_data=code)
+    # 把本次拿到的实时价持久化,重开软件后现价不再还原成旧价
+    if live_prices:
+        try:
+            db.save_watch_prices(live_prices)
+        except Exception:
+            pass
+    # 价格源标签:按本次自选票实际用到的源细化
+    if use_realtime and spot:
+        if n_live and n_saved:
+            src_txt = f"实时{n_live}只/昨收或历史{n_saved}只"
+        elif n_live:
+            src_txt = "实时"
+        else:
+            src_txt = "昨收(未开盘/休市)"
+    else:
+        src_txt = f"上次实时价(共{n_saved}只)" if n_saved else "本地收盘"
     if total_pnl:
         avg = sum(total_pnl) / len(total_pnl)
         dpg.set_value("watch_status",
                       f"持仓 {len(total_pnl)} 只 · 平均浮动盈亏 {avg:+.2f}% · 价格源:{src_txt}")
     else:
         dpg.set_value("watch_status", f"自选 {len(wl)} 只(均为观察) · 价格源:{src_txt}")
+
+
+def _on_edit_buy_price(sender=None, app_data=None, user_data=None):
+    """盯盘表内联修改买入价:存库并重算浮动盈亏。"""
+    code = user_data
+    try:
+        val = round(float(app_data), 2)   # input_float 为单精度,四舍五入到分,避免 10.32→10.3199
+    except Exception:
+        val = 0.0
+    if val < 0:
+        val = 0.0
+    db.update_buy_price(code, val)
+    _set_status(f"已更新 {code} 买入价为 {val:.2f}")
+    # 用当前价格源(实时/库存)重算,不重新拉网络
+    _refresh_watchlist(use_realtime=bool(STATE.get("spot")))
+
+
+def on_copy_watch_ai(sender=None, app_data=None, user_data=None):
+    """把盯盘页 AI 点评面板的全文(标题+操作/风险+正文+免责)复制到系统剪贴板。"""
+    parts = []
+    for tag in ("watch_ai_title", "watch_ai_action", "watch_ai_risk",
+                "watch_ai_report", "watch_ai_text", "watch_ai_disclaimer"):
+        if dpg.does_item_exist(tag):
+            v = dpg.get_value(tag)
+            if v and str(v).strip():
+                parts.append(str(v).strip())
+    text = "\n".join(parts).strip()
+    if not text:
+        _set_status("暂无可复制的点评内容")
+        return
+    try:
+        dpg.set_clipboard_text(text)
+        _set_status(f"已复制点评到剪贴板({len(text)} 字)")
+    except Exception as e:  # noqa
+        _set_status(f"复制失败:{e}")
+
+
+def _copy_ai_text(sender=None, app_data=None, user_data=None):
+    """通用:把指定 AI 点评面板的文本 tags 拼接后复制到系统剪贴板。
+    user_data 为该面板要复制的文本 tag 列表(标题/评级/正文/免责等,按显示顺序)。
+    供选股单只点评、批量晨报、组合解读、行情大盘点评等各面板共用。"""
+    tags = user_data or []
+    parts = []
+    for tag in tags:
+        if dpg.does_item_exist(tag):
+            v = dpg.get_value(tag)
+            if v and str(v).strip():
+                parts.append(str(v).strip())
+    text = "\n".join(parts).strip()
+    if not text:
+        _set_status("暂无可复制的点评内容")
+        return
+    try:
+        dpg.set_clipboard_text(text)
+        _set_status(f"已复制点评到剪贴板({len(text)} 字)")
+    except Exception as e:  # noqa
+        _set_status(f"复制失败:{e}")
 
 
 def on_refresh_realtime():
@@ -2314,6 +2580,594 @@ def _stop_poll():
         _set_status("已停止分时轮询")
 
 
+# ---------- 行情页(大盘概览) ----------
+def _fmt_yi(amount_yuan):
+    """把成交额/市值(元)格式化为『亿』或『万亿』字符串;None/异常返回 '-'。"""
+    try:
+        v = float(amount_yuan)
+    except Exception:  # noqa
+        return "-"
+    if v != v:  # NaN
+        return "-"
+    yi = v / 1e8
+    if abs(yi) >= 10000:
+        return f"{yi / 10000:.2f} 万亿"
+    return f"{yi:,.0f} 亿"
+
+
+def _chg_color(v):
+    """涨跌幅 → 颜色(A股惯例:涨红跌绿,0 灰)。"""
+    try:
+        x = float(v)
+    except Exception:  # noqa
+        return (200, 200, 200)
+    if x > 0:
+        return (230, 60, 60)
+    if x < 0:
+        return (40, 180, 90)
+    return (190, 190, 190)
+
+
+def _render_market(idx_df, act, summ):
+    """把拉取到的行情数据渲染进「行情」页的各控件(必须在主线程/回调里调)。"""
+    # ---- 指数表 ----
+    if dpg.does_item_exist("mkt_index_table"):
+        dpg.delete_item("mkt_index_table", children_only=True)
+        for col in ["指数", "最新价", "涨跌幅", "涨跌点", "今开",
+                    "最高", "最低", "成交额"]:
+            dpg.add_table_column(label=col, parent="mkt_index_table")
+        if idx_df is not None and not idx_df.empty:
+            for _, r in idx_df.iterrows():
+                col = _chg_color(r.get("chg_pct"))
+                with dpg.table_row(parent="mkt_index_table"):
+                    dpg.add_text(str(r.get("name", "")))
+                    dpg.add_text(f"{r.get('price', float('nan')):.2f}", color=col)
+                    cp = r.get("chg_pct")
+                    dpg.add_text(f"{cp:+.2f}%" if cp == cp else "-", color=col)
+                    ca = r.get("chg_amt")
+                    dpg.add_text(f"{ca:+.2f}" if ca == ca else "-", color=col)
+                    dpg.add_text(f"{r.get('open', float('nan')):.2f}")
+                    dpg.add_text(f"{r.get('high', float('nan')):.2f}")
+                    dpg.add_text(f"{r.get('low', float('nan')):.2f}")
+                    dpg.add_text(_fmt_yi(r.get("amount")))
+
+    # ---- 成交额/总貌 ----
+    sh_amt = (idx_df.attrs.get("sh_amount") if idx_df is not None else None)
+    sz_amt = (idx_df.attrs.get("sz_amount") if idx_df is not None else None)
+    tot = (idx_df.attrs.get("total_amount") if idx_df is not None else None)
+    if dpg.does_item_exist("mkt_amount_text"):
+        line = (f"两市成交额  {_fmt_yi(tot)}    "
+                f"(沪 {_fmt_yi(sh_amt)} + 深 {_fmt_yi(sz_amt)})")
+        dpg.set_value("mkt_amount_text", line)
+    if dpg.does_item_exist("mkt_summary_text"):
+        sh_mv = summ.get("sh_mv")   # 亿元
+        sz_mv = summ.get("sz_mv")   # 元
+        parts = []
+        if sh_mv is not None:
+            parts.append(f"沪市总市值 {sh_mv / 1e4:,.2f} 万亿")
+        if sz_mv is not None:
+            parts.append(f"深市总市值 {_fmt_yi(sz_mv)}")
+        if summ.get("sh_listed") is not None:
+            parts.append(f"沪市上市 {int(summ['sh_listed'])} 家")
+        if summ.get("sz_listed") is not None:
+            parts.append(f"深市股票 {int(summ['sz_listed'])} 只")
+        dpg.set_value("mkt_summary_text", "    ".join(parts) if parts else "-")
+
+    # ---- 涨跌家数/情绪 ----
+    if dpg.does_item_exist("mkt_activity_group"):
+        dpg.delete_item("mkt_activity_group", children_only=True)
+        up = int(act.get("上涨", 0) or 0)
+        down = int(act.get("下跌", 0) or 0)
+        flat = int(act.get("平盘", 0) or 0)
+        zt = int(act.get("涨停", 0) or 0)
+        zt_real = int(act.get("真实涨停", 0) or 0)
+        dt = int(act.get("跌停", 0) or 0)
+        dt_real = int(act.get("真实跌停", 0) or 0)
+        halt = int(act.get("停牌", 0) or 0)
+        active = act.get("活跃度")
+        with dpg.group(horizontal=True, parent="mkt_activity_group"):
+            dpg.add_text(f"上涨 {up}", color=(230, 60, 60))
+            dpg.add_text(" / ", color=(140, 140, 140))
+            dpg.add_text(f"下跌 {down}", color=(40, 180, 90))
+            dpg.add_text(" / ", color=(140, 140, 140))
+            dpg.add_text(f"平盘 {flat}", color=(190, 190, 190))
+            dpg.add_text("      ", color=(140, 140, 140))
+            dpg.add_text(f"涨停 {zt}(真实 {zt_real})", color=(230, 60, 60))
+            dpg.add_text(" / ", color=(140, 140, 140))
+            dpg.add_text(f"跌停 {dt}(真实 {dt_real})", color=(40, 180, 90))
+            dpg.add_text("      ", color=(140, 140, 140))
+            dpg.add_text(f"停牌 {halt}", color=(190, 190, 190))
+            if active is not None:
+                dpg.add_text("      ", color=(140, 140, 140))
+                dpg.add_text(f"赚钱效应(活跃度) {active}", color=(230, 200, 120))
+        # 涨跌强弱条(上涨占比,红涨绿跌)
+        total_ud = up + down
+        if total_ud > 0:
+            ratio = up / total_ud
+            with dpg.group(horizontal=True, parent="mkt_activity_group"):
+                dpg.add_text(f"多空比 {ratio * 100:.0f}%", color=(200, 200, 200))
+                dpg.add_progress_bar(default_value=ratio, width=300,
+                                     overlay=f"{up}↑ / {down}↓")
+
+
+def _render_market_mood(vol, pool):
+    """渲染『盘面量能 / 情绪温度』区(mkt_mood_group):量能对比(缩量/放量)+
+    连板高度 + 涨停梯队 + 封板率 + 炸板数。
+    vol = market_data.fetch_volume_compare 结果;pool = fetch_limit_pool 结果。
+    任一为空则该部分显示占位,不报错。"""
+    if not dpg.does_item_exist("mkt_mood_group"):
+        return
+    dpg.delete_item("mkt_mood_group", children_only=True)
+
+    # ---- 第一行:量能对比 ----
+    with dpg.group(horizontal=True, parent="mkt_mood_group"):
+        vol = vol or {}
+        state = vol.get("state")
+        ratio = vol.get("ratio_pct")
+        today = vol.get("today")
+        avg5 = vol.get("avg5")
+        # 放量=红(情绪升温) 缩量=绿 持平=灰,契合A股涨红跌绿的情绪direction
+        vcol = {"放量": (230, 60, 60), "缩量": (40, 180, 90),
+                "持平": (190, 190, 190)}.get(state, (190, 190, 190))
+        dpg.add_text("量能", color=(140, 140, 140))
+        if state and ratio is not None:
+            dpg.add_text(f"{state} {ratio:+.0f}%", color=vcol)
+            dpg.add_text("(较近5日均量)", color=(150, 150, 150))
+        else:
+            dpg.add_text("数据未就绪", color=(150, 150, 150))
+
+    # ---- 第二行:情绪温度(连板高度 / 封板率 / 炸板) ----
+    pool = pool or {}
+    max_board = pool.get("max_board")
+    seal = pool.get("seal_rate")
+    zt_n = pool.get("zt_count")
+    zb_n = pool.get("zb_count")
+    with dpg.group(horizontal=True, parent="mkt_mood_group"):
+        dpg.add_text("情绪", color=(140, 140, 140))
+        if max_board is not None:
+            dpg.add_text(f"最高 {max_board} 连板", color=(230, 60, 60))
+        else:
+            dpg.add_text("涨停梯队数据未就绪", color=(150, 150, 150))
+        if zt_n is not None:
+            dpg.add_text("   ", color=(140, 140, 140))
+            dpg.add_text(f"涨停 {zt_n}", color=(230, 60, 60))
+        if zb_n is not None:
+            dpg.add_text(" / ", color=(140, 140, 140))
+            dpg.add_text(f"炸板 {zb_n}", color=(230, 160, 60))
+        if seal is not None:
+            dpg.add_text(" / ", color=(140, 140, 140))
+            # 封板率高=情绪强(红) 低=退潮(绿),60% 为大致分界
+            scol = (230, 60, 60) if seal >= 60 else (40, 180, 90)
+            dpg.add_text(f"封板率 {seal:.0f}%", color=scol)
+
+    # ---- 第三行:涨停梯队(各连板档位家数) ----
+    ladder = pool.get("ladder") or []
+    first = pool.get("first_board")
+    if ladder or first is not None:
+        with dpg.group(horizontal=True, parent="mkt_mood_group"):
+            dpg.add_text("梯队", color=(140, 140, 140))
+            for b, n in ladder:   # 已按连板数降序(高标在前)
+                dpg.add_text(f"{b}板×{n}", color=(230, 90, 90))
+                dpg.add_text(" ", color=(140, 140, 140))
+            if first is not None:
+                dpg.add_text(f"首板×{first}", color=(230, 150, 120))
+
+
+def _render_updown_dist(dist):
+    """渲染『涨跌幅分布直方图』(mkt_dist_group):从跌停到涨停 10 档各家数,
+    用进度条模拟横向柱状图(涨档红、跌档绿)。dist = fetch_updown_dist 结果。
+    数据未就绪时显示占位提示(不阻塞其余行情数据)。"""
+    if not dpg.does_item_exist("mkt_dist_group"):
+        return
+    dpg.delete_item("mkt_dist_group", children_only=True)
+    dist = dist or {}
+    bins = dist.get("bins") or []
+    if not bins:
+        dpg.add_text("(涨跌幅分布数据加载中… 全市场快照约 20 秒,首次稍慢)",
+                     color=(150, 150, 150), parent="mkt_dist_group")
+        return
+    if dpg.does_item_exist("mkt_dist_note"):
+        up = dist.get("up"); down = dist.get("down"); flat = dist.get("flat")
+        dpg.set_value("mkt_dist_note",
+                      f"  上涨 {up} / 平盘 {flat} / 下跌 {down} "
+                      f"(共 {dist.get('total')} 只)")
+    max_n = max((n for _, n in bins), default=0) or 1
+    for lab, n in bins:
+        # 涨档红、跌档绿(涨停/涨x = 红系,跌停/跌x = 绿系)
+        is_up = lab.startswith("涨")
+        col = (230, 60, 60) if is_up else (40, 180, 90)
+        with dpg.group(horizontal=True, parent="mkt_dist_group"):
+            dpg.add_text(f"{lab:>4}", color=col)
+            dpg.add_progress_bar(default_value=n / max_n, width=340,
+                                 overlay=str(n))
+
+
+_BOARD_SORT_KEYS = {
+    "chg_pct": "涨跌幅",
+    "net_inflow": "净流入",
+    "amount": "成交额",
+}
+
+
+def _render_board(df):
+    """渲染热门板块表(已按 STATE['mkt_board_sort'] 排序)。"""
+    if not dpg.does_item_exist("mkt_board_table"):
+        return
+    dpg.delete_item("mkt_board_table", children_only=True)
+    for col in ["排名", "板块", "涨跌幅", "成交额", "净额(全单)",
+                "涨/跌家数", "领涨股"]:
+        dpg.add_table_column(label=col, parent="mkt_board_table")
+    if df is None or df.empty:
+        return
+    key = STATE.get("mkt_board_sort", "chg_pct")
+    if key in df.columns:
+        asc = False  # 涨幅/净流入/成交额均降序看头部
+        df = df.sort_values(key, ascending=asc).reset_index(drop=True)
+    # 记录渲染顺序对应的板块名 → 供定时刷新时按位置原地更新数值(不重建表、不重排序)
+    names_order = []
+    for i, r in df.iterrows():
+        name = str(r.get("name", ""))
+        names_order.append(name)
+        cp = r.get("chg_pct")
+        col = _chg_color(cp)
+        with dpg.table_row(parent="mkt_board_table"):
+            dpg.add_text(str(i + 1), color=(150, 150, 150))
+            dpg.add_text(name, color=col, tag=f"bcell{i}_name")
+            dpg.add_text(f"{cp:+.2f}%" if cp == cp else "-", color=col,
+                         tag=f"bcell{i}_chg")
+            dpg.add_text(_fmt_yi(r.get("amount")), tag=f"bcell{i}_amt")
+            ni = r.get("net_inflow")
+            dpg.add_text(_fmt_yi(ni), color=_chg_color(ni), tag=f"bcell{i}_net")
+            up = r.get("up")
+            down = r.get("down")
+            up_s = str(int(up)) if up == up else "-"
+            down_s = str(int(down)) if down == down else "-"
+            with dpg.group(horizontal=True, horizontal_spacing=0):
+                dpg.add_text(up_s, color=(230, 60, 60), tag=f"bcell{i}_up")
+                dpg.add_text("/", color=(140, 140, 140))
+                dpg.add_text(down_s, color=(40, 180, 90), tag=f"bcell{i}_down")
+            lc = r.get("leader_chg")
+            with dpg.group(horizontal=True, horizontal_spacing=4):
+                dpg.add_text(str(r.get("leader", "")), color=(200, 200, 200),
+                             tag=f"bcell{i}_leader")
+                dpg.add_text(f"{lc:+.2f}%" if lc == lc else "",
+                             color=_chg_color(lc), tag=f"bcell{i}_lc")
+    STATE["mkt_board_names"] = names_order
+
+
+def _update_board_values(df):
+    """定时刷新用:只原地更新板块表已有行的数值/颜色,不删表、不重排序。
+    这样用户滚动到列表任意位置时刷新,滚动位置保持不变(体感不跳)。
+    按板块名匹配到重建时记录的行位置;若板块集合发生变化(新增/消失),
+    则退回完整重建 _render_board(此时重置滚动可接受,属少见情况)。"""
+    if not dpg.does_item_exist("mkt_board_table"):
+        return
+    names_order = STATE.get("mkt_board_names")
+    if not names_order or df is None or df.empty:
+        _render_board(df)
+        return
+    by_name = {str(r.get("name", "")): r for _, r in df.iterrows()}
+    # 板块集合变了 → 结构不同,重建
+    if set(by_name.keys()) != set(names_order):
+        _render_board(df)
+        return
+    for i, name in enumerate(names_order):
+        r = by_name.get(name)
+        if r is None:
+            continue
+        cp = r.get("chg_pct")
+        col = _chg_color(cp)
+        _set_cell(f"bcell{i}_name", name, col)
+        _set_cell(f"bcell{i}_chg",
+                  f"{cp:+.2f}%" if cp == cp else "-", col)
+        _set_cell(f"bcell{i}_amt", _fmt_yi(r.get("amount")))
+        ni = r.get("net_inflow")
+        _set_cell(f"bcell{i}_net", _fmt_yi(ni), _chg_color(ni))
+        up = r.get("up")
+        down = r.get("down")
+        _set_cell(f"bcell{i}_up",
+                  str(int(up)) if up == up else "-")
+        _set_cell(f"bcell{i}_down",
+                  str(int(down)) if down == down else "-")
+        _set_cell(f"bcell{i}_leader", str(r.get("leader", "")))
+        lc = r.get("leader_chg")
+        _set_cell(f"bcell{i}_lc",
+                  f"{lc:+.2f}%" if lc == lc else "", _chg_color(lc))
+
+
+def _set_cell(tag, value, color=None):
+    """原地更新单个单元格文本(可选颜色);控件不存在则跳过。"""
+    if not dpg.does_item_exist(tag):
+        return
+    dpg.set_value(tag, value)
+    if color is not None:
+        dpg.configure_item(tag, color=color)
+
+
+def on_sort_board(sender=None, app_data=None, user_data=None):
+    """切换板块排序字段并重绘(user_data 为排序键)。"""
+    key = user_data or "chg_pct"
+    STATE["mkt_board_sort"] = key
+    for k in _BOARD_SORT_KEYS:
+        tag = f"mkt_board_sort_{k}"
+        if dpg.does_item_exist(tag):
+            dpg.bind_item_theme(tag, "period_on" if k == key else 0)
+    _render_board(STATE.get("mkt_board_df"))
+
+
+def _fetch_market_all():
+    """后台拉取行情主数据,返回 (idx_df, activity_dict, summary_dict, board_df,
+    vol_dict, pool_dict)。这些都相对快(<5s),可进 10s 定时刷新循环。
+    涨跌幅分布(全市场快照~20s)不在此列,由独立慢速线程 _mkt_dist_worker 处理。"""
+    idx_df = market_data.fetch_index_spot()
+    act = market_data.fetch_market_activity()
+    summ = market_data.fetch_market_summary()
+    board = market_data.fetch_industry_board()
+    # 量能对比: 复用 idx_df attrs 里的今日成交量, 不额外拉网络
+    sh_vol = idx_df.attrs.get("sh_volume") if idx_df is not None else None
+    sz_vol = idx_df.attrs.get("sz_volume") if idx_df is not None else None
+    try:
+        vol = market_data.fetch_volume_compare(sh_vol, sz_vol)
+    except Exception:  # noqa
+        vol = {}
+    try:
+        pool = market_data.fetch_limit_pool()   # 涨停/炸板池(~4s, 带45s缓存)
+    except Exception:  # noqa
+        pool = {}
+    return idx_df, act, summ, board, vol, pool
+
+
+def _kick_updown_dist():
+    """起一个一次性慢速线程拉『涨跌幅分布』(全市场快照~20s)并渲染。
+    带一个 in-flight 去重标记,避免定时刷新每轮都并发起多个全市场快照拉取
+    (数据层本身也有 60s TTL 缓存兜底)。"""
+    if STATE.get("mkt_dist_inflight"):
+        return
+
+    def worker():
+        STATE["mkt_dist_inflight"] = True
+        try:
+            dist = market_data.fetch_updown_dist()
+            STATE["mkt_dist"] = dist
+            _render_updown_dist(dist)
+        except Exception as e:  # noqa
+            import traceback
+            traceback.print_exc()
+        finally:
+            STATE["mkt_dist_inflight"] = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def on_refresh_market(sender=None, app_data=None, user_data=None):
+    """刷新「行情」页数据(后台线程拉取,回主线程渲染,不阻塞界面)。"""
+    if dpg.does_item_exist("mkt_status"):
+        dpg.set_value("mkt_status", "正在拉取大盘行情...")
+
+    def worker():
+        try:
+            idx_df, act, summ, board, vol, pool = _fetch_market_all()
+        except Exception as e:  # noqa
+            if dpg.does_item_exist("mkt_status"):
+                dpg.set_value("mkt_status", f"行情拉取失败: {e}")
+            return
+        try:
+            _render_market(idx_df, act, summ)
+            _render_market_mood(vol, pool)
+            STATE["mkt_board_df"] = board
+            STATE["mkt_idx_df"] = idx_df
+            STATE["mkt_act"] = act
+            STATE["mkt_summ"] = summ
+            STATE["mkt_vol"] = vol
+            STATE["mkt_pool"] = pool
+            _render_board(board)
+            ts = act.get("统计日期") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            tag = "(定时刷新中)" if STATE.get("mkt_poll_on") else ""
+            if dpg.does_item_exist("mkt_status"):
+                dpg.set_value("mkt_status", f"已更新 · 数据时间 {ts} {tag}")
+        except Exception as e:  # noqa
+            if dpg.does_item_exist("mkt_status"):
+                dpg.set_value("mkt_status", f"行情渲染失败: {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    # 涨跌幅分布(全市场快照慢)单独起一次慢速拉取, 不阻塞上面的主刷新
+    _kick_updown_dist()
+
+
+def _selected_is_market(sel) -> bool:
+    """判断某个 tab 选中值 sel 是否指向『行情』tab。
+    兼容不同 DPG 版本:sel 可能是 int id,也可能是 str 别名。
+    - int:直接与 get_alias_id('tab_market') 比;
+    - str:先与别名字符串 'tab_market' 比,再尝试解析成 id 比。"""
+    if sel is None or sel == 0:
+        return False
+    try:
+        mid = dpg.get_alias_id("tab_market")
+    except Exception:
+        mid = None
+    # str 别名直接比对
+    if isinstance(sel, str):
+        if sel == "tab_market":
+            return True
+        try:
+            return dpg.get_alias_id(sel) == mid
+        except Exception:
+            return False
+    # int id 比对
+    try:
+        return int(sel) == int(mid)
+    except Exception:
+        return False
+
+
+def _on_main_tab_changed(sender=None, app_data=None, user_data=None):
+    """主标签栏切换回调(主线程触发)。把『当前是否停在行情页』记进 STATE,
+    供定时刷新线程读取。app_data 为当前选中 tab 的 id/别名。
+    注意:UI 值读取非线程安全,所以只在此主线程回调里读一次并缓存,
+    后台线程只读 STATE 这个纯字典。"""
+    try:
+        STATE["active_is_market"] = _selected_is_market(app_data)
+    except Exception:
+        pass
+
+
+def _is_market_tab_active() -> bool:
+    """当前是否正停在『行情』tab(供定时刷新线程调用)。
+    只读 STATE 缓存的纯布尔值,不在后台线程碰 UI(线程安全)。"""
+    return bool(STATE.get("active_is_market"))
+
+
+def _mkt_poll_worker():
+    """行情页定时刷新线程:每 MKT_POLL_INTERVAL 秒拉一次并重绘。
+    仅当界面正停在『行情』tab 时才真正拉取;切到其他 tab 时静默跳过本轮,
+    避免用户在别的界面时后台仍在发网络请求、刷新看不到的页面。"""
+    while STATE.get("mkt_poll_on"):
+        if _is_market_tab_active():
+            try:
+                idx_df, act, summ, board, vol, pool = _fetch_market_all()
+                _render_market(idx_df, act, summ)
+                _render_market_mood(vol, pool)
+                STATE["mkt_board_df"] = board
+                STATE["mkt_idx_df"] = idx_df
+                STATE["mkt_act"] = act
+                STATE["mkt_summ"] = summ
+                STATE["mkt_vol"] = vol
+                STATE["mkt_pool"] = pool
+                # 定时刷新只原地更新板块表数值,不重建表/不重排序,
+                # 保持用户当前滚动位置(体感不跳)
+                _update_board_values(board)
+                # 涨跌幅分布慢(全市场快照~20s),独立慢速线程拉,不拖累本轮
+                _kick_updown_dist()
+                ts = act.get("统计日期") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if dpg.does_item_exist("mkt_status"):
+                    dpg.set_value("mkt_status", f"已更新 · 数据时间 {ts} (定时刷新中)")
+            except Exception as e:  # noqa
+                # 拉取/渲染失败也显示到界面,别只 print 到看不见的控制台
+                import traceback
+                traceback.print_exc()
+                if dpg.does_item_exist("mkt_status"):
+                    dpg.set_value("mkt_status", f"定时刷新失败:{e} ({datetime.now().strftime('%H:%M:%S')})")
+        else:
+            # 不在行情页,跳过本轮(把原因显示出来,便于排查"勾了却不刷新")
+            if dpg.does_item_exist("mkt_status"):
+                cur = dpg.get_value("mkt_status") or ""
+                if "已暂停" not in cur:
+                    dpg.set_value("mkt_status", "定时刷新已暂停(当前不在行情页,切回自动恢复)")
+        for _ in range(MKT_POLL_INTERVAL * 2):
+            if not STATE.get("mkt_poll_on"):
+                break
+            _time.sleep(0.5)
+
+
+def on_toggle_mkt_poll(sender=None, app_data=None, user_data=None):
+    """行情页『盘中定时刷新』开关回调。app_data 为 checkbox 新值。"""
+    want = bool(app_data)
+    if want and not STATE.get("mkt_poll_on"):
+        # 关键:这个复选框本身就在行情页上,用户能勾到它,当下必然停在行情页。
+        # 所以勾选即直接置 True——不去读 tab_bar 的选中值(其类型在不同 DPG
+        # 版本 int/str 不一,硬比较易恒 False,正是之前"勾了也不刷新"的根因)。
+        # 之后切走由 _on_main_tab_changed 回调更新为 False,切回再置回 True。
+        STATE["active_is_market"] = True
+        STATE["mkt_poll_on"] = True
+        t = threading.Thread(target=_mkt_poll_worker, daemon=True)
+        STATE["mkt_poll_thread"] = t
+        t.start()
+    elif not want:
+        STATE["mkt_poll_on"] = False
+
+
+def _build_market_snapshot():
+    """把行情页已拉取的指数/情绪/总貌/板块打包成 commentary.comment_market 所需
+    的 snapshot(纯读 STATE,不发网络请求,保证点评与屏幕显示同源)。
+    数据未就绪时返回 None。"""
+    idx_df = STATE.get("mkt_idx_df")
+    act = STATE.get("mkt_act")
+    board = STATE.get("mkt_board_df")
+    if (idx_df is None or getattr(idx_df, "empty", True)) and not act:
+        return None
+
+    snap = {}
+    # 指数
+    indexes = []
+    if idx_df is not None and not idx_df.empty:
+        for _, r in idx_df.iterrows():
+            indexes.append({"name": r.get("name", ""),
+                            "chg_pct": r.get("chg_pct"),
+                            "price": r.get("price")})
+        snap["sh_amount"] = idx_df.attrs.get("sh_amount")
+        snap["sz_amount"] = idx_df.attrs.get("sz_amount")
+        snap["total_amount"] = idx_df.attrs.get("total_amount")
+    snap["indexes"] = indexes
+    # 情绪
+    snap["activity"] = act or {}
+    # 板块(转成轻量 list;已按涨幅降序)
+    boards = []
+    if board is not None and not board.empty:
+        for _, r in board.iterrows():
+            boards.append({"name": r.get("name", ""),
+                           "chg_pct": r.get("chg_pct"),
+                           "net_inflow": r.get("net_inflow")})
+    snap["boards"] = boards
+    return snap
+
+
+def on_ai_comment_market(sender=None, app_data=None, user_data=None):
+    """对当前大盘 + 行业生成 AI 点评(后台线程流式,不阻塞界面)。
+
+    事实全部复用行情页已拉取的快照(指数/涨跌家数/成交额/板块),
+    与屏幕显示同源;AI 只做研判 + 风险提示,不给操作建议(见 app/ai)。
+    """
+    dpg.configure_item("mkt_ai_win", show=True)
+    dpg.configure_item("mkt_ai_disclaimer", show=False)
+    if dpg.does_item_exist("mkt_ai_sentiment"):
+        dpg.configure_item("mkt_ai_sentiment", show=False)
+
+    # 未配置模型:直接给引导
+    if not ai_configured():
+        dpg.set_value("mkt_ai_text", ai_config_hint())
+        return
+
+    snapshot = _build_market_snapshot()
+    if not snapshot:
+        dpg.set_value("mkt_ai_text",
+                      "请先点『刷新行情』拉取大盘数据,再生成 AI 点评。")
+        return
+
+    dpg.set_value("mkt_ai_text", "正在综合指数/涨跌家数/成交额/行业板块生成大盘点评,请稍候...")
+    dpg.configure_item("mkt_ai_btn", enabled=False, label="点评中...")
+
+    def worker():
+        buf = {"s": ""}
+
+        def _on_delta(piece):
+            buf["s"] += piece
+            if dpg.does_item_exist("mkt_ai_text"):
+                dpg.set_value("mkt_ai_text", buf["s"])
+
+        try:
+            res = ai_commentary.comment_market(snapshot, on_delta=_on_delta)
+            if res.get("ok"):
+                dpg.set_value("mkt_ai_text", res["text"])
+                dpg.set_value("mkt_ai_disclaimer", res["disclaimer"])
+                dpg.configure_item("mkt_ai_disclaimer", show=True)
+                # 情绪评级彩色标签(偏暖=红 偏冷=绿,遵循 A 股惯例)
+                sent = res.get("sentiment")
+                if dpg.does_item_exist("mkt_ai_sentiment") and sent:
+                    color = {"偏暖": (230, 60, 60), "偏冷": (40, 170, 80),
+                             "中性": (200, 180, 90)}.get(sent, (200, 200, 200))
+                    dpg.set_value("mkt_ai_sentiment", f"  市场情绪:{sent}")
+                    dpg.configure_item("mkt_ai_sentiment", color=color, show=True)
+            else:
+                dpg.set_value("mkt_ai_text",
+                              f"点评失败:\n{res.get('error', '未知错误')}")
+                dpg.configure_item("mkt_ai_disclaimer", show=False)
+        finally:
+            if dpg.does_item_exist("mkt_ai_btn"):
+                dpg.configure_item("mkt_ai_btn", enabled=True, label="AI点评大盘")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def _on_pick_code(code, hint=None):
     """点结果/榜单/自选表里的代码:跳到「选股 & K线」页并画K线;切换标的时停旧轮询、回到日线。
 
@@ -2328,6 +3182,8 @@ def _on_pick_code(code, hint=None):
     try:
         if dpg.does_item_exist("main_tabs") and dpg.does_item_exist("tab_kline"):
             dpg.set_value("main_tabs", dpg.get_alias_id("tab_kline"))
+            # 程序化切 tab 不触发 tab_bar callback,手动同步(切走行情页)
+            STATE["active_is_market"] = False
     except Exception:
         pass
 
@@ -2348,6 +3204,89 @@ def _on_code_click(sender, app_data, user_data):
     if code == last_code and (now - last_ts) <= 0.40:
         STATE["_last_click_ts"] = 0.0   # 重置,避免三连击误判
         _on_pick_code(code)
+
+
+def _on_watch_row_hover(sender, app_data):
+    """持仓表整行悬停高亮(全局鼠标移动驱动)。
+
+    持仓表行内含"持仓点评/移除"按钮与"买入价"输入框,不能用跨列 selectable
+    (span_columns=True 会铺满整行抢占点击)。故改用 highlight_table_cell:
+    它只染单元格背景、不占点击区域,鼠标落在某行任意位置时,
+    把该行【全部9列】背景染成高亮色。第9列"操作"(点评/移除按钮)一起高亮,
+    但 highlight_table_cell 只画背景不抢点击,按钮/输入框仍可正常点击/编辑。
+
+    命中判定:不用表格容器自身的 rect(table 的 get_item_rect_min/max 常返回
+    (0,0)/无效,会让整行判定失效)。改用【行内单元格】的 rect 拼行矩形:
+    X = 该行首格左边 ~ 末格右边(覆盖所有列及格内留白、按钮右侧空白),
+    Y = 首格上下边界(定行高)。单元格叶子控件的 rect 覆盖整格(含留白),
+    故鼠标落在行内任意位置(有无文字都一样)都能命中整行。
+    坐标系:get_item_rect_min/max 与 get_mouse_pos(local=False) 均为 viewport
+    绝对坐标,一致。若坐标全拿不到,回退 is_item_hovered 逐格兜底(不全灭)。
+    """
+    tbl = "watch_table"
+    if not dpg.does_item_exist(tbl):
+        return
+    try:
+        rows = dpg.get_item_children(tbl, 1) or []
+    except Exception:
+        return
+    hover_idx = None
+    try:
+        mx, my = dpg.get_mouse_pos(local=False)   # 相对 viewport 的绝对坐标
+    except Exception:
+        mx = my = None
+    coord_ok = False   # 本帧是否成功用坐标判定(有一行拿到有效 rect 即视为可用)
+    if mx is not None:
+        for idx, row in enumerate(rows):
+            try:
+                cells = dpg.get_item_children(row, 1) or []
+            except Exception:
+                continue
+            if not cells:
+                continue
+            try:
+                r_min = dpg.get_item_rect_min(cells[0])    # 首格左上(定行高+左边界)
+                r_max = dpg.get_item_rect_max(cells[0])    # 首格右下
+                x_right = dpg.get_item_rect_max(cells[-1])[0]  # 末格右边界
+            except Exception:
+                continue
+            if not r_min or not r_max:
+                continue
+            left, top, bot = r_min[0], r_min[1], r_max[1]
+            if bot <= top:   # rect 尚未渲染,跳过
+                continue
+            if x_right <= left:      # 末格 rect 无效,退用首格右边界兜底
+                x_right = r_max[0]
+            coord_ok = True
+            # 鼠标落在该行矩形(表宽 x 行高,含所有留白)即命中
+            if left <= mx <= x_right and top <= my <= bot:
+                hover_idx = idx
+                break
+    if not coord_ok:   # 坐标方案失效(rect 全无效)→ 回退逐格 hover 检测,至少不全灭
+        for idx, row in enumerate(rows):
+            try:
+                cells = dpg.get_item_children(row, 1) or []
+            except Exception:
+                continue
+            if any(dpg.is_item_hovered(c) for c in cells):
+                hover_idx = idx
+                break
+    prev = STATE.get("_watch_hl_row")
+    if hover_idx == prev:
+        return
+    if prev is not None:   # 清除上一行高亮
+        for col in range(9):
+            try:
+                dpg.unhighlight_table_cell(tbl, prev, col)
+            except Exception:
+                pass
+    if hover_idx is not None:   # 染当前行全部9列(含操作列)
+        for col in range(9):
+            try:
+                dpg.highlight_table_cell(tbl, hover_idx, col, WATCH_CELL_HL)
+            except Exception:
+                pass
+    STATE["_watch_hl_row"] = hover_idx
 
 
 def _on_result_click(sender, app_data, user_data):
@@ -3093,7 +4032,8 @@ def build_ui():
 
             # ===== 右侧:标签页 =====
             with dpg.child_window(tag="right_panel"):
-                with dpg.tab_bar(tag="main_tabs"):
+                with dpg.tab_bar(tag="main_tabs",
+                                 callback=_on_main_tab_changed):
                     # --- Tab 1: 选股 & K线 ---
                     with dpg.tab(label="选股 & K线", tag="tab_kline"):
                         with dpg.group(horizontal=True):
@@ -3123,6 +4063,12 @@ def build_ui():
                                 dpg.add_button(label="关闭", width=48, height=22,
                                                callback=lambda: dpg.configure_item(
                                                    "ai_rank_win", show=False))
+                            dpg.add_text(
+                                "说明:此处评级/风险是 AI 在本批候选池内『横向相对比较』"
+                                "后给出的,依据为压缩后的关键指标;与 K 线页『AI 综合点评』"
+                                "对单只做『深度绝对评级』(事实更全、含筹码/多周期)口径不同,"
+                                "两者可能不一致,均属正常。",
+                                wrap=820, color=(150, 150, 150))
                             with dpg.table(tag="ai_rank_table", header_row=True,
                                            resizable=True,
                                            policy=dpg.mvTable_SizingStretchProp,
@@ -3138,6 +4084,11 @@ def build_ui():
                             with dpg.group(horizontal=True):
                                 dpg.add_text("AI 批量点评晨报", tag="ai_batch_title",
                                              color=(160, 200, 255))
+                                dpg.add_button(label="复制", width=48, height=22,
+                                               callback=_copy_ai_text,
+                                               user_data=["ai_batch_title",
+                                                          "ai_batch_report",
+                                                          "ai_batch_text"])
                                 dpg.add_button(label="打开目录", width=76, height=22,
                                                callback=on_open_report_dir)
                                 dpg.add_button(label="关闭", width=48, height=22,
@@ -3154,6 +4105,11 @@ def build_ui():
                             with dpg.group(horizontal=True):
                                 dpg.add_text("AI 组合解读", tag="ai_pf_title",
                                              color=(160, 200, 255))
+                                dpg.add_button(label="复制", width=48, height=22,
+                                               callback=_copy_ai_text,
+                                               user_data=["ai_pf_title",
+                                                          "ai_pf_text",
+                                                          "ai_pf_disclaimer"])
                                 dpg.add_button(label="关闭", width=48, height=22,
                                                callback=lambda: dpg.configure_item(
                                                    "ai_pf_win", show=False))
@@ -3208,6 +4164,12 @@ def build_ui():
                                 dpg.add_text("", tag="ai_risk_badge", show=False)
                                 dpg.add_text("", tag="ai_cache_badge",
                                              color=(130, 130, 130), show=False)
+                                dpg.add_button(label="复制", width=48, height=22,
+                                               callback=_copy_ai_text,
+                                               user_data=["ai_rating_badge",
+                                                          "ai_risk_badge",
+                                                          "ai_comment_text",
+                                                          "ai_comment_disclaimer"])
                                 dpg.add_button(label="刷新", width=48, height=22,
                                                tag="ai_refresh_btn",
                                                callback=lambda: on_ai_comment(
@@ -3217,6 +4179,12 @@ def build_ui():
                                                    "ai_comment_win", show=False))
                             dpg.add_text("", tag="ai_comment_text", wrap=820,
                                          color=(230, 230, 230))
+                            dpg.add_text(
+                                "说明:此评级/风险为 AI 对本只个股做『深度绝对评级』"
+                                "(事实含筹码/多周期/行业分位等,单独判定);与『AI精排Top10』"
+                                "中在候选池内『横向相对比较』的评级口径不同,两者可能不一致,"
+                                "均属正常。",
+                                wrap=820, color=(150, 150, 150))
                             dpg.add_text("", tag="ai_comment_disclaimer", wrap=820,
                                          color=(150, 150, 150), show=False)
                         # 标题行:横向 group,把"涨跌幅"单独拆出来上色(单 text 无法分段着色)
@@ -3231,6 +4199,109 @@ def build_ui():
                         dpg.add_group(tag="kline_info", horizontal=True,
                                       horizontal_spacing=0)
                         dpg.add_child_window(tag="chart_area", border=False, height=-1)
+
+                    # --- Tab: 行情(大盘概览) ---
+                    with dpg.tab(label="行情", tag="tab_market"):
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label="刷新行情", width=100, height=28,
+                                           tag="mkt_refresh_btn",
+                                           callback=on_refresh_market)
+                            dpg.add_checkbox(label="盘中定时刷新", tag="mkt_poll_cb",
+                                             callback=on_toggle_mkt_poll)
+                            dpg.add_text(f"(每{MKT_POLL_INTERVAL}秒)",
+                                         color=(130, 130, 130))
+                            dpg.add_button(label="AI点评大盘", width=110, height=28,
+                                           tag="mkt_ai_btn",
+                                           callback=on_ai_comment_market)
+                            dpg.add_text("点『刷新行情』拉取大盘数据",
+                                         tag="mkt_status", color=(255, 200, 100))
+                        dpg.add_separator()
+                        # AI 大盘点评面板(默认隐藏,点『AI点评大盘』展开)
+                        with dpg.child_window(tag="mkt_ai_win", height=190,
+                                              border=True, show=False):
+                            with dpg.group(horizontal=True):
+                                dpg.add_text("AI 大盘点评", color=(160, 200, 255))
+                                dpg.add_text("", tag="mkt_ai_sentiment",
+                                             show=False)
+                                dpg.add_button(label="复制", width=48, height=22,
+                                               callback=_copy_ai_text,
+                                               user_data=["mkt_ai_sentiment",
+                                                          "mkt_ai_text",
+                                                          "mkt_ai_disclaimer"])
+                                dpg.add_button(label="重新生成", width=80, height=22,
+                                               callback=on_ai_comment_market)
+                                dpg.add_button(label="关闭", width=48, height=22,
+                                               callback=lambda: dpg.configure_item(
+                                                   "mkt_ai_win", show=False))
+                            dpg.add_text("综合指数、涨跌家数、成交额、行业板块由 AI 研判,"
+                                         "只做解读与风险提示,不构成投资建议",
+                                         color=(130, 130, 130), wrap=880)
+                            dpg.add_text("", tag="mkt_ai_text", wrap=880,
+                                         color=(230, 230, 230))
+                            dpg.add_text("", tag="mkt_ai_disclaimer", wrap=880,
+                                         color=(140, 140, 140), show=False)
+                        dpg.add_separator()
+                        # 成交额 + 市场总貌(一行醒目文字)
+                        dpg.add_text("", tag="mkt_amount_text", color=(230, 200, 120))
+                        dpg.add_text("", tag="mkt_summary_text", color=(160, 200, 255),
+                                     wrap=900)
+                        dpg.add_separator()
+                        # 涨跌家数 / 市场情绪
+                        dpg.add_text("涨跌家数 / 市场情绪", color=(120, 220, 160))
+                        dpg.add_group(tag="mkt_activity_group")
+                        dpg.add_separator()
+                        # 量能对比 + 情绪温度(连板高度/封板率/炸板)
+                        dpg.add_text("盘面量能 / 情绪温度", color=(120, 220, 160))
+                        dpg.add_group(tag="mkt_mood_group")
+                        dpg.add_separator()
+                        # 涨跌幅分布直方图(全市场,复用盯盘快照,慢速独立刷新)
+                        with dpg.group(horizontal=True):
+                            dpg.add_text("涨跌幅分布(全市场·涨=红 跌=绿)",
+                                         color=(120, 220, 160))
+                            dpg.add_text("", tag="mkt_dist_note",
+                                         color=(130, 130, 130))
+                        dpg.add_group(tag="mkt_dist_group")
+                        dpg.add_separator()
+                        # 核心指数实时行情表
+                        dpg.add_text("核心指数(涨=红 跌=绿)", color=(120, 220, 160))
+                        with dpg.table(tag="mkt_index_table", header_row=True,
+                                       resizable=True,
+                                       policy=dpg.mvTable_SizingStretchProp,
+                                       height=260, scrollY=True):
+                            for col in ["指数", "最新价", "涨跌幅", "涨跌点", "今开",
+                                        "最高", "最低", "成交额"]:
+                                dpg.add_table_column(label=col)
+                        dpg.add_separator()
+                        # 热门板块(同花顺行业板块,90个,可切换排序)
+                        with dpg.group(horizontal=True):
+                            dpg.add_text("热门板块(行业·涨=红 跌=绿)",
+                                         color=(120, 220, 160))
+                            dpg.add_text("  排序:", color=(140, 140, 140))
+                            dpg.add_button(label="涨跌幅", width=64, height=22,
+                                           tag="mkt_board_sort_chg_pct",
+                                           user_data="chg_pct",
+                                           callback=on_sort_board)
+                            dpg.bind_item_theme("mkt_board_sort_chg_pct",
+                                                "period_on")
+                            dpg.add_button(label="净额", width=64, height=22,
+                                           tag="mkt_board_sort_net_inflow",
+                                           user_data="net_inflow",
+                                           callback=on_sort_board)
+                            dpg.add_button(label="成交额", width=64, height=22,
+                                           tag="mkt_board_sort_amount",
+                                           user_data="amount",
+                                           callback=on_sort_board)
+                        dpg.add_text("净额=板块内全部资金 流入−流出(全单口径),"
+                                     "方向反映资金进出但非券商『主力资金』口径,"
+                                     "数值会明显偏小,仅供参考",
+                                     color=(130, 130, 130), wrap=880)
+                        with dpg.table(tag="mkt_board_table", header_row=True,
+                                       resizable=True,
+                                       policy=dpg.mvTable_SizingStretchProp,
+                                       height=-1, scrollY=True):
+                            for col in ["排名", "板块", "涨跌幅", "成交额", "净额(全单)",
+                                        "涨/跌家数", "领涨股"]:
+                                dpg.add_table_column(label=col)
 
                     # --- Tab 2: 今日推荐 ---
                     with dpg.tab(label="今日推荐"):
@@ -3305,8 +4376,31 @@ def build_ui():
                             dpg.add_button(label="点评历史", width=90, height=28,
                                            callback=on_open_ai_history)
                         dpg.add_text("买入价默认记为加入时的现价;『刷新实时行情』拉全市场快照算"
-                                     "当日涨跌+浮动盈亏并检查预警;点代码看K线",
+                                     "当日涨跌+浮动盈亏并检查预警;点代码看K线;"
+                                     "点每行『持仓点评』结合你的买入价给持有/加减仓倾向",
                                      wrap=900, color=(130, 130, 130))
+                        # --- AI 输出面板(晨报/组合解读/单只持仓点评共用,就地显示) ---
+                        with dpg.child_window(tag="watch_ai_win", height=220,
+                                              border=True, show=False):
+                            with dpg.group(horizontal=True):
+                                dpg.add_text("AI 点评", tag="watch_ai_title",
+                                             color=(160, 200, 255))
+                                dpg.add_text("", tag="watch_ai_action", show=False)
+                                dpg.add_text("", tag="watch_ai_risk", show=False)
+                                dpg.add_button(label="复制", width=48, height=22,
+                                               callback=on_copy_watch_ai)
+                                dpg.add_button(label="打开目录", width=76, height=22,
+                                               callback=on_open_report_dir)
+                                dpg.add_button(label="关闭", width=48, height=22,
+                                               callback=lambda: dpg.configure_item(
+                                                   "watch_ai_win", show=False))
+                            dpg.add_text("", tag="watch_ai_report",
+                                         wrap=900, color=(120, 220, 160))
+                            with dpg.child_window(height=130, border=False):
+                                dpg.add_text("", tag="watch_ai_text", wrap=880,
+                                             color=(230, 230, 230))
+                            dpg.add_text("", tag="watch_ai_disclaimer", wrap=900,
+                                         color=(150, 150, 150), show=False)
                         dpg.add_separator()
                         with dpg.table(tag="watch_table", header_row=True, resizable=True,
                                        policy=dpg.mvTable_SizingStretchProp,
@@ -3357,6 +4451,8 @@ def build_ui():
     # 全局鼠标移动:驱动K线主图的自定义悬停提示(跟随鼠标定位到最近蜡烛)
     with dpg.handler_registry():
         dpg.add_mouse_move_handler(callback=_on_kline_hover)
+        # 持仓表整行悬停高亮(highlight_table_cell 染背景,不抢点击,按钮仍可点)
+        dpg.add_mouse_move_handler(callback=_on_watch_row_hover)
 
     dpg.create_viewport(title="A-Share Stock Picker", width=1320, height=840)
     dpg.setup_dearpygui()
