@@ -89,10 +89,28 @@ STATE = {
     "mkt_poll_thread": None,    # 行情页定时刷新线程
     "mkt_board_df": None,       # 热门板块最近一次数据(DataFrame),供排序切换复用
     "mkt_board_sort": "chg_pct",  # 热门板块当前排序字段
+    "mkt_sector_val": {},       # {板块名:{pe,pb,pe_pct,pb_pct}} PE/PB中位数+历史分位(慢速回填,按天缓存)
+    "mkt_sector_val_inflight": False,  # 板块估值当日中位数回填 in-flight 标记
+    "mkt_sector_bf_done": set(),  # 本次会话已回填过历史的板块名(避免重复60s回填)
+    "mkt_sector_bf_inflight": False,  # 历史回填 in-flight 标记(串行, 一次只回填一个)
     "mkt_idx_df": None,         # 核心指数最近一次数据(DataFrame),供AI大盘点评复用
     "mkt_act": None,            # 涨跌家数/情绪最近一次数据(dict),供AI大盘点评复用
     "mkt_summ": None,           # 两市总貌最近一次数据(dict),供AI大盘点评复用
+    "mkt_drag": None,           # 行情页正在拖拽的分隔条(child_window tag),None=未拖拽
+    "mkt_drag_y0": 0.0,         # 拖拽起始鼠标Y(viewport绝对坐标)
+    "mkt_drag_h0": 0.0,         # 拖拽起始时该块高度
 }
+
+# 行情页各可调高度区块的默认高度(px)。拖拽分隔条实时改写这里对应的 child_window。
+MKT_SECTION_HEIGHTS = {
+    "sec_activity": 150,   # 涨跌家数/情绪 + 盘面量能/情绪温度
+    "sec_dist": 235,       # 涨跌幅分布直方图(竖直柱状图)
+    "sec_diag": 240,       # 板块强弱·资金诊断(高潜力/高风险左右平行)
+    "sec_index": 240,      # 核心指数表
+    "sec_board": 300,      # 热门板块表
+}
+MKT_SECTION_MIN = 80       # 拖拽时单块最小高度
+MKT_SECTION_MAX = 900      # 拖拽时单块最大高度
 
 # L1 横截面多因子(智能版)在策略下拉框里的特殊 key。它不走逐股 evaluate,
 # 而是独立的全市场横截面打分路径(见 app/strategy/cross_section),故用 sentinel 区分。
@@ -136,6 +154,57 @@ def _make_bar_themes():
     with dpg.theme(tag="line_green"):
         with dpg.theme_component(dpg.mvLineSeries):
             dpg.add_theme_color(dpg.mvPlotCol_Line, GREEN, category=dpg.mvThemeCat_Plots)
+    # 拖拽分隔条主题:一条低调的细横条(button 伪装), 悬停/按下变亮提示可拖
+    with dpg.theme(tag="mkt_drag_bar"):
+        with dpg.theme_component(dpg.mvButton):
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (70, 70, 78))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (90, 150, 220))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (110, 170, 240))
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 2)
+
+
+# ---------- 行情页可拖拽分隔条(调整各大块高度) ----------
+def _mkt_drag_start(section_tag):
+    """按下某分隔手柄:记录当前块与起始鼠标Y、起始高度,进入拖拽态。"""
+    def _cb(sender=None, app_data=None, user_data=None):
+        if not dpg.does_item_exist(section_tag):
+            return
+        STATE["mkt_drag"] = section_tag
+        _, my = dpg.get_mouse_pos(local=False)
+        STATE["mkt_drag_y0"] = my
+        STATE["mkt_drag_h0"] = float(dpg.get_item_height(section_tag) or
+                                     MKT_SECTION_HEIGHTS.get(section_tag, 200))
+    return _cb
+
+
+def _mkt_drag_move(sender=None, app_data=None, user_data=None):
+    """拖拽中:按鼠标Y位移实时改写当前块高度(带 min/max 约束)。"""
+    tag = STATE.get("mkt_drag")
+    if not tag or not dpg.does_item_exist(tag):
+        return
+    _, my = dpg.get_mouse_pos(local=False)
+    dy = my - STATE["mkt_drag_y0"]
+    h = STATE["mkt_drag_h0"] + dy
+    h = max(MKT_SECTION_MIN, min(MKT_SECTION_MAX, h))
+    dpg.set_item_height(tag, int(h))
+    MKT_SECTION_HEIGHTS[tag] = int(h)
+
+
+def _mkt_drag_end(sender=None, app_data=None, user_data=None):
+    """松开鼠标:退出拖拽态。"""
+    STATE["mkt_drag"] = None
+
+
+def _add_mkt_section_handle(section_tag):
+    """在某可调块下方加一条可上下拖拽的分隔手柄(细横条按钮)。
+    向下拖=放大该块,向上拖=缩小。松手保存高度到 MKT_SECTION_HEIGHTS。"""
+    h = dpg.add_button(label="", height=6, width=-1,
+                       callback=None, tag=f"{section_tag}_handle")
+    dpg.bind_item_theme(h, "mkt_drag_bar")
+    with dpg.item_handler_registry() as reg:
+        dpg.add_item_clicked_handler(dpg.mvMouseButton_Left,
+                                     callback=_mkt_drag_start(section_tag))
+    dpg.bind_item_handler_registry(h, reg)
 
 
 # ---------- 业务回调 ----------
@@ -2118,7 +2187,8 @@ def _refresh_watchlist(use_realtime=False):
     """
     if not dpg.does_item_exist("watch_table"):
         return
-    cols = ["代码", "名称", "加入日", "买入价", "现价", "今日涨跌%", "浮动盈亏%", "备注", "操作"]
+    cols = ["代码", "名称", "加入日", "买入价", "现价", "今日涨跌%", "浮动盈亏%",
+            "PE分位", "PB分位", "备注", "操作"]
     dpg.delete_item("watch_table", children_only=True)
     STATE["_watch_hl_row"] = None   # 行重建后旧高亮索引失效,重置避免误清/越界
     for col in cols:
@@ -2200,6 +2270,9 @@ def _refresh_watchlist(use_realtime=False):
                 dpg.add_text("待行情", color=(150, 150, 150))
             else:
                 dpg.add_text("观察", color=(150, 150, 150))
+            # PE/PB 历史分位: 先占位, 后台线程批量算完回填(见下方 _kick_watch_valuation)
+            dpg.add_text("…", tag=f"watch_peval_{code}", color=(120, 120, 130))
+            dpg.add_text("…", tag=f"watch_pbval_{code}", color=(120, 120, 130))
             dpg.add_text(str(r["note"]))
             with dpg.group(horizontal=True):
                 dpg.add_button(label="持仓点评", width=76,
@@ -2230,6 +2303,51 @@ def _refresh_watchlist(use_realtime=False):
                       f"持仓 {len(total_pnl)} 只 · 平均浮动盈亏 {avg:+.2f}% · 价格源:{src_txt}")
     else:
         dpg.set_value("watch_status", f"自选 {len(wl)} 只(均为观察) · 价格源:{src_txt}")
+
+    # 渲染完成后, 后台批量补每只持仓票的 PE/PB 历史分位(不阻塞界面)
+    try:
+        _codes = [str(c) for c in wl["code"].tolist()]
+    except Exception:  # noqa
+        _codes = []
+    if _codes:
+        _kick_watch_valuation(_codes)
+
+
+def _kick_watch_valuation(codes):
+    """后台线程: 逐只算持仓票 PE/PB 历史分位, 回填到表格对应格子。
+    个股估值一次请求即出(约1s/只), 持仓票少(十几只)故串行即可, 不阻塞界面。
+    只读传入的 code 列表(纯数据), 不读 UI 值; 算完用 set_value 回填。"""
+    if STATE.get("_watch_val_inflight"):
+        return
+    STATE["_watch_val_inflight"] = True
+
+    def _fill(code, kind, cell):
+        """cell: market.stock_valuation_percentile 返回的 pe/pb 子 dict 或 None。"""
+        tag = f"watch_{kind}val_{code}"
+        if not dpg.does_item_exist(tag):
+            return
+        if not cell:
+            dpg.set_value(tag, "-")
+            dpg.configure_item(tag, color=(120, 120, 130))
+            return
+        txt, col = _val_pct_cell(cell.get("value"), cell.get("percentile"))
+        dpg.set_value(tag, txt)
+        dpg.configure_item(tag, color=col)
+
+    def worker():
+        try:
+            for code in codes:
+                # ETF 无个股 PE/PB, 跳过(显示 '-')
+                try:
+                    r = market_data.stock_valuation_percentile(code)
+                except Exception:  # noqa
+                    r = {"pe": None, "pb": None}
+                _fill(code, "pe", r.get("pe"))
+                _fill(code, "pb", r.get("pb"))
+        finally:
+            STATE["_watch_val_inflight"] = False
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def _on_edit_buy_price(sender=None, app_data=None, user_data=None):
@@ -2656,9 +2774,25 @@ def _render_market(idx_df, act, summ):
     # ---- 涨跌家数/情绪 ----
     if dpg.does_item_exist("mkt_activity_group"):
         dpg.delete_item("mkt_activity_group", children_only=True)
-        up = int(act.get("上涨", 0) or 0)
-        down = int(act.get("下跌", 0) or 0)
-        flat = int(act.get("平盘", 0) or 0)
+        # 【数据一致性修复】上涨/下跌/平盘 统一采用与"涨跌幅分布直方图"同源的
+        # 新浪全市场快照(STATE["mkt_dist"]),而不是乐咕 legu 源——两个源的快照
+        # 时间与股票池不同,曾导致"上涨 405 / 482 / 4051"三个不一致的上涨数并存。
+        # legu 源只保留它独有、且 spot 无法直接得到的字段: 涨停/跌停/真实涨停/
+        # 真实跌停/停牌/活跃度。这样全页只有一个权威"上涨数"。
+        dist = STATE.get("mkt_dist") or {}
+        src_spot = dist.get("up") is not None and dist.get("down") is not None
+        if src_spot:
+            up = int(dist.get("up") or 0)
+            down = int(dist.get("down") or 0)
+            flat = int(dist.get("flat") or 0)
+            total_stat = dist.get("total")
+            src_note = f"(全市场快照口径 · 共{total_stat}只)" if total_stat else "(全市场快照口径)"
+        else:
+            # 分布快照还没拉回来(首次~20s),先用 legu 家数占位,拉回后自动统一
+            up = int(act.get("上涨", 0) or 0)
+            down = int(act.get("下跌", 0) or 0)
+            flat = int(act.get("平盘", 0) or 0)
+            src_note = "(乐咕口径·分布快照加载中,稍后统一)"
         zt = int(act.get("涨停", 0) or 0)
         zt_real = int(act.get("真实涨停", 0) or 0)
         dt = int(act.get("跌停", 0) or 0)
@@ -2671,7 +2805,27 @@ def _render_market(idx_df, act, summ):
             dpg.add_text(f"下跌 {down}", color=(40, 180, 90))
             dpg.add_text(" / ", color=(140, 140, 140))
             dpg.add_text(f"平盘 {flat}", color=(190, 190, 190))
-            dpg.add_text("      ", color=(140, 140, 140))
+            dpg.add_text(f"  {src_note}", color=(120, 120, 130))
+        # 中位数涨跌: 比指数更能反映"多数股票的真实体感"(指数被权重股扭曲时尤甚)。
+        # 中位数与均值的差揭示分布偏态(均值>>中位数=少数大牛股拉高均值、多数在跌)。
+        med = dist.get("median")
+        mean = dist.get("mean")
+        if med is not None:
+            with dpg.group(horizontal=True, parent="mkt_activity_group"):
+                dpg.add_text("中位数涨跌 ", color=(190, 190, 190))
+                dpg.add_text(f"{med:+.2f}%", color=_chg_color(med))
+                if mean is not None:
+                    dpg.add_text("   平均涨跌 ", color=(190, 190, 190))
+                    dpg.add_text(f"{mean:+.2f}%", color=_chg_color(mean))
+                    # 偏态提示: 均值显著高于中位数=少数股拉高均值,多数股更弱
+                    skew = mean - med
+                    if abs(skew) >= 0.5:
+                        if skew > 0:
+                            tip = "  ⚠均值>>中位数·少数大票拉高指数,多数股更弱"
+                        else:
+                            tip = "  均值<<中位数·少数大票拖累指数,多数股更强"
+                        dpg.add_text(tip, color=(200, 170, 110))
+        with dpg.group(horizontal=True, parent="mkt_activity_group"):
             dpg.add_text(f"涨停 {zt}(真实 {zt_real})", color=(230, 60, 60))
             dpg.add_text(" / ", color=(140, 140, 140))
             dpg.add_text(f"跌停 {dt}(真实 {dt_real})", color=(40, 180, 90))
@@ -2680,14 +2834,35 @@ def _render_market(idx_df, act, summ):
             if active is not None:
                 dpg.add_text("      ", color=(140, 140, 140))
                 dpg.add_text(f"赚钱效应(活跃度) {active}", color=(230, 200, 120))
-        # 涨跌强弱条(上涨占比,红涨绿跌)
+        # 涨跌强弱条(上涨占比,红涨绿跌)——与上面家数同源,口径一致
         total_ud = up + down
         if total_ud > 0:
             ratio = up / total_ud
+            up_share = up / (up + down + flat) if (up + down + flat) > 0 else ratio
+            # 历史分位: 今日上涨占比在过去一年里处于什么冷热位置
+            pct_note = ""
+            try:
+                pr = market_data.breadth_percentile("up_share", up_share * 100)
+                if pr is not None:
+                    pct = pr.get("percentile")
+                    n = pr.get("samples")
+                    if pct is not None and n and n >= 20:
+                        if pct <= 15:
+                            hot = "偏冷(恐慌区)"
+                        elif pct >= 85:
+                            hot = "偏热(亢奋区)"
+                        else:
+                            hot = "中性"
+                        pct_note = (f"   历史分位 {pct:.0f}%·{hot} "
+                                    f"(近{n}日样本)")
+            except Exception:  # noqa
+                pass
             with dpg.group(horizontal=True, parent="mkt_activity_group"):
                 dpg.add_text(f"多空比 {ratio * 100:.0f}%", color=(200, 200, 200))
                 dpg.add_progress_bar(default_value=ratio, width=300,
                                      overlay=f"{up}↑ / {down}↓")
+                if pct_note:
+                    dpg.add_text(pct_note, color=(180, 180, 130))
 
 
 def _render_market_mood(vol, pool):
@@ -2753,33 +2928,72 @@ def _render_market_mood(vol, pool):
                 dpg.add_text(f"首板×{first}", color=(230, 150, 120))
 
 
+_BAR_THEME_CACHE = {}   # color(tuple) -> theme id, 竖直柱体背景色复用
+
+
+def _bar_theme(color):
+    """给竖直柱体的 child_window 生成/复用一个纯色背景 theme。"""
+    key = tuple(color)
+    t = _BAR_THEME_CACHE.get(key)
+    if t is not None:
+        return t
+    with dpg.theme() as t:
+        with dpg.theme_component(dpg.mvChildWindow):
+            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, color)
+            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 2)
+    _BAR_THEME_CACHE[key] = t
+    return t
+
+
 def _render_updown_dist(dist):
     """渲染『涨跌幅分布直方图』(mkt_dist_group):从跌停到涨停 10 档各家数,
-    用进度条模拟横向柱状图(涨档红、跌档绿)。dist = fetch_updown_dist 结果。
-    数据未就绪时显示占位提示(不阻塞其余行情数据)。"""
+    竖直柱状图(涨档红、跌档绿,柱高=家数占比,柱顶标数字、柱底标档位)。
+    DPG 无竖直进度条,故用染色 child_window 当柱体 + 顶部 spacer 顶到等高
+    基线:每列 spacer(留白)+数字+柱体三者高度和恒为 H,故所有柱的数字顶端
+    与底部标签都自动对齐。dist = fetch_updown_dist 结果。数据未就绪显示占位。"""
     if not dpg.does_item_exist("mkt_dist_group"):
         return
-    dpg.delete_item("mkt_dist_group", children_only=True)
     dist = dist or {}
     bins = dist.get("bins") or []
     if not bins:
+        # 空数据(拉取失败)进来:若柱状图已画好,保持原图不动,绝不用占位覆盖;
+        # 仅当从未画过(group 为空)时才显示首次加载占位。防"有文字没图"残缺态。
+        try:
+            _existing = dpg.get_item_children("mkt_dist_group", 1) or []
+        except Exception:  # noqa
+            _existing = []
+        if _existing:
+            return
+        dpg.delete_item("mkt_dist_group", children_only=True)
         dpg.add_text("(涨跌幅分布数据加载中… 全市场快照约 20 秒,首次稍慢)",
                      color=(150, 150, 150), parent="mkt_dist_group")
         return
+    dpg.delete_item("mkt_dist_group", children_only=True)
     if dpg.does_item_exist("mkt_dist_note"):
         up = dist.get("up"); down = dist.get("down"); flat = dist.get("flat")
         dpg.set_value("mkt_dist_note",
                       f"  上涨 {up} / 平盘 {flat} / 下跌 {down} "
                       f"(共 {dist.get('total')} 只)")
     max_n = max((n for _, n in bins), default=0) or 1
-    for lab, n in bins:
-        # 涨档红、跌档绿(涨停/涨x = 红系,跌停/跌x = 绿系)
-        is_up = lab.startswith("涨")
-        col = (230, 60, 60) if is_up else (40, 180, 90)
-        with dpg.group(horizontal=True, parent="mkt_dist_group"):
-            dpg.add_text(f"{lab:>4}", color=col)
-            dpg.add_progress_bar(default_value=n / max_n, width=340,
-                                 overlay=str(n))
+    H = 130          # 柱区最大高度(px)
+    BW = 46          # 柱宽
+    COLW = 62        # 每列宽度(容纳档位标签,让柱间距均匀)
+    with dpg.group(horizontal=True, parent="mkt_dist_group"):
+        for lab, n in bins:
+            # 涨档红、跌档绿(涨停/涨x = 红系,跌停/跌x = 绿系)
+            is_up = lab.startswith("涨")
+            col = (230, 60, 60) if is_up else (40, 180, 90)
+            ratio = n / max_n
+            bar_h = max(2, int(round(H * ratio)))
+            pad_h = max(0, H - bar_h)      # 顶部留白,把柱压到统一基线
+            with dpg.group():              # 一列: 留白+数字+柱体+标签, 总高恒定
+                dpg.add_spacer(height=pad_h)
+                dpg.add_text(str(n), color=(210, 210, 210))
+                cw = dpg.add_child_window(width=BW, height=bar_h,
+                                          border=False, no_scrollbar=True)
+                dpg.bind_item_theme(cw, _bar_theme(col))
+                dpg.add_text(lab, color=col)
+            dpg.add_spacer(width=max(2, COLW - BW))
 
 
 _BOARD_SORT_KEYS = {
@@ -2789,13 +3003,244 @@ _BOARD_SORT_KEYS = {
 }
 
 
+def _persist_breadth(dist, pool, idx_df):
+    """把当日盘面宽度快照落库(每交易日一条, 盘中反复写只更新当天),
+    供『历史分位』和后续研判使用。dist=涨跌幅分布(spot口径), pool=涨停池,
+    idx_df=指数行情(取成交额)。任一缺失该字段置空, 不阻断。"""
+    dist = dist or {}
+    up = dist.get("up"); down = dist.get("down"); flat = dist.get("flat")
+    if up is None or down is None:
+        return  # 没有权威广度数据就不落库(避免脏数据污染分位基准)
+    total = (up or 0) + (down or 0) + (flat or 0)
+    up_share = (up / total * 100) if total > 0 else None
+    pool = pool or {}
+    act = STATE.get("mkt_act") or {}
+    vol = STATE.get("mkt_vol") or {}
+    # 成交额(亿元): 优先两市合计
+    amt_yi = None
+    try:
+        tot = idx_df.attrs.get("total_amount") if idx_df is not None else None
+        if tot:
+            amt_yi = round(float(tot) / 1e8, 1)
+    except Exception:  # noqa
+        pass
+    dt_real = act.get("真实跌停")
+    try:
+        dt_real = int(dt_real) if dt_real is not None else None
+    except Exception:  # noqa
+        dt_real = None
+    row = {
+        "up_share": round(up_share, 2) if up_share is not None else None,
+        "up_cnt": int(up), "down_cnt": int(down),
+        "flat_cnt": int(flat or 0),
+        "limit_up": pool.get("zt_count"),
+        "limit_down": dt_real,
+        "zb_cnt": pool.get("zb_count"),
+        "seal_rate": pool.get("seal_rate"),
+        "max_board": pool.get("max_board"),
+        "amount_yi": amt_yi,
+        "vol_ratio": vol.get("ratio_pct"),
+    }
+    day = datetime.now().strftime("%Y-%m-%d")
+    try:
+        db.save_market_breadth(day, row)
+    except Exception:  # noqa
+        pass
+
+
+def _render_market_verdict():
+    """渲染顶部『盘面一句话结论』(mkt_verdict_group)。
+    综合涨跌广度/涨跌停/量能/封板率/高低切, 用规则引擎生成一行定性结论,
+    按基调上色(偏空红、偏多按A股惯例也是红但语义不同, 这里中性灰、偏空橙红、
+    偏多绿——避免和涨跌颜色混淆, 结论区改用: 偏多=金、偏空=橙红、中性=灰)。"""
+    if not dpg.does_item_exist("mkt_verdict_group"):
+        return
+    dpg.delete_item("mkt_verdict_group", children_only=True)
+    try:
+        verdict = market_data.build_market_verdict(
+            STATE.get("mkt_dist"), STATE.get("mkt_act"),
+            STATE.get("mkt_pool"), STATE.get("mkt_vol"),
+            STATE.get("mkt_board_df"))
+    except Exception:  # noqa
+        verdict = None
+    if not verdict or not verdict.get("tags"):
+        dpg.add_text("盘面结论生成中… (需涨跌分布快照, 首次约20秒)",
+                     color=(150, 150, 150), parent="mkt_verdict_group")
+        return
+    # 分段标签分色: bull=金(230,200,120) bear=橙红(235,110,70) neutral=浅灰
+    tone_col = {"bull": (230, 200, 120), "bear": (235, 110, 70),
+                "neutral": (185, 195, 210), "warn": (235, 160, 60)}
+    with dpg.group(horizontal=True, parent="mkt_verdict_group"):
+        dpg.add_text("今日盘面:", color=(120, 220, 160))
+        first = True
+        for text, tone in verdict["tags"]:
+            if not first:
+                dpg.add_text("|", color=(90, 95, 105))
+            dpg.add_text(text, color=tone_col.get(tone, (185, 195, 210)))
+            first = False
+
+
+def _board_diag_score(df):
+    """给行业板块算综合强弱分并筛出两端(高潜力/高风险)。
+    综合分 = 当日涨幅(40%) + 资金净额(30%) + 板块内上涨占比广度(30%),
+    三项各自 min-max 归一化到 [0,1] 再加权; 三项都秒回可算(无需历史)。
+    返回 (up_df, dn_df):按综合分降序的前 6 / 升序的前 6(最弱在前)。"""
+    import pandas as _pd
+    d = df.copy()
+
+    def _norm(s):
+        s = _pd.to_numeric(s, errors="coerce")
+        lo, hi = s.min(), s.max()
+        if not (hi - lo) or hi != hi or lo != lo:
+            return s * 0 + 0.5
+        return (s - lo) / (hi - lo)
+
+    # 广度: 板块内上涨占比 up/(up+down), 缺失取中性 0.5
+    if "up" in d.columns and "down" in d.columns:
+        tot = (d["up"].fillna(0) + d["down"].fillna(0)).replace(0, float("nan"))
+        d["breadth"] = (d["up"].fillna(0) / tot).fillna(0.5)
+    else:
+        d["breadth"] = 0.5
+
+    chg_n = _norm(d["chg_pct"]).fillna(0.5)
+    if "net_inflow" in d.columns and d["net_inflow"].notna().any():
+        net_n = _norm(d["net_inflow"]).fillna(0.5)
+    else:
+        net_n = chg_n * 0 + 0.5
+    d["score"] = 0.4 * chg_n + 0.3 * net_n + 0.3 * d["breadth"]
+
+    d = d.sort_values("score", ascending=False).reset_index(drop=True)
+    up = d.head(6)
+    dn = d.tail(6).sort_values("score", ascending=True)
+    return up, dn
+
+
+def _render_board_diagnosis(df):
+    """渲染『板块强弱·资金诊断』(mkt_board_diag_group):复用行业板块数据,
+    用综合评分(当日涨幅+资金净额+板块内广度)筛出两端——上栏『高潜力』(综合
+    最强)、下栏『高风险』(综合最弱)。多日趋势(5/20日)与量比由慢速线程回填。
+
+    口径:当日涨幅+资金净额+板块内涨跌广度(均秒回);5日/20日涨跌与量比来自
+    同花顺行业指数日线(慢速回填,未就绪显示…)。不含PE/PB历史分位(本地无)。"""
+    if not dpg.does_item_exist("mkt_board_diag_group"):
+        return
+    dpg.delete_item("mkt_board_diag_group", children_only=True)
+    if df is None or getattr(df, "empty", True):
+        dpg.add_text("(板块数据加载中…)", color=(150, 150, 150),
+                     parent="mkt_board_diag_group")
+        return
+
+    up, dn = _board_diag_score(df)
+    # 入选两端板块名存 STATE, 供慢速线程拉多日趋势/量比
+    STATE["mkt_diag_names"] = (up["name"].tolist() + dn["name"].tolist())
+    trend = STATE.get("mkt_board_trend") or {}
+
+    def _vol_tag(vr):
+        """量比 → (标记文字, 颜色)。放量橙 / 缩量灰绿 / 未回填空。"""
+        if vr is None or vr != vr:
+            return "", (120, 120, 120)
+        if vr >= 1.15:
+            return "放", (235, 150, 60)
+        if vr <= 0.85:
+            return "缩", (120, 165, 140)
+        return "平", (150, 150, 150)
+
+    def _col_block(title, sub, rows, accent, is_up):
+        with dpg.group():
+            dpg.add_text(title, color=accent)
+            dpg.add_text(sub, color=(130, 130, 130))
+            with dpg.table(header_row=True, resizable=False, width=430,
+                           policy=dpg.mvTable_SizingFixedFit,
+                           borders_innerH=False, borders_outerH=True,
+                           borders_innerV=False, borders_outerV=True):
+                dpg.add_table_column(label="板块", width_fixed=True,
+                                     init_width_or_weight=112)
+                dpg.add_table_column(label="当日", width_fixed=True,
+                                     init_width_or_weight=58)
+                dpg.add_table_column(label="5日", width_fixed=True,
+                                     init_width_or_weight=56)
+                dpg.add_table_column(label="20日", width_fixed=True,
+                                     init_width_or_weight=58)
+                dpg.add_table_column(label="广度", width_fixed=True,
+                                     init_width_or_weight=54)
+                dpg.add_table_column(label="净额", width_fixed=True,
+                                     init_width_or_weight=70)
+                if rows is None or len(rows) == 0:
+                    with dpg.table_row():
+                        dpg.add_text("—", color=(150, 150, 150))
+                        for _ in range(5):
+                            dpg.add_text("")
+                for _, r in rows.iterrows():
+                    nm = str(r.get("name", ""))
+                    cp = r.get("chg_pct")
+                    ni = r.get("net_inflow")
+                    br = r.get("breadth")
+                    tr = trend.get(nm, {}) or {}
+                    c5 = tr.get("chg_5d")
+                    c20 = tr.get("chg_20d")
+                    vr = tr.get("vol_ratio")
+                    vtag, vcol = _vol_tag(vr)
+                    with dpg.table_row():
+                        with dpg.group(horizontal=True, horizontal_spacing=3):
+                            dpg.add_text(nm[:5], color=_chg_color(cp))
+                            if vtag:
+                                dpg.add_text(vtag, color=vcol)
+                        dpg.add_text(f"{cp:+.1f}%" if cp == cp else "-",
+                                     color=_chg_color(cp))
+                        dpg.add_text(f"{c5:+.1f}%" if c5 is not None else "…",
+                                     color=_chg_color(c5) if c5 is not None
+                                     else (110, 110, 110))
+                        dpg.add_text(f"{c20:+.1f}%" if c20 is not None else "…",
+                                     color=_chg_color(c20) if c20 is not None
+                                     else (110, 110, 110))
+                        # 广度: 上涨占比%, >50 偏红 <50 偏绿
+                        if br == br:
+                            bp = br * 100
+                            bcol = (210, 90, 90) if bp >= 50 else (90, 190, 120)
+                            dpg.add_text(f"{bp:.0f}%", color=bcol)
+                        else:
+                            dpg.add_text("-", color=(130, 130, 130))
+                        dpg.add_text(_fmt_yi(ni), color=_chg_color(ni))
+
+    with dpg.group(parent="mkt_board_diag_group", horizontal=True,
+                   horizontal_spacing=18):
+        _col_block("▲ 高潜力(综合最强)", "涨幅40%+资金30%+广度30%", up,
+                   (230, 90, 90), True)
+        _col_block("▼ 高风险(综合最弱)", "跌幅+资金出逃+内部普跌", dn,
+                   (90, 200, 130), False)
+    dpg.add_text("综合分=当日涨幅+资金净额(全单口径)+板块内涨跌广度;"
+                 "5日/20日为行业指数日线趋势,量比放/缩标记(慢速回填,首次稍慢);"
+                 "不含PE/PB历史分位(本地数据源无)。仅反映资金与趋势,非投资建议",
+                 color=(120, 120, 120), wrap=560,
+                 parent="mkt_board_diag_group")
+
+
+def _val_pct_cell(value, pct):
+    """把 PE/PB 中位数 + 历史分位格式化成一格文本与颜色。
+    显示形如 '12.3(35%)': 括号内是历史分位。
+    颜色语义(估值角度, 与涨跌色分开): 分位低=便宜=暖色(金/黄), 分位高=贵=冷色(青),
+    中间=浅灰。无估值显示 '-', 有估值但分位未就绪(历史不足)显示 '12.3(…)'。"""
+    if value is None or value != value:
+        return "-", (120, 120, 130)
+    if pct is None:
+        return f"{value:.1f}(…)", (150, 150, 155)
+    # 分位配色: <30 偏便宜(金), >70 偏贵(青), 其余浅灰
+    if pct <= 30:
+        col = (235, 190, 90)      # 金: 历史低位, 相对便宜
+    elif pct >= 70:
+        col = (90, 200, 210)      # 青: 历史高位, 相对贵
+    else:
+        col = (185, 185, 190)
+    return f"{value:.1f}({pct:.0f}%)", col
+
+
 def _render_board(df):
     """渲染热门板块表(已按 STATE['mkt_board_sort'] 排序)。"""
     if not dpg.does_item_exist("mkt_board_table"):
         return
     dpg.delete_item("mkt_board_table", children_only=True)
     for col in ["排名", "板块", "涨跌幅", "成交额", "净额(全单)",
-                "涨/跌家数", "领涨股"]:
+                "涨/跌家数", "PE分位", "PB分位", "领涨股"]:
         dpg.add_table_column(label=col, parent="mkt_board_table")
     if df is None or df.empty:
         return
@@ -2826,6 +3271,12 @@ def _render_board(df):
                 dpg.add_text(up_s, color=(230, 60, 60), tag=f"bcell{i}_up")
                 dpg.add_text("/", color=(140, 140, 140))
                 dpg.add_text(down_s, color=(40, 180, 90), tag=f"bcell{i}_down")
+            # PE/PB 历史分位(慢速回填, 从 STATE 缓存读; 未就绪显示 …)
+            val = (STATE.get("mkt_sector_val") or {}).get(name) or {}
+            pe_txt, pe_col = _val_pct_cell(val.get("pe"), val.get("pe_pct"))
+            pb_txt, pb_col = _val_pct_cell(val.get("pb"), val.get("pb_pct"))
+            dpg.add_text(pe_txt, color=pe_col, tag=f"bcell{i}_pepct")
+            dpg.add_text(pb_txt, color=pb_col, tag=f"bcell{i}_pbpct")
             lc = r.get("leader_chg")
             with dpg.group(horizontal=True, horizontal_spacing=4):
                 dpg.add_text(str(r.get("leader", "")), color=(200, 200, 200),
@@ -2869,6 +3320,12 @@ def _update_board_values(df):
                   str(int(up)) if up == up else "-")
         _set_cell(f"bcell{i}_down",
                   str(int(down)) if down == down else "-")
+        # PE/PB 分位(从 STATE 缓存读; 慢速回填线程负责更新缓存)
+        val = (STATE.get("mkt_sector_val") or {}).get(name) or {}
+        pe_txt, pe_col = _val_pct_cell(val.get("pe"), val.get("pe_pct"))
+        pb_txt, pb_col = _val_pct_cell(val.get("pb"), val.get("pb_pct"))
+        _set_cell(f"bcell{i}_pepct", pe_txt, pe_col)
+        _set_cell(f"bcell{i}_pbpct", pb_txt, pb_col)
         _set_cell(f"bcell{i}_leader", str(r.get("leader", "")))
         lc = r.get("leader_chg")
         _set_cell(f"bcell{i}_lc",
@@ -2903,11 +3360,10 @@ def _fetch_market_all():
     act = market_data.fetch_market_activity()
     summ = market_data.fetch_market_summary()
     board = market_data.fetch_industry_board()
-    # 量能对比: 复用 idx_df attrs 里的今日成交量, 不额外拉网络
-    sh_vol = idx_df.attrs.get("sh_volume") if idx_df is not None else None
-    sz_vol = idx_df.attrs.get("sz_volume") if idx_df is not None else None
+    # 量能对比: 今日量与5日基准都在数据层从新浪日线取(同为"股"口径,
+    # 规避实时快照"沪按手/深按股"的单位陷阱), 此处无需再传今日量。
     try:
-        vol = market_data.fetch_volume_compare(sh_vol, sz_vol)
+        vol = market_data.fetch_volume_compare()
     except Exception:  # noqa
         vol = {}
     try:
@@ -2928,13 +3384,177 @@ def _kick_updown_dist():
         STATE["mkt_dist_inflight"] = True
         try:
             dist = market_data.fetch_updown_dist()
+            if not (dist and dist.get("bins")):
+                # 本轮全市场快照拉取失败/全被判 stale → bins 为空。此时【绝不能】用空数据
+                # 覆盖已画好的柱状图(否则出现"note 有旧数字、柱图却变加载中占位"的残缺态)。
+                # 已有成功分布则原样保留、直接跳过本轮;从未成功过才渲染首次占位提示。
+                prev = STATE.get("mkt_dist")
+                if not (prev and prev.get("bins")):
+                    _render_updown_dist(dist)
+                return
             STATE["mkt_dist"] = dist
             _render_updown_dist(dist)
+            # 分布(spot 全市场快照)是"上涨/下跌家数"的权威口径来源。它比涨跌家数区
+            # 慢~20s 回填,回来后重绘一次涨跌家数区,把首屏用 legu 占位的数字统一成
+            # spot 口径(消除"405/482"两个上涨数不一致),并落一条当日盘面宽度历史。
+            act = STATE.get("mkt_act")
+            summ = STATE.get("mkt_summ")
+            idx_df = STATE.get("mkt_idx_df")
+            if act is not None:
+                try:
+                    _render_market(idx_df, act, summ)
+                except Exception:  # noqa
+                    pass
+            try:
+                _persist_breadth(dist, STATE.get("mkt_pool"), idx_df)
+            except Exception:  # noqa
+                pass
+            # 分布回来后, 结论才有权威广度口径, 重绘一次盘面速读
+            try:
+                _render_market_verdict()
+            except Exception:  # noqa
+                pass
         except Exception as e:  # noqa
             import traceback
             traceback.print_exc()
         finally:
             STATE["mkt_dist_inflight"] = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _kick_board_trend():
+    """起一个一次性慢速线程, 对诊断表已入选的两端板块(约12个)拉多日趋势/量比
+    (同花顺行业指数日线, 每个~1s, 带按自然日缓存), 回填后重绘诊断表。
+    带 in-flight 去重标记, 避免定时刷新每轮并发重拉; 历史当天不变故缓存后极快。"""
+    if STATE.get("mkt_trend_inflight"):
+        return
+    names = STATE.get("mkt_diag_names") or []
+    if not names:
+        return
+
+    def worker():
+        STATE["mkt_trend_inflight"] = True
+        try:
+            trend = market_data.fetch_board_trend(names)
+            if trend:
+                STATE["mkt_board_trend"] = {
+                    **(STATE.get("mkt_board_trend") or {}), **trend}
+                # 用最新板块数据重绘诊断表(把回填的趋势/量比显示出来)
+                board = STATE.get("mkt_board_df")
+                if board is not None:
+                    _render_board_diagnosis(board)
+        except Exception:  # noqa
+            import traceback
+            traceback.print_exc()
+        finally:
+            STATE["mkt_trend_inflight"] = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _kick_sector_val():
+    """起慢速线程回填热门板块的 PE/PB 中位数 + 历史分位(不阻塞主表10s刷新)。
+    两步:
+      1) 当日中位数: 对当前板块表里的板块一次性算成分股 PE/PB 中位数(东财, 按天缓存),
+         写 STATE['mkt_sector_val'] 并落库当日快照。首次~90s, 之后走缓存极快。
+      2) 历史分位: 对每个板块从 SQLite 读历史算分位; 历史不足(<20天)的板块, 挑
+         排名靠前的 1 个做一次性历史回填(每个~60s, 串行, 本会话去重), 分位随天数积累。
+    分位是慢变量, 全程只读缓存/DB, 主表10s刷新不受影响。"""
+    if STATE.get("mkt_sector_val_inflight"):
+        return
+    board = STATE.get("mkt_board_df")
+    if board is None or board.empty or "name" not in board.columns:
+        return
+    names = [str(n) for n in board["name"].tolist()]
+
+    def worker():
+        STATE["mkt_sector_val_inflight"] = True
+        try:
+            # --- 步骤1: 当日 PE/PB 中位数(按天缓存, 落库) ---
+            vals = market_data.fetch_sector_valuation(names)
+            cache = dict(STATE.get("mkt_sector_val") or {})
+            for nm, v in vals.items():
+                rec = dict(cache.get(nm) or {})
+                rec["pe"] = v.get("pe")
+                rec["pb"] = v.get("pb")
+                cache[nm] = rec
+            STATE["mkt_sector_val"] = cache
+
+            # --- 步骤2: 历史分位(读DB); 历史不足的挑排名靠前1个回填 ---
+            need_backfill = None
+            for nm in names:
+                rec = dict((STATE.get("mkt_sector_val") or {}).get(nm) or {})
+                pe = rec.get("pe")
+                pb = rec.get("pb")
+                pe_p = db.sector_val_percentile(nm, "pe", pe) if pe else None
+                pb_p = db.sector_val_percentile(nm, "pb", pb) if pb else None
+                rec["pe_pct"] = pe_p["percentile"] if pe_p else None
+                rec["pb_pct"] = pb_p["percentile"] if pb_p else None
+                cache2 = dict(STATE.get("mkt_sector_val") or {})
+                cache2[nm] = rec
+                STATE["mkt_sector_val"] = cache2
+                # 历史不足且本会话没回填过 -> 记下第一个待回填板块
+                if (pe or pb) and pe_p is None and pb_p is None \
+                        and nm not in STATE.get("mkt_sector_bf_done", set()) \
+                        and need_backfill is None:
+                    need_backfill = nm
+
+            # 重绘一次板块表, 把估值分位显示出来
+            board2 = STATE.get("mkt_board_df")
+            if board2 is not None:
+                try:
+                    _render_board(board2)
+                except Exception:  # noqa
+                    pass
+        except Exception:  # noqa
+            import traceback
+            traceback.print_exc()
+        finally:
+            STATE["mkt_sector_val_inflight"] = False
+
+        # --- 历史回填(独立串行线程, 一次一个, 慢~60s, 不与上面并发) ---
+        if need_backfill and not STATE.get("mkt_sector_bf_inflight"):
+            _kick_sector_backfill(need_backfill)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _kick_sector_backfill(name):
+    """对单个板块一次性回填过去一年 PE/PB 历史(慢~60s), 完成后重算该板块分位并重绘。
+    串行执行(一次只回填一个板块), 本会话去重, 避免拖垮网络与反复回填。"""
+    if STATE.get("mkt_sector_bf_inflight"):
+        return
+
+    def worker():
+        STATE["mkt_sector_bf_inflight"] = True
+        try:
+            n = market_data.backfill_sector_valuation_history(name, days=300)
+            done = set(STATE.get("mkt_sector_bf_done") or set())
+            done.add(name)   # 无论成功与否都标记, 避免本会话反复重试同一个
+            STATE["mkt_sector_bf_done"] = done
+            if n > 0:
+                rec = dict((STATE.get("mkt_sector_val") or {}).get(name) or {})
+                pe = rec.get("pe")
+                pb = rec.get("pb")
+                pe_p = db.sector_val_percentile(name, "pe", pe) if pe else None
+                pb_p = db.sector_val_percentile(name, "pb", pb) if pb else None
+                rec["pe_pct"] = pe_p["percentile"] if pe_p else None
+                rec["pb_pct"] = pb_p["percentile"] if pb_p else None
+                cache = dict(STATE.get("mkt_sector_val") or {})
+                cache[name] = rec
+                STATE["mkt_sector_val"] = cache
+                board = STATE.get("mkt_board_df")
+                if board is not None:
+                    try:
+                        _render_board(board)
+                    except Exception:  # noqa
+                        pass
+        except Exception:  # noqa
+            import traceback
+            traceback.print_exc()
+        finally:
+            STATE["mkt_sector_bf_inflight"] = False
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -2961,6 +3581,12 @@ def on_refresh_market(sender=None, app_data=None, user_data=None):
             STATE["mkt_vol"] = vol
             STATE["mkt_pool"] = pool
             _render_board(board)
+            _render_board_diagnosis(board)
+            _render_market_verdict()
+            # 多日趋势/量比(同花顺行业指数日线)对入选两端板块慢速回填
+            _kick_board_trend()
+            # 板块 PE/PB 中位数+历史分位(慢速回填, 按天缓存, 不阻塞主表)
+            _kick_sector_val()
             ts = act.get("统计日期") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             tag = "(定时刷新中)" if STATE.get("mkt_poll_on") else ""
             if dpg.does_item_exist("mkt_status"):
@@ -3036,8 +3662,14 @@ def _mkt_poll_worker():
                 # 定时刷新只原地更新板块表数值,不重建表/不重排序,
                 # 保持用户当前滚动位置(体感不跳)
                 _update_board_values(board)
+                _render_board_diagnosis(board)
+                _render_market_verdict()
                 # 涨跌幅分布慢(全市场快照~20s),独立慢速线程拉,不拖累本轮
                 _kick_updown_dist()
+                # 多日趋势/量比对入选两端板块慢速回填
+                _kick_board_trend()
+                # 板块 PE/PB 中位数+历史分位(慢速回填, 按天缓存)
+                _kick_sector_val()
                 ts = act.get("统计日期") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 if dpg.does_item_exist("mkt_status"):
                     dpg.set_value("mkt_status", f"已更新 · 数据时间 {ts} (定时刷新中)")
@@ -3274,14 +3906,24 @@ def _on_watch_row_hover(sender, app_data):
     prev = STATE.get("_watch_hl_row")
     if hover_idx == prev:
         return
+    # 动态取列数(表列会随功能增减,如加 PE分位/PB分位),避免写死漏染尾列
+    ncols = 11
+    for _r in rows:
+        try:
+            _c = dpg.get_item_children(_r, 1) or []
+        except Exception:
+            _c = []
+        if _c:
+            ncols = len(_c)
+            break
     if prev is not None:   # 清除上一行高亮
-        for col in range(9):
+        for col in range(ncols):
             try:
                 dpg.unhighlight_table_cell(tbl, prev, col)
             except Exception:
                 pass
-    if hover_idx is not None:   # 染当前行全部9列(含操作列)
-        for col in range(9):
+    if hover_idx is not None:   # 染当前行全部列(含备注/操作列)
+        for col in range(ncols):
             try:
                 dpg.highlight_table_cell(tbl, hover_idx, col, WATCH_CELL_HL)
             except Exception:
@@ -4246,62 +4888,100 @@ def build_ui():
                         dpg.add_text("", tag="mkt_summary_text", color=(160, 200, 255),
                                      wrap=900)
                         dpg.add_separator()
-                        # 涨跌家数 / 市场情绪
-                        dpg.add_text("涨跌家数 / 市场情绪", color=(120, 220, 160))
-                        dpg.add_group(tag="mkt_activity_group")
+                        # ===== 盘面一句话结论(规则引擎自动生成, 顶部醒目) =====
+                        with dpg.child_window(tag="sec_verdict", height=58,
+                                              border=True):
+                            with dpg.group(horizontal=True):
+                                dpg.add_text("盘面速读", color=(120, 220, 160))
+                                dpg.add_text("(规则自动研判 · 仅客观描述, 非投资建议)",
+                                             color=(120, 130, 150))
+                            dpg.add_group(tag="mkt_verdict_group")
                         dpg.add_separator()
-                        # 量能对比 + 情绪温度(连板高度/封板率/炸板)
-                        dpg.add_text("盘面量能 / 情绪温度", color=(120, 220, 160))
-                        dpg.add_group(tag="mkt_mood_group")
-                        dpg.add_separator()
-                        # 涨跌幅分布直方图(全市场,复用盯盘快照,慢速独立刷新)
-                        with dpg.group(horizontal=True):
-                            dpg.add_text("涨跌幅分布(全市场·涨=红 跌=绿)",
-                                         color=(120, 220, 160))
-                            dpg.add_text("", tag="mkt_dist_note",
-                                         color=(130, 130, 130))
-                        dpg.add_group(tag="mkt_dist_group")
-                        dpg.add_separator()
-                        # 核心指数实时行情表
-                        dpg.add_text("核心指数(涨=红 跌=绿)", color=(120, 220, 160))
-                        with dpg.table(tag="mkt_index_table", header_row=True,
-                                       resizable=True,
-                                       policy=dpg.mvTable_SizingStretchProp,
-                                       height=260, scrollY=True):
-                            for col in ["指数", "最新价", "涨跌幅", "涨跌点", "今开",
-                                        "最高", "最低", "成交额"]:
-                                dpg.add_table_column(label=col)
-                        dpg.add_separator()
-                        # 热门板块(同花顺行业板块,90个,可切换排序)
-                        with dpg.group(horizontal=True):
-                            dpg.add_text("热门板块(行业·涨=红 跌=绿)",
-                                         color=(120, 220, 160))
-                            dpg.add_text("  排序:", color=(140, 140, 140))
-                            dpg.add_button(label="涨跌幅", width=64, height=22,
-                                           tag="mkt_board_sort_chg_pct",
-                                           user_data="chg_pct",
-                                           callback=on_sort_board)
-                            dpg.bind_item_theme("mkt_board_sort_chg_pct",
-                                                "period_on")
-                            dpg.add_button(label="净额", width=64, height=22,
-                                           tag="mkt_board_sort_net_inflow",
-                                           user_data="net_inflow",
-                                           callback=on_sort_board)
-                            dpg.add_button(label="成交额", width=64, height=22,
-                                           tag="mkt_board_sort_amount",
-                                           user_data="amount",
-                                           callback=on_sort_board)
-                        dpg.add_text("净额=板块内全部资金 流入−流出(全单口径),"
-                                     "方向反映资金进出但非券商『主力资金』口径,"
-                                     "数值会明显偏小,仅供参考",
-                                     color=(130, 130, 130), wrap=880)
-                        with dpg.table(tag="mkt_board_table", header_row=True,
-                                       resizable=True,
-                                       policy=dpg.mvTable_SizingStretchProp,
-                                       height=-1, scrollY=True):
-                            for col in ["排名", "板块", "涨跌幅", "成交额", "净额(全单)",
-                                        "涨/跌家数", "领涨股"]:
-                                dpg.add_table_column(label=col)
+                        dpg.add_text("提示:各区块间的细横条可上下拖拽,放大你关注的板块",
+                                     color=(120, 130, 150))
+                        # ===== 可拖拽块1:涨跌家数/情绪 + 盘面量能/情绪温度 =====
+                        with dpg.child_window(
+                                tag="sec_activity",
+                                height=MKT_SECTION_HEIGHTS["sec_activity"],
+                                border=True):
+                            dpg.add_text("涨跌家数 / 市场情绪", color=(120, 220, 160))
+                            dpg.add_group(tag="mkt_activity_group")
+                            dpg.add_separator()
+                            dpg.add_text("盘面量能 / 情绪温度", color=(120, 220, 160))
+                            dpg.add_group(tag="mkt_mood_group")
+                        _add_mkt_section_handle("sec_activity")
+                        # ===== 可拖拽块2:涨跌幅分布直方图(整行) =====
+                        with dpg.child_window(
+                                tag="sec_dist",
+                                height=MKT_SECTION_HEIGHTS["sec_dist"],
+                                border=True):
+                            with dpg.group(horizontal=True):
+                                dpg.add_text("涨跌幅分布(全市场·涨=红 跌=绿)",
+                                             color=(120, 220, 160))
+                                dpg.add_text("", tag="mkt_dist_note",
+                                             color=(130, 130, 130))
+                            dpg.add_group(tag="mkt_dist_group")
+                        _add_mkt_section_handle("sec_dist")
+                        # ===== 可拖拽块3:板块强弱·资金诊断(整行,高潜力/高风险左右平行) =====
+                        with dpg.child_window(
+                                tag="sec_diag",
+                                height=MKT_SECTION_HEIGHTS["sec_diag"],
+                                border=True):
+                            with dpg.group(horizontal=True):
+                                dpg.add_text("板块强弱 · 资金诊断",
+                                             color=(120, 220, 160))
+                                dpg.add_text("(当日盘面口径)",
+                                             color=(130, 130, 130))
+                            dpg.add_group(tag="mkt_board_diag_group")
+                        _add_mkt_section_handle("sec_diag")
+                        # ===== 可拖拽块4:核心指数实时行情表 =====
+                        with dpg.child_window(
+                                tag="sec_index",
+                                height=MKT_SECTION_HEIGHTS["sec_index"],
+                                border=True):
+                            dpg.add_text("核心指数(涨=红 跌=绿)", color=(120, 220, 160))
+                            with dpg.table(tag="mkt_index_table", header_row=True,
+                                           resizable=True,
+                                           policy=dpg.mvTable_SizingStretchProp,
+                                           height=-1, scrollY=True):
+                                for col in ["指数", "最新价", "涨跌幅", "涨跌点", "今开",
+                                            "最高", "最低", "成交额"]:
+                                    dpg.add_table_column(label=col)
+                        _add_mkt_section_handle("sec_index")
+                        # ===== 块5:热门板块(最后一块,height=-1 自动填满剩余空间) =====
+                        with dpg.child_window(
+                                tag="sec_board",
+                                height=-1,
+                                border=True):
+                            with dpg.group(horizontal=True):
+                                dpg.add_text("热门板块(行业·涨=红 跌=绿)",
+                                             color=(120, 220, 160))
+                                dpg.add_text("  排序:", color=(140, 140, 140))
+                                dpg.add_button(label="涨跌幅", width=64, height=22,
+                                               tag="mkt_board_sort_chg_pct",
+                                               user_data="chg_pct",
+                                               callback=on_sort_board)
+                                dpg.bind_item_theme("mkt_board_sort_chg_pct",
+                                                    "period_on")
+                                dpg.add_button(label="净额", width=64, height=22,
+                                               tag="mkt_board_sort_net_inflow",
+                                               user_data="net_inflow",
+                                               callback=on_sort_board)
+                                dpg.add_button(label="成交额", width=64, height=22,
+                                               tag="mkt_board_sort_amount",
+                                               user_data="amount",
+                                               callback=on_sort_board)
+                            dpg.add_text("净额=板块内全部资金 流入−流出(全单口径),"
+                                         "方向反映资金进出但非券商『主力资金』口径,"
+                                         "数值会明显偏小,仅供参考",
+                                         color=(130, 130, 130), wrap=880)
+                            with dpg.table(tag="mkt_board_table", header_row=True,
+                                           resizable=True,
+                                           policy=dpg.mvTable_SizingStretchProp,
+                                           height=-1, scrollY=True):
+                                for col in ["排名", "板块", "涨跌幅", "成交额",
+                                            "净额(全单)", "涨/跌家数", "领涨股"]:
+                                    dpg.add_table_column(label=col)
 
                     # --- Tab 2: 今日推荐 ---
                     with dpg.tab(label="今日推荐"):
@@ -4453,6 +5133,11 @@ def build_ui():
         dpg.add_mouse_move_handler(callback=_on_kline_hover)
         # 持仓表整行悬停高亮(highlight_table_cell 染背景,不抢点击,按钮仍可点)
         dpg.add_mouse_move_handler(callback=_on_watch_row_hover)
+        # 行情页分隔条拖拽:move 实时调高度, release 结束拖拽
+        dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Left,
+                                   callback=_mkt_drag_move)
+        dpg.add_mouse_release_handler(button=dpg.mvMouseButton_Left,
+                                      callback=_mkt_drag_end)
 
     dpg.create_viewport(title="A-Share Stock Picker", width=1320, height=840)
     dpg.setup_dearpygui()

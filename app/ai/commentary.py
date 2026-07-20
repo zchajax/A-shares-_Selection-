@@ -282,10 +282,14 @@ def build_facts(code: str) -> dict:
         rsi_state = "严重超买"
     elif rsi >= 70:
         rsi_state = "偏超买"
+    elif rsi >= 65:
+        rsi_state = "偏热(接近超买)"
     elif rsi <= 20:
         rsi_state = "严重超卖"
     elif rsi <= 30:
         rsi_state = "偏超卖"
+    elif rsi <= 35:
+        rsi_state = "偏冷(接近超卖)"
     else:
         rsi_state = "中性"
 
@@ -358,6 +362,14 @@ def build_facts(code: str) -> dict:
     except Exception:  # noqa
         pb_pct = None
 
+    # 个股估值历史分位(纵向: PE/PB 在自身过去一年的位置, 与上面"行业横向对比"互补)。
+    # 一次请求即出(百度估值接口), 失败降级为空; 放在这里让持仓/单只点评都能用。
+    try:
+        from app.data import market as _mkt
+        _selfval = _mkt.stock_valuation_percentile(code)
+    except Exception:  # noqa
+        _selfval = {"pe": None, "pb": None}
+
     # 筹码分布(成本结构):本地日线三角分布衰减模型,与通达信标准一致。
     # 定位为"辅助参考、说趋势不报精确值"(股本近似,禁 AI 编造精确套牢比例)。
     try:
@@ -407,6 +419,9 @@ def build_facts(code: str) -> dict:
         # 行业估值分位
         "pe_pct": pe_pct,
         "pb_pct": pb_pct,
+        # 个股估值历史分位(纵向, 比自身过去一年)
+        "self_pe_pct": _selfval.get("pe"),
+        "self_pb_pct": _selfval.get("pb"),
         # 筹码结构(成本分布派生;股本近似,作趋势参考)
         "chip_profit_ratio": (_chip["profit_ratio"] if _chip else None),
         "chip_avg_cost": (_chip["avg_cost"] if _chip else None),
@@ -441,6 +456,42 @@ def _valuation_verdict(pct: dict, metric: str, industry: str,
             f"注意:分位低=便宜,分位高=贵,勿与'高于X%'的字面混淆")
 
 
+def _self_hist_val_line(f: dict) -> str:
+    """个股估值历史分位行(纵向, PE/PB 在自身过去一年区间的位置)。
+
+    与 _valuation_verdict(行业横向对比)互补: 这里比的是"这只票现在 vs 它自己
+    过去一年", 分位越小=越接近一年低位=相对自己历史越便宜。两个指标都有时,
+    AI 能同时看"和同行比贵不贵""和自己历史比贵不贵"。任一缺失则跳过。
+    """
+    def _one(cell, label):
+        if not cell:
+            return None
+        v = cell.get("value")
+        p = cell.get("percentile")
+        if v is None:
+            return None
+        if p is None:
+            n = cell.get("samples")
+            return f"{label}当前{v}(历史样本仅{n}天,不足一年,分位暂略)"
+        if p <= 30:
+            tag = "处近一年低位, 相对自身历史偏便宜"
+        elif p >= 70:
+            tag = "处近一年高位, 相对自身历史偏贵"
+        else:
+            tag = "处近一年中间区域"
+        rng = cell.get("min"), cell.get("max")
+        rng_s = (f", 一年区间{rng[0]}~{rng[1]}"
+                 if rng[0] is not None and rng[1] is not None else "")
+        return f"{label}当前{v}(近一年 {p:.0f}% 分位{rng_s}, {tag})"
+
+    parts = [x for x in (_one(f.get("self_pe_pct"), "PE"),
+                         _one(f.get("self_pb_pct"), "PB")) if x]
+    if not parts:
+        return ""
+    return ("- 个股估值历史分位(纵向比自身过去一年,分位低=处历史低位=相对便宜): "
+            + "; ".join(parts))
+
+
 def _fundamental_lines(f: dict) -> str:
     """基本面要点(估值 + 成长/质量)。整体缺失时明确告诉模型"未获取到"。"""
     val_keys = ("pe_ttm", "pb", "roe", "total_mv", "ps_ttm",
@@ -469,6 +520,11 @@ def _fundamental_lines(f: dict) -> str:
     if pb_pct:
         lines.append("- 行业估值对比(PB): " + _valuation_verdict(
             pb_pct, "PB", pb_pct["industry"], pb_pct["peers"]))
+
+    # 个股估值历史分位(纵向, 比自身过去一年): 分位越小=越接近一年低位=越便宜
+    self_hist = _self_hist_val_line(f)
+    if self_hist:
+        lines.append(self_hist)
 
     # 盈利/成长/负债行
     prof_parts = [f"ROE={_fmt(f.get('roe'))}%"]
@@ -547,6 +603,25 @@ def _etf_metrics_lines(f: dict) -> str:
     return "\n".join(lines)
 
 
+def _pos_60_tag(pos) -> str:
+    """把近60日区间分位翻译成明确的高/中/低位标签, 避免 AI 把裸数字误读。
+    位置分位 = (现价-近20日低)/(近60日高-近20日低)*100, 越高=越接近区间顶部=相对高位。
+    注意: 这是'价格在近期区间的位置', 与用户买入价浮盈浮亏是两码事, 勿混淆。"""
+    try:
+        p = float(pos)
+    except (TypeError, ValueError):
+        return ""
+    if p >= 80:
+        return "相对高位(接近60日高点)"
+    if p >= 60:
+        return "偏上位置"
+    if p <= 20:
+        return "相对低位(接近60日低点)"
+    if p <= 40:
+        return "偏下位置"
+    return "区间中部"
+
+
 def _etf_facts_to_lines(f: dict) -> str:
     """ETF 专属事实拼装:技术面与股票共用,基本面/筹码替换为 ETF 专属指标。"""
     price_tag = "当日实时" if f.get("price_source") == "realtime" else "本地日线收盘"
@@ -562,7 +637,7 @@ def _etf_facts_to_lines(f: dict) -> str:
         f"- 动能: {f['macd_state']}; RSI(14)={_fmt(f['rsi'],1)}({f['rsi_state']})\n"
         f"{reson}"
         f"- 量能: 量比={_fmt(f['vol_ratio'])}({f['vol_state']})\n"
-        f"- 位置: 处于近60日区间约 {_fmt(f['pos_60'],0)}% 分位"
+        f"- 位置: 处于近60日区间约 {_fmt(f['pos_60'],0)}% 分位, {_pos_60_tag(f['pos_60'])}"
         f"(60日高={_fmt(f['high_60'], 3)})\n"
         f"- 布林带: 上轨={_fmt(f['boll_up'], 3)} 下轨={_fmt(f['boll_low'], 3)}\n"
         f"{_etf_metrics_lines(f)}"
@@ -603,8 +678,25 @@ def _chip_line(f: dict) -> str:
         parts.append(f"90%筹码集中在 {_fmt(lo)}~{_fmt(hi)}")
     conc = f.get("chip_concentration")
     if conc is not None:
-        c_tag = "筹码集中(易拉升/易控盘)" if conc < 0.3 else (
-            "筹码分散(换手充分/分歧大)" if conc > 0.6 else "集中度中等")
+        # 集中度低有两种【成因相反】的解释,不可一概贴"易控盘":
+        #   · 小盘股筹码集中 → 可能真是主力高度控盘(易被拉升/打压);
+        #   · 大盘蓝筹筹码集中 → 多是日换手极低(如银行0.4~0.8%)、成本长期沉淀
+        #     所致,流通盘动辄数千亿根本无从"控盘",只意味波动小、成本稳定。
+        # 用总市值(亿元)分流,避免把平安银行/工行这类巨无霸误判成"易被控盘"。
+        mv = f.get("total_mv")
+        if conc < 0.3:
+            if mv and mv >= 800:
+                c_tag = ("筹码高度集中,但此为大盘低换手、成本长期沉淀所致"
+                         "(巨盘难被控盘),通常意味波动小、成本稳定")
+            elif mv and mv <= 150:
+                c_tag = "筹码高度集中,小盘股需留意主力控盘可能(易被拉升/打压)"
+            else:
+                c_tag = ("筹码分布偏窄(集中),成因需结合换手:"
+                         "低换手多为长期沉淀,高换手才近控盘")
+        elif conc > 0.6:
+            c_tag = "筹码分散(换手充分/分歧大)"
+        else:
+            c_tag = "集中度中等"
         parts.append(f"集中度{conc:.2f}({c_tag})")
     note = "近1年本地估算、股本近似,仅作成本结构的定性参考,请勿据此报精确套牢比例"
     return f"- 筹码结构: " + "; ".join(parts) + f"。[{note}]"
@@ -627,7 +719,7 @@ def facts_to_lines(f: dict) -> str:
         f"- 动能: {f['macd_state']}; RSI(14)={_fmt(f['rsi'],1)}({f['rsi_state']})\n"
         f"{reson}"
         f"- 量能: 量比={_fmt(f['vol_ratio'])}({f['vol_state']})\n"
-        f"- 位置: 处于近60日区间约 {_fmt(f['pos_60'],0)}% 分位"
+        f"- 位置: 处于近60日区间约 {_fmt(f['pos_60'],0)}% 分位, {_pos_60_tag(f['pos_60'])}"
         f"(60日高={_fmt(f['high_60'])})\n"
         f"- 布林带: 上轨={_fmt(f['boll_up'])} 下轨={_fmt(f['boll_low'])}\n"
         f"{_chip_line(f) + chr(10) if _chip_line(f) else ''}"
@@ -1196,6 +1288,11 @@ HOLDING_SYSTEM_PROMPT = (
     "参考);\n"
     "【操作倾向】给出明确但审慎的仓位管理倾向,在'继续持有 / 考虑减仓(止盈或止损)"
     "/ 逢低加仓 / 观望'中选择并说明理由,理由必须落在前面列出的客观事实上。"
+    "止盈/止损用词纪律:'止盈'仅用于当前【浮盈】时的减仓,'止损/减仓控制风险'用于当前"
+    "【浮亏】时的减仓——浮亏状态严禁说'止盈',浮盈状态减仓才叫'止盈'(以事实行的浮动盈亏"
+    "正负为准)。位置纪律:'现价相对近60日区间的高/低位'(见位置行的高/中/低位标签)与"
+    "'用户这笔的浮盈浮亏'是两个独立概念,不得混为一谈——例如浮亏但价格处于区间相对高位是"
+    "完全可能的,描述位置时一律以事实行给出的高/中/低位标签为准,不得因为浮亏就说成'处于低位'。"
     "两条硬约束:(1)【归因纪律】'接近60日高点/处于高分位'本身是【高位】信号,不得反向"
     "解读成'还有上涨空间/上行空间'('上涨空间''上行空间'在高位语境下为禁用表述,一律不得"
     "出现);位置高低只陈述事实,是否有空间需另有依据(如刚突破、"
@@ -1429,8 +1526,15 @@ def _holding_position_line(f: dict, buy_price) -> str:
         return f"- 持仓成本: 买入价={_fmt(bp)}(现价未取到,无法计算浮动盈亏)\n"
     pnl = (cur - bp) / bp * 100 if bp else 0.0
     zt = "浮盈" if pnl > 0 else ("浮亏" if pnl < 0 else "持平")
+    # 明确止盈/止损语义, 避免 AI 在浮亏时误用"止盈"(浮亏减仓=止损, 浮盈减仓=止盈)
+    if pnl > 0:
+        hint = "  [当前浮盈, 若谈减仓应称'止盈', 不得称'止损']"
+    elif pnl < 0:
+        hint = "  [当前浮亏, 若谈减仓应称'止损'或'减仓控制风险', 严禁称'止盈']"
+    else:
+        hint = ""
     return (f"- 持仓成本: 买入价={_fmt(bp)}  当前价={_fmt(cur)}  "
-            f"浮动盈亏={_fmt(pnl)}%({zt})\n")
+            f"浮动盈亏={_fmt(pnl)}%({zt}){hint}\n")
 
 
 def comment_holding(code: str, buy_price=0.0, on_delta=None) -> dict:

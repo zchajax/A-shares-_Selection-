@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from . import indicators as ind
+from . import chip
 
 
 @dataclass
@@ -362,6 +363,154 @@ class MultiFactor(BaseStrategy):
         return selected, float(comp), reason
 
 
+# ============================================================================
+# 筹码形态策略 (同花顺"筹码形态洞察"同款: 低位锁定/低位密集/双峰/高位密集)
+# ----------------------------------------------------------------------------
+# 复用 chip.compute_chip_distribution(通达信同款筹码模型) + chip.analyze_chip_shape
+# 提取的形态中间量。scanner 传入的 df 无流通股本, 筹码计算走 turn=3% 兜底; 形态判据
+# 用的都是"相对形状"(现价在历史区间位置/集中度/获利盘/横盘度/峰形), 不依赖精确股本,
+# 结论稳健。四个策略各自独立出现在下拉框, 命名直观。
+# ============================================================================
+class _ChipShapeBase(BaseStrategy):
+    """筹码形态策略基类: 统一算好筹码分布与形态中间量, 子类只写 _judge。"""
+    # 子类可覆盖: 筹码计算至少需要的日线长度
+    _min_len = 60
+
+    def _shape(self, df):
+        """返回 chip.analyze_chip_shape 的中间量 dict, 数据不足返回 None。"""
+        if df is None or len(df) < self._min_len:
+            return None
+        cr = chip.compute_chip_distribution(df)
+        return chip.analyze_chip_shape(cr, df)
+
+    def evaluate(self, df):
+        sh = self._shape(df)
+        if not sh:
+            return False, 0, "数据不足/筹码不可算"
+        return self._judge(sh)
+
+    def _judge(self, sh):  # 子类实现
+        raise NotImplementedError
+
+
+class ChipLowLock(_ChipShapeBase):
+    """
+    低位锁定(主力拉升): 筹码高度集中在低位并已被锁定, 现价从低位抬起,
+    低位筹码普遍浮盈(获利盘高), 温和上行 —— 主力控盘后拉升的典型形态。
+    """
+    name = "筹码-低位锁定"
+    desc = "低位筹码密集锁定+已从底部抬升,获利盘高,主力控盘拉升"
+    params = [
+        Param("max_conc", "集中度上限(越小越密)", 25, 10, 60),
+        Param("max_pos", "现价位置上限(0-100)", 45, 20, 70),
+        Param("min_profit", "获利盘下限(%)", 55, 30, 90),
+    ]
+
+    def _judge(self, sh):
+        conc = sh["concentration"] * 100
+        pos = sh["price_pos"] * 100
+        profit = sh["profit_ratio"] * 100
+        cond_conc = conc <= self.values["max_conc"]          # 筹码密集
+        cond_pos = pos <= self.values["max_pos"]             # 现价仍处相对低位
+        cond_profit = profit >= self.values["min_profit"]    # 低位筹码浮盈
+        cond_up = sh["trend_20"] > 0                         # 已从底部抬起
+        selected = bool(cond_conc and cond_pos and cond_profit and cond_up)
+        # 打分: 越密集、获利盘越高、抬升越温和越好
+        score = (self.values["max_conc"] - conc) + profit * 0.5 + sh["trend_20"]
+        reason = (f"集中度{conc:.0f} 位置{pos:.0f} 获利{profit:.0f}% "
+                  f"20日{sh['trend_20']:+.1f}%")
+        return selected, float(score), reason
+
+
+class ChipLowDense(_ChipShapeBase):
+    """
+    低位密集(主力建仓): 大跌后在低位横盘, 筹码在低价区高度密集,
+    现价贴近平均成本(获利盘中性, 多空成本趋同) —— 主力低位吸筹的典型形态。
+    """
+    name = "筹码-低位密集"
+    desc = "低位横盘+筹码密集+现价贴近平均成本,主力建仓吸筹"
+    params = [
+        Param("max_conc", "集中度上限(越小越密)", 22, 10, 50),
+        Param("max_pos", "现价位置上限(0-100)", 40, 20, 60),
+        Param("max_consol", "横盘振幅上限(%)", 18, 8, 40),
+    ]
+
+    def _judge(self, sh):
+        conc = sh["concentration"] * 100
+        pos = sh["price_pos"] * 100
+        consol = (sh["consolidation"] * 100) if sh["consolidation"] is not None else 999
+        # 现价与均价的偏离(%),越接近说明多空成本趋同
+        dev = abs(sh["last_close"] - sh["avg_cost"]) / (sh["avg_cost"] + 1e-9) * 100
+        cond_conc = conc <= self.values["max_conc"]
+        cond_pos = pos <= self.values["max_pos"]
+        cond_consol = consol <= self.values["max_consol"]    # 近期横盘
+        cond_dev = dev <= 8                                  # 现价≈平均成本
+        selected = bool(cond_conc and cond_pos and cond_consol and cond_dev)
+        score = (self.values["max_conc"] - conc) + (self.values["max_consol"] - consol) \
+            + (8 - dev)
+        reason = (f"集中度{conc:.0f} 位置{pos:.0f} 振幅{consol:.0f}% "
+                  f"距均价{dev:.1f}%")
+        return selected, float(score), reason
+
+
+class ChipTwinPeak(_ChipShapeBase):
+    """
+    双峰形态(高抛低吸): 成本分布出现上下两个明显的筹码密集峰, 中间有低谷,
+    对应一轮上涨后套牢盘(上峰)与低位成本盘(下峰)并存 —— 关注筹码是上移还是下沉。
+    """
+    name = "筹码-双峰形态"
+    desc = "成本分布上下双峰+中间低谷,套牢盘与低成本盘并存"
+    params = [
+        Param("min_gap", "双峰最小价差(%)", 12, 5, 40),
+        Param("max_gap", "双峰最大价差(%)", 80, 40, 200),
+        Param("max_valley", "谷深上限(0-100)", 55, 20, 80),
+    ]
+
+    def _judge(self, sh):
+        tw = sh["twin"]
+        if not tw:
+            return False, 0, "无双峰"
+        gap = tw["gap_pct"]
+        valley = tw["valley_ratio"] * 100
+        cond_gap = self.values["min_gap"] <= gap <= self.values["max_gap"]  # 价差在合理区间
+        cond_valley = valley <= self.values["max_valley"]    # 谷够深(双峰分明)
+        selected = bool(cond_gap and cond_valley)
+        # 打分: 谷越深、两峰越均衡越"标准", 价差适中加分
+        score = (self.values["max_valley"] - valley) + tw["peak_balance"] * 30
+        reason = (f"下峰{tw['lower_price']:.2f} 上峰{tw['upper_price']:.2f} "
+                  f"价差{gap:.0f}% 谷深{valley:.0f} 均衡{tw['peak_balance']:.2f}")
+        return selected, float(score), reason
+
+
+class ChipHighDense(_ChipShapeBase):
+    """
+    高位密集(高位套牢/派发风险): 筹码在高价区高度密集, 现价处于历史高位,
+    获利盘极高(浮盈盘沉重, 潜在抛压大) —— 高位横盘密集, 需警惕见顶派发。
+    这是低位锁定的镜像形态: 密集但位置在顶, 意义相反(风险 > 机会)。
+    """
+    name = "筹码-高位密集"
+    desc = "高位筹码密集+现价处历史高位+获利盘沉重,警惕见顶派发"
+    params = [
+        Param("max_conc", "集中度上限(越小越密)", 25, 10, 60),
+        Param("min_pos", "现价位置下限(0-100)", 65, 50, 90),
+        Param("min_profit", "获利盘下限(%)", 80, 60, 99),
+    ]
+
+    def _judge(self, sh):
+        conc = sh["concentration"] * 100
+        pos = sh["price_pos"] * 100
+        profit = sh["profit_ratio"] * 100
+        cond_conc = conc <= self.values["max_conc"]          # 筹码密集
+        cond_pos = pos >= self.values["min_pos"]             # 现价处历史高位
+        cond_profit = profit >= self.values["min_profit"]    # 获利盘沉重
+        selected = bool(cond_conc and cond_pos and cond_profit)
+        # 打分: 越密集、位置越高、获利盘越重 → 派发风险越大, 分越高
+        score = (self.values["max_conc"] - conc) + pos * 0.5 + profit * 0.3
+        reason = (f"集中度{conc:.0f} 位置{pos:.0f} 获利{profit:.0f}% "
+                  f"⚠高位")
+        return selected, float(score), reason
+
+
 # 注册所有可用策略,UI 从这里读取。新增策略只要在这里加一行即可。
 ALL_STRATEGIES = {
     "multi_factor": MultiFactor,
@@ -372,4 +521,8 @@ ALL_STRATEGIES = {
     "pullback": PullbackMa,
     "vol_price_rise": VolumePriceRise,
     "oversold_rebound": OversoldRebound,
+    "chip_low_lock": ChipLowLock,
+    "chip_low_dense": ChipLowDense,
+    "chip_twin_peak": ChipTwinPeak,
+    "chip_high_dense": ChipHighDense,
 }

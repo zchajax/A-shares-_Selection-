@@ -216,3 +216,132 @@ def compute_chip_distribution(
         "concentration": concentration,
         "shares_known": fs is not None,
     }
+
+
+# ============================================================================
+# 筹码形态识别 (同花顺"筹码形态洞察"同款思路)
+# ============================================================================
+# 在 compute_chip_distribution 的输出上再做一层"形态判定",不额外拉网络。
+# 四种形态: 低位锁定 / 低位密集 / 双峰 / 高位密集。
+# 判定所需的中间量(现价在历史区间的位置、集中度、获利盘、横盘度、峰形)统一
+# 由 analyze_chip_shape 算好, 策略类只读字段 + 套自己的阈值, 逻辑集中、好维护。
+
+def _detect_peaks(chips: np.ndarray):
+    """
+    对归一化筹码数组做手写峰检测(不依赖 scipy)。
+    步骤: 3档滑动平均降噪 → 找显著局部极大(高度≥15%全局峰) → 合并过近的峰。
+    返回 (merged_peak_indices, smoothed_array)。峰按索引升序。
+    """
+    n = len(chips)
+    if n < 5:
+        return [], chips
+    k = 3
+    sm = np.convolve(chips, np.ones(k) / k, mode="same")
+    mx = float(sm.max())
+    if mx <= 0:
+        return [], sm
+    raw = []
+    for i in range(1, n - 1):
+        if sm[i] >= sm[i - 1] and sm[i] > sm[i + 1] and sm[i] >= 0.15 * mx:
+            raw.append(i)
+    # 合并距离过近的峰(保留更高者), 间距阈值随分档数自适应
+    min_gap = max(3, n // 25)
+    merged = []
+    for p in raw:
+        if merged and p - merged[-1] <= min_gap:
+            if sm[p] > sm[merged[-1]]:
+                merged[-1] = p
+        else:
+            merged.append(p)
+    return merged, sm
+
+
+def _twin_peak(chips: np.ndarray, prices: np.ndarray):
+    """
+    双峰判定: 取最高的两个峰, 要求两峰都够"密集显著"(≥45%全局峰, 即两峰高度
+    均衡度天然≥0.45)且中间谷足够深(谷≤较矮峰的 60%)。这样排除"一个主峰+远端
+    一个勉强够线小凸起"被误判为双峰。命中返回 dict, 否则 None。
+    """
+    merged, sm = _detect_peaks(chips)
+    if len(merged) < 2:
+        return None
+    mx = float(sm.max())
+    top2 = sorted(merged, key=lambda i: sm[i], reverse=True)[:2]
+    a, b = sorted(top2)
+    if b <= a:
+        return None
+    valley = float(sm[a:b + 1].min())
+    h_lo, h_hi = float(sm[a]), float(sm[b])
+    small = min(h_lo, h_hi)
+    if small < 0.45 * mx or small <= 0:   # 两峰都必须是"密集区", 而非拖尾小凸起
+        return None
+    if valley > 0.60 * small:
+        return None
+    lower_p, upper_p = float(prices[a]), float(prices[b])
+    gap_pct = (upper_p - lower_p) / (lower_p + 1e-9) * 100
+    return {
+        "lower_price": lower_p,
+        "upper_price": upper_p,
+        "valley_ratio": valley / small,   # 越小谷越深, 双峰越分明
+        "gap_pct": gap_pct,               # 两峰价差(%)
+        "peak_balance": small / max(h_lo, h_hi),  # 两峰高度均衡度(1=等高)
+    }
+
+
+def analyze_chip_shape(chip_result: Optional[dict],
+                       df: pd.DataFrame,
+                       lookback: int = 250) -> Optional[dict]:
+    """
+    在 compute_chip_distribution 结果上提取形态判定所需的全部中间量。
+
+    返回 dict(数据不足返回 None):
+      price_pos     : 现价在近 lookback 价格区间的位置(0=最低,1=最高)
+      cost_pos      : 平均成本在价格区间的位置(筹码重心高低)
+      concentration : 集中度(越小越密集), 直接透传自 chip_result
+      profit_ratio  : 获利盘比例, 透传
+      consolidation : 近20日振幅/均价(越小越横盘, None=数据不足)
+      trend_20      : 近20日涨跌幅(%)
+      drawdown_60   : 现价距近60日最高的回撤(%), 负值=离高点多远
+      twin          : 双峰信息 dict 或 None
+      last_close/avg_cost : 透传, 便于文案
+    """
+    if not chip_result:
+        return None
+    prices = chip_result["prices"]
+    chips = chip_result["chips"]
+    last_close = float(chip_result["last_close"])
+    avg_cost = float(chip_result["avg_cost"])
+
+    d = df.copy()
+    for col in ("high", "low", "close"):
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+    d = d.dropna(subset=["high", "low", "close"]).tail(lookback)
+    if len(d) < 20:
+        return None
+    hi = float(d["high"].max())
+    lo = float(d["low"].min())
+    rng = (hi - lo) if hi > lo else 1e-9
+    price_pos = (last_close - lo) / rng
+    cost_pos = (avg_cost - lo) / rng
+
+    c = d["close"].reset_index(drop=True)
+    recent = c.tail(20)
+    consolidation = (float((recent.max() - recent.min()) / (recent.mean() + 1e-9))
+                     if len(recent) >= 10 else None)
+    trend_20 = (float((c.iloc[-1] - c.iloc[-20]) / (c.iloc[-20] + 1e-9) * 100)
+                if len(c) >= 21 else 0.0)
+    hi60 = float(d["high"].tail(60).max())
+    drawdown_60 = (last_close - hi60) / (hi60 + 1e-9) * 100
+
+    return {
+        "price_pos": float(price_pos),
+        "cost_pos": float(cost_pos),
+        "concentration": float(chip_result["concentration"]),
+        "profit_ratio": float(chip_result["profit_ratio"]),
+        "consolidation": consolidation,
+        "trend_20": trend_20,
+        "drawdown_60": float(drawdown_60),
+        "twin": _twin_peak(chips, prices),
+        "last_close": last_close,
+        "avg_cost": avg_cost,
+    }

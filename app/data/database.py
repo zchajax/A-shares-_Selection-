@@ -205,6 +205,172 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_ai_comm_code "
             "ON ai_commentary(code, created_at)"
         )
+        # 每日盘面宽度/情绪历史: 每个交易日落一条(盘中反复写则更新当天), 用于
+        # 计算"今日读数在过去一年里处于什么冷热分位"——把"上涨占比8%"这种孤立
+        # 数字变成"过去一年最冷的5%"这种有参照的信号(散户看不到、最能反映极值)。
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_breadth (
+                date       TEXT PRIMARY KEY,   -- 交易日 YYYY-MM-DD
+                up_share   REAL,               -- 上涨占比%: up/(up+down+flat)*100
+                up_cnt     INTEGER,            -- 上涨家数(全市场快照口径)
+                down_cnt   INTEGER,            -- 下跌家数
+                flat_cnt   INTEGER,            -- 平盘家数
+                limit_up   INTEGER,            -- 涨停家数(涨停池)
+                limit_down INTEGER,            -- 跌停家数(乐咕真实跌停,可为空)
+                zb_cnt     INTEGER,            -- 炸板家数
+                seal_rate  REAL,               -- 封板率%
+                max_board  INTEGER,            -- 最高连板
+                amount_yi  REAL,               -- 两市成交额(亿元)
+                vol_ratio  REAL,               -- 量能比%(较5日均量)
+                updated_at TEXT
+            )
+            """
+        )
+        # 板块估值历史: 每交易日每个行业板块一条, 存该板块成分股 PE/PB 中位数。
+        # 用于把"当前板块估值贵不贵"变成"处在过去一年的第几分位"这种有参照的信号。
+        # (date, sector) 联合主键, 盘中多次写只留最新。
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sector_valuation (
+                date       TEXT,                -- 交易日 YYYY-MM-DD
+                sector     TEXT,                -- 板块名(同花顺口径)
+                pe         REAL,                -- 成分股动态市盈率中位数(仅正值)
+                pb         REAL,                -- 成分股市净率中位数
+                cons_n     INTEGER,             -- 参与计算的成分股数
+                updated_at TEXT,
+                PRIMARY KEY (date, sector)
+            )
+            """
+        )
+
+
+def save_market_breadth(date: str, row: dict):
+    """写入/更新某交易日的盘面宽度快照(按 date 主键 UPSERT, 盘中多次写只留最新)。
+    row 键与 market_breadth 列对应(缺的置 None)。date 为 YYYY-MM-DD。"""
+    if not date:
+        return
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    cols = ["up_share", "up_cnt", "down_cnt", "flat_cnt", "limit_up",
+            "limit_down", "zb_cnt", "seal_rate", "max_board", "amount_yi",
+            "vol_ratio"]
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO market_breadth "
+            "(date," + ",".join(cols) + ",updated_at) "
+            "VALUES (?," + ",".join(["?"] * len(cols)) + ",?) "
+            "ON CONFLICT(date) DO UPDATE SET " +
+            ",".join(f"{c}=excluded.{c}" for c in cols) +
+            ",updated_at=excluded.updated_at",
+            (date, *[row.get(c) for c in cols], now),
+        )
+
+
+def load_market_breadth(days: int = 250) -> pd.DataFrame:
+    """读取最近 days 个交易日的盘面宽度历史(按日期升序)。"""
+    cols = ["date", "up_share", "up_cnt", "down_cnt", "flat_cnt", "limit_up",
+            "limit_down", "zb_cnt", "seal_rate", "max_board", "amount_yi",
+            "vol_ratio"]
+    with get_conn() as conn:
+        try:
+            df = pd.read_sql(
+                "SELECT " + ",".join(cols) + " FROM market_breadth "
+                "ORDER BY date DESC LIMIT ?", conn, params=(days,))
+            return df.sort_values("date").reset_index(drop=True)
+        except Exception:
+            return pd.DataFrame(columns=cols)
+
+
+def breadth_percentile(metric: str, value: float, days: int = 250) -> dict:
+    """计算某盘面读数 value 在过去 days 个交易日历史中的分位(0-100)。
+    分位 = 历史上 <= value 的天数占比 * 100。越低=越冷(该 metric 越小越极端时),
+    如 up_share 分位越低代表越接近"历史最冷/最恐慌"。样本 < 20 返回 None。
+    返回 {percentile, samples, min, max, cur} 或 None。"""
+    df = load_market_breadth(days)
+    if df is None or df.empty or metric not in df.columns:
+        return None
+    s = pd.to_numeric(df[metric], errors="coerce").dropna()
+    if len(s) < 20:
+        return None
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    below = int((s <= v).sum())
+    pct = below / len(s) * 100
+    return {"percentile": pct, "samples": int(len(s)),
+            "min": float(s.min()), "max": float(s.max()), "cur": v}
+
+
+def save_sector_valuation(date: str, sector: str, pe, pb, cons_n=None):
+    """写入/更新某交易日某板块的估值中位数(按 (date,sector) UPSERT)。
+    pe/pb 可为 None(缺一不影响另一个)。date 为 YYYY-MM-DD。"""
+    if not date or not sector:
+        return
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO sector_valuation "
+            "(date,sector,pe,pb,cons_n,updated_at) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(date,sector) DO UPDATE SET "
+            "pe=excluded.pe,pb=excluded.pb,cons_n=excluded.cons_n,"
+            "updated_at=excluded.updated_at",
+            (date, sector, pe, pb, cons_n, now),
+        )
+
+
+def save_sector_valuation_batch(rows: list):
+    """批量写入板块估值历史(用于回填)。rows = [(date,sector,pe,pb,cons_n), ...]。"""
+    if not rows:
+        return
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        conn.executemany(
+            "INSERT INTO sector_valuation "
+            "(date,sector,pe,pb,cons_n,updated_at) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(date,sector) DO UPDATE SET "
+            "pe=excluded.pe,pb=excluded.pb,cons_n=excluded.cons_n,"
+            "updated_at=excluded.updated_at",
+            [(d, s, pe, pb, n, now) for (d, s, pe, pb, n) in rows],
+        )
+
+
+def load_sector_valuation(sector: str, days: int = 300) -> pd.DataFrame:
+    """读取某板块最近 days 个交易日的估值历史(按日期升序)。"""
+    cols = ["date", "pe", "pb", "cons_n"]
+    with get_conn() as conn:
+        try:
+            df = pd.read_sql(
+                "SELECT date,pe,pb,cons_n FROM sector_valuation "
+                "WHERE sector=? ORDER BY date DESC LIMIT ?",
+                conn, params=(sector, days))
+            return df.sort_values("date").reset_index(drop=True)
+        except Exception:
+            return pd.DataFrame(columns=cols)
+
+
+def sector_val_percentile(sector: str, metric: str, value: float,
+                          days: int = 300) -> dict:
+    """计算某板块当前 metric(pe/pb) 读数 value 在过去 days 交易日历史中的分位。
+    分位 = 历史上 <= value 的天数占比 * 100。
+    分位越高=当前估值处于历史偏贵区间; 越低=偏便宜。样本 < 20 返回 None。
+    返回 {percentile, samples, min, max, cur} 或 None。"""
+    if metric not in ("pe", "pb"):
+        return None
+    df = load_sector_valuation(sector, days)
+    if df is None or df.empty or metric not in df.columns:
+        return None
+    s = pd.to_numeric(df[metric], errors="coerce").dropna()
+    if len(s) < 20:
+        return None
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    below = int((s <= v).sum())
+    pct = below / len(s) * 100
+    return {"percentile": pct, "samples": int(len(s)),
+            "min": float(s.min()), "max": float(s.max()), "cur": v}
 
 
 def save_stock_list(df: pd.DataFrame):
