@@ -28,6 +28,7 @@ import pandas as pd
 
 from . import panel as pnl
 from . import factor_ic as fic
+from . import protocol as proto
 
 
 # IC 显著性门槛:|t| 达此值才认为因子"有料",纳入自适应;否则权重归 0(不表态)。
@@ -64,6 +65,12 @@ def derive_weights(fwd_days: int = 5, step: int = None,
         step = fwd_days
     if panel is None:
         panel = pnl.build_panel(fwd_days=fwd_days, progress_cb=progress_cb)
+    # 权重只用训练窗。调用方若传了全样本的 IC 表，丢弃后按训练窗重算。
+    if panel is not None and "exit_date" in getattr(panel, "columns", []):
+        sliced = proto.train_slice(panel)
+        if len(sliced) != len(panel):
+            ic_summary = None
+        panel = sliced
     if ic_summary is None:
         ic_summary, _ = fic.compute_ic(fwd_days=fwd_days, step=step, panel=panel)
 
@@ -114,8 +121,8 @@ def _build_note(detail: pd.DataFrame, fwd_days: int, t_threshold: float) -> str:
     """把结果翻译成人话(方向 + 可信度提醒,绝不夸大)。"""
     sel = detail[detail["selected"]]
     if sel.empty:
-        return ("这几个指标过去都没表现出足够可信的规律,数据帮不了忙。"
-                "建议先别改权重,或者把\"预测天数\"调一调再试。")
+        return ("训练窗里这几个因子没有通过预先写下的显著性门槛。"
+                "按规则不再换到测试窗上重搜。")
     parts = []
     for _, r in sel.iterrows():
         direction = "顺着用(得分越高越好)" if r["weight"] > 0 else "反着用(得分越低越好)"
@@ -127,6 +134,6 @@ def _build_note(detail: pd.DataFrame, fwd_days: int, t_threshold: float) -> str:
     if neg > 0:
         hint = ("；其中 %d 个指标是【反着用】——就是说近 %d 天里,\"跌得多的反弹\"比"
                 "\"强的继续强\"更赚钱。" % (neg, fwd_days))
-    tail = ("。提醒:这只是过去这段行情的规律,行情风格一变(比如转牛市)可能就反过来了。"
-            "一定先看下面的历史验证确认它更强,别长期照搬。")
+    tail = ("。权重只在训练窗（卖出日不晚于 %s）里估计。"
+            "测试窗结论以 validity_record.txt 为准，不在这里重算。" % proto.TRAIN_END)
     return "结论:" + body + hint + tail

@@ -12,15 +12,23 @@ import pandas as pd
 # 数据库文件放在项目根目录的 data_cache 下
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DB_PATH = os.path.join(_BASE_DIR, "data_cache", "stock.db")
+_WAL_READY = False
 
 
 @contextmanager
 def get_conn():
     """获取数据库连接的上下文管理器,自动提交/关闭。"""
+    global _WAL_READY
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30)
     # 并发拉取时多个线程可能同时读写,让 SQLite 最多等 30s 而不是立刻报 locked
     conn.execute("PRAGMA busy_timeout=30000")
+    if not _WAL_READY:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _WAL_READY = True
+        except sqlite3.OperationalError:
+            pass
     try:
         yield conn
         conn.commit()
@@ -154,7 +162,15 @@ def init_db():
         for _c, _t in (("gross_margin", "REAL"), ("net_margin", "REAL"),
                        ("rev_yoy", "REAL"), ("profit_yoy", "REAL"),
                        ("debt_ratio", "REAL"), ("dividend_ratio", "REAL"),
-                       ("report_date", "TEXT")):
+                       ("report_date", "TEXT"), ("float_mv", "REAL"),
+                       ("pe_hist_pct", "REAL"), ("pb_hist_pct", "REAL"),
+                       ("pe_ind_pct", "REAL"), ("peg", "REAL"),
+                       ("roe_3y_min", "REAL"), ("roe_3y_avg", "REAL"), ("gm_trend", "REAL"),
+                       ("growth_streak", "REAL"), ("rev_growth_streak", "REAL"),
+                       ("avg_profit_yoy_3q", "REAL"), ("profit_accel", "REAL"),
+                       ("div_years_5y", "REAL"), ("div_avg_5y", "REAL"), ("div_min_3y", "REAL"),
+                       ("ret_20d", "REAL"), ("ret_60d", "REAL"),
+                       ("ma_bull", "REAL"), ("break_high60", "REAL")):
             if _c not in _fund_cols:
                 cur.execute(f"ALTER TABLE fundamental ADD COLUMN {_c} {_t}")
         # 价格预警:对个股设置涨跌幅/价位阈值,盘中实时行情触发时高亮提示
@@ -240,6 +256,167 @@ def init_db():
                 cons_n     INTEGER,             -- 参与计算的成分股数
                 updated_at TEXT,
                 PRIMARY KEY (date, sector)
+            )
+            """
+        )
+        # 实盘/模拟盘信号跟踪账本 (Signal Ledger): 自动记录每次推荐信号并在后续更新时跟踪触及止盈/止损
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signal_ledger (
+                signal_date  TEXT,
+                horizon      INTEGER,
+                code         TEXT,
+                name         TEXT,
+                industry     TEXT,
+                setups       TEXT,
+                p_cond       REAL,
+                p_tb         REAL,
+                signal_close REAL,
+                max_buy      REAL,
+                stop_loss    REAL,
+                take_profit  REAL,
+                entry_date   TEXT,
+                entry_price  REAL,
+                exit_date    TEXT,
+                exit_price   REAL,
+                return_pct   REAL,
+                status       TEXT,
+                updated_at   TEXT,
+                PRIMARY KEY (signal_date, horizon, code)
+            )
+            """
+        )
+        # 1) 历史季报序列 (Point-in-Time Financials): 按公告日 notice_date 对齐历史真实 ROE / 利润同比 / BPS
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pit_financials (
+                code         TEXT,
+                report_date  TEXT,
+                notice_date  TEXT,
+                eps          REAL,
+                roe          REAL,
+                rev_yoy      REAL,
+                profit_yoy   REAL,
+                bps          REAL,
+                gross_margin REAL,
+                board_name   TEXT,
+                PRIMARY KEY (code, report_date)
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pit_code_notice ON pit_financials(code, notice_date)"
+        )
+        # 2) 日内盘口与主力资金流 (Capital Flow & Order Imbalance)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS capital_flow (
+                code           TEXT,
+                date           TEXT,
+                buy_big_ratio  REAL,
+                sell_big_ratio REAL,
+                net_big_ratio  REAL,
+                outer_vol      REAL,
+                inner_vol      REAL,
+                active_buy_imb REAL,
+                net_inflow_yi  REAL,
+                updated_at     TEXT,
+                PRIMARY KEY (code, date)
+            )
+            """
+        )
+        # 3) 事件与排雷日历 (Risk Calendar: 限售股解禁 + 业绩预告预亏/暴雷)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS risk_calendar (
+                code         TEXT,
+                event_type   TEXT,
+                event_date   TEXT,
+                severity     TEXT,
+                ratio_val    REAL,
+                summary      TEXT,
+                updated_at   TEXT,
+                PRIMARY KEY (code, event_type, event_date)
+            )
+            """
+        )
+        # 4) 东财二级细分题材板块映射 (Subsector / Concept Map)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS subsector_map (
+                code       TEXT PRIMARY KEY,
+                board_name TEXT,
+                board_code TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        # 5) 场内 ETF 全量指标快照表 (1700+ 只场内 ETF，含分类、规模、折溢价、换手、阶段涨幅)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS etf_snapshot (
+                code          TEXT PRIMARY KEY,
+                name          TEXT,
+                category      TEXT,
+                price         REAL,
+                chg_pct       REAL,
+                open          REAL,
+                high          REAL,
+                low           REAL,
+                amount_yi     REAL,
+                turnover      REAL,
+                scale_yi      REAL,
+                iopv          REAL,
+                discount_rate REAL,
+                ret_20d       REAL,
+                ret_60d       REAL,
+                ret_250d      REAL,
+                updated_at    TEXT
+            )
+            """
+        )
+        # 6) 场外开放式公募基金业绩库 (20000+ 只公募基金，含净值与各周期收益率、费率、规模、机构占比、最大回撤)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mutual_fund_rank (
+                code       TEXT PRIMARY KEY,
+                name       TEXT,
+                category   TEXT,
+                nav_date   TEXT,
+                unit_nav   REAL,
+                acc_nav    REAL,
+                day_chg    REAL,
+                ret_1w     REAL,
+                ret_1m     REAL,
+                ret_3m     REAL,
+                ret_6m     REAL,
+                ret_1y     REAL,
+                ret_2y     REAL,
+                ret_3y     REAL,
+                ret_ytd    REAL,
+                ret_since  REAL,
+                fee_pct    REAL,
+                scale_yi   REAL,
+                inst_ratio REAL,
+                max_dd_1y  REAL,
+                max_dd_all REAL,
+                updated_at TEXT
+            )
+            """
+        )
+        _mf_cols = [r[1] for r in cur.execute("PRAGMA table_info(mutual_fund_rank)").fetchall()]
+        for _c, _t in (("scale_yi", "REAL"), ("inst_ratio", "REAL"), ("max_dd_1y", "REAL"), ("max_dd_all", "REAL")):
+            if _c not in _mf_cols:
+                cur.execute(f"ALTER TABLE mutual_fund_rank ADD COLUMN {_c} {_t}")
+        # 7) 场外公募基金历史净值走势表 (供基金产品详情页绘制业绩走势与净值曲线)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fund_nav_history (
+                code     TEXT,
+                date     TEXT,
+                unit_nav REAL,
+                day_chg  REAL,
+                PRIMARY KEY (code, date)
             )
             """
         )
@@ -484,6 +661,62 @@ def list_cached_codes() -> list:
             return []
 
 
+def last_dates() -> dict:
+    """一次取出每只股票的本地最新日期，避免逐只查询。"""
+    with get_conn() as conn:
+        try:
+            rows = conn.execute(
+                "SELECT code, MAX(date) FROM daily_kline GROUP BY code"
+            ).fetchall()
+        except Exception:
+            return {}
+    return {r[0]: r[1] for r in rows if r[0] and r[1]}
+
+
+def last_bars_summary(recent_since: str) -> dict:
+    """
+    一次性取出每只股票的本地最新日期，以及 recent_since 之后的每日收盘价映射。
+    返回: {code: {"last_date": str, "closes": {date: float}}}
+    用于极速增量更新与除权除息(qfq)断层检测。
+    """
+    out = {}
+    with get_conn() as conn:
+        try:
+            max_rows = conn.execute(
+                "SELECT code, MAX(date) FROM daily_kline GROUP BY code"
+            ).fetchall()
+            for code, max_d in max_rows:
+                if code and max_d:
+                    out[str(code)] = {"last_date": str(max_d), "closes": {}}
+            recent_rows = conn.execute(
+                "SELECT code, date, close FROM daily_kline WHERE date >= ?",
+                (str(recent_since),),
+            ).fetchall()
+            for code, d, c in recent_rows:
+                item = out.get(str(code))
+                if item is not None and d and c is not None:
+                    item["closes"][str(d)] = float(c)
+        except Exception:
+            pass
+    return out
+
+
+def upsert_kline_rows(rows: list[tuple]):
+    """
+    批量增量合并日线行: rows 元素为 (code, date, open, high, low, close, volume, amount)。
+    使用 INSERT OR REPLACE，既能追加新交易日，也能在盘中/收盘再次更新时刷新当日最新K线。
+    """
+    if not rows:
+        return
+    with get_conn() as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO daily_kline "
+            "(code,date,open,high,low,close,volume,amount) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            rows,
+        )
+
+
 def get_last_date(code: str):
     """返回某只股票本地已缓存的最新日期(YYYY-MM-DD),没有则返回 None。"""
     with get_conn() as conn:
@@ -497,7 +730,7 @@ def get_last_date(code: str):
 
 
 def append_kline(code: str, df: pd.DataFrame):
-    """增量追加日线(不删旧数据),用 INSERT OR IGNORE 避免主键冲突。"""
+    """增量合并日线(不删历史旧数据),用 INSERT OR REPLACE 支持同日盘中到收盘覆盖更新。"""
     if df is None or df.empty:
         return
     df = df.copy()
@@ -507,7 +740,7 @@ def append_kline(code: str, df: pd.DataFrame):
     with get_conn() as conn:
         rows = [tuple(r) for r in df.itertuples(index=False)]
         conn.executemany(
-            "INSERT OR IGNORE INTO daily_kline "
+            "INSERT OR REPLACE INTO daily_kline "
             "(code,date,open,high,low,close,volume,amount) "
             "VALUES (?,?,?,?,?,?,?,?)",
             rows,
@@ -613,7 +846,7 @@ def load_watchlist() -> pd.DataFrame:
 # ==================== 基本面 / 估值 ====================
 def save_fundamental(rows: dict):
     """
-    批量写入基本面数据。rows: {code: {pe_ttm, pb, ps_ttm, total_mv, roe,
+    批量写入基本面数据。rows: {code: {pe_ttm, pb, ps_ttm, total_mv, float_mv, roe,
       gross_margin, net_margin, rev_yoy, profit_yoy, debt_ratio,
       dividend_ratio, report_date}}。
     UPSERT:已存在则更新非空字段(None 不覆盖旧值)。
@@ -626,15 +859,16 @@ def save_fundamental(rows: dict):
             conn.execute(
                 """
                 INSERT INTO fundamental
-                    (code, pe_ttm, pb, ps_ttm, total_mv, roe,
+                    (code, pe_ttm, pb, ps_ttm, total_mv, float_mv, roe,
                      gross_margin, net_margin, rev_yoy, profit_yoy,
                      debt_ratio, dividend_ratio, report_date, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(code) DO UPDATE SET
                     pe_ttm   = COALESCE(excluded.pe_ttm,   fundamental.pe_ttm),
                     pb       = COALESCE(excluded.pb,       fundamental.pb),
                     ps_ttm   = COALESCE(excluded.ps_ttm,   fundamental.ps_ttm),
                     total_mv = COALESCE(excluded.total_mv, fundamental.total_mv),
+                    float_mv = COALESCE(excluded.float_mv, fundamental.float_mv),
                     roe      = COALESCE(excluded.roe,       fundamental.roe),
                     gross_margin   = COALESCE(excluded.gross_margin,   fundamental.gross_margin),
                     net_margin     = COALESCE(excluded.net_margin,     fundamental.net_margin),
@@ -646,7 +880,7 @@ def save_fundamental(rows: dict):
                     updated_at = excluded.updated_at
                 """,
                 (code, d.get("pe_ttm"), d.get("pb"), d.get("ps_ttm"),
-                 d.get("total_mv"), d.get("roe"),
+                 d.get("total_mv"), d.get("float_mv"), d.get("roe"),
                  d.get("gross_margin"), d.get("net_margin"),
                  d.get("rev_yoy"), d.get("profit_yoy"),
                  d.get("debt_ratio"), d.get("dividend_ratio"),
@@ -655,11 +889,26 @@ def save_fundamental(rows: dict):
 
 
 def load_fundamental() -> pd.DataFrame:
-    """读取全部基本面数据(含成长/质量字段)。"""
-    _cols = ["code", "pe_ttm", "pb", "ps_ttm", "total_mv", "roe",
+    """读取全部基本面数据(含成长/质量/流通市值/5年估值分位/同业分位/连续3年ROE/PEG/连续增长季度/5年分红与股息率字段)。"""
+    _cols = ["code", "pe_ttm", "pb", "ps_ttm", "total_mv", "float_mv", "roe",
              "gross_margin", "net_margin", "rev_yoy", "profit_yoy",
-             "debt_ratio", "dividend_ratio", "report_date", "updated_at"]
+             "debt_ratio", "dividend_ratio", "report_date",
+             "pe_hist_pct", "pb_hist_pct", "pe_ind_pct", "peg",
+             "roe_3y_min", "roe_3y_avg", "gm_trend",
+             "growth_streak", "rev_growth_streak", "avg_profit_yoy_3q", "profit_accel",
+             "div_years_5y", "div_avg_5y", "div_min_3y",
+             "ret_20d", "ret_60d", "ma_bull", "break_high60",
+             "updated_at"]
     with get_conn() as conn:
+        for col in ("pe_hist_pct", "pb_hist_pct", "pe_ind_pct", "peg",
+                    "roe_3y_min", "roe_3y_avg", "gm_trend",
+                    "growth_streak", "rev_growth_streak", "avg_profit_yoy_3q", "profit_accel",
+                    "div_years_5y", "div_avg_5y", "div_min_3y",
+                    "ret_20d", "ret_60d", "ma_bull", "break_high60"):
+            try:
+                conn.execute(f"ALTER TABLE fundamental ADD COLUMN {col} REAL")
+            except Exception:
+                pass
         try:
             return pd.read_sql(
                 "SELECT " + ",".join(_cols) + " FROM fundamental", conn)
@@ -667,8 +916,11 @@ def load_fundamental() -> pd.DataFrame:
             return pd.DataFrame(columns=_cols)
 
 
+load_fundamentals = load_fundamental
+
+
 def load_fundamental_map() -> dict:
-    """返回 {code: {pe_ttm, pb, ps_ttm, total_mv, roe}},供选股/展示快速查。"""
+    """返回全量个股基本面与衍生特征字典。"""
     df = load_fundamental()
     if df is None or df.empty:
         return {}
@@ -676,7 +928,32 @@ def load_fundamental_map() -> dict:
     for r in df.itertuples(index=False):
         out[r.code] = {
             "pe_ttm": r.pe_ttm, "pb": r.pb, "ps_ttm": r.ps_ttm,
-            "total_mv": r.total_mv, "roe": r.roe,
+            "total_mv": r.total_mv, "float_mv": getattr(r, "float_mv", None),
+            "roe": r.roe,
+            "gross_margin": getattr(r, "gross_margin", None),
+            "net_margin": getattr(r, "net_margin", None),
+            "rev_yoy": getattr(r, "rev_yoy", None),
+            "profit_yoy": getattr(r, "profit_yoy", None),
+            "debt_ratio": getattr(r, "debt_ratio", None),
+            "dividend_ratio": getattr(r, "dividend_ratio", None),
+            "pe_hist_pct": getattr(r, "pe_hist_pct", None),
+            "pb_hist_pct": getattr(r, "pb_hist_pct", None),
+            "pe_ind_pct": getattr(r, "pe_ind_pct", None),
+            "peg": getattr(r, "peg", None),
+            "roe_3y_min": getattr(r, "roe_3y_min", None),
+            "roe_3y_avg": getattr(r, "roe_3y_avg", None),
+            "gm_trend": getattr(r, "gm_trend", None),
+            "growth_streak": getattr(r, "growth_streak", None),
+            "rev_growth_streak": getattr(r, "rev_growth_streak", None),
+            "avg_profit_yoy_3q": getattr(r, "avg_profit_yoy_3q", None),
+            "profit_accel": getattr(r, "profit_accel", None),
+            "div_years_5y": getattr(r, "div_years_5y", None),
+            "div_avg_5y": getattr(r, "div_avg_5y", None),
+            "div_min_3y": getattr(r, "div_min_3y", None),
+            "ret_20d": getattr(r, "ret_20d", None),
+            "ret_60d": getattr(r, "ret_60d", None),
+            "ma_bull": getattr(r, "ma_bull", None),
+            "break_high60": getattr(r, "break_high60", None),
         }
     return out
 
@@ -723,11 +1000,11 @@ def industry_valuation_percentile(code: str, metric: str = "pe_ttm") -> dict:
 
 
 def get_fundamental(code: str) -> dict:
-    """返回单只股票的基本面(含成长/质量字段);无则 None。"""
+    """返回单只股票的基本面(含成长/质量/流通市值字段);无则 None。"""
     with get_conn() as conn:
         try:
             r = conn.execute(
-                "SELECT pe_ttm,pb,ps_ttm,total_mv,roe,gross_margin,net_margin,"
+                "SELECT pe_ttm,pb,ps_ttm,total_mv,float_mv,roe,gross_margin,net_margin,"
                 "rev_yoy,profit_yoy,debt_ratio,dividend_ratio,report_date,updated_at "
                 "FROM fundamental WHERE code=?", (code,)).fetchone()
         except Exception:
@@ -735,10 +1012,10 @@ def get_fundamental(code: str) -> dict:
     if not r:
         return None
     return {"pe_ttm": r[0], "pb": r[1], "ps_ttm": r[2],
-            "total_mv": r[3], "roe": r[4], "gross_margin": r[5],
-            "net_margin": r[6], "rev_yoy": r[7], "profit_yoy": r[8],
-            "debt_ratio": r[9], "dividend_ratio": r[10],
-            "report_date": r[11], "updated_at": r[12]}
+            "total_mv": r[3], "float_mv": r[4], "roe": r[5],
+            "gross_margin": r[6], "net_margin": r[7], "rev_yoy": r[8],
+            "profit_yoy": r[9], "debt_ratio": r[10], "dividend_ratio": r[11],
+            "report_date": r[12], "updated_at": r[13]}
 
 
 def codes_without_fundamental(codes: list = None) -> list:
@@ -807,13 +1084,6 @@ def save_etf_list(df: pd.DataFrame):
             "updated_at=excluded.updated_at",
             rows,
         )
-        # 同步进 stock_list(便于 namemap 统一取名 + 参与扫描)
-        conn.executemany(
-            "INSERT INTO stock_list (code, name, updated_at) VALUES (?,?,?) "
-            "ON CONFLICT(code) DO UPDATE SET name=excluded.name, "
-            "updated_at=excluded.updated_at",
-            rows,
-        )
 
 
 def load_etf_list() -> pd.DataFrame:
@@ -848,10 +1118,11 @@ def search_local(keyword: str, limit: int = 30) -> list:
         return []
     with get_conn() as conn:
         try:
-            # 只取本地真正有日线的 code,并 join 名称(stock_list 已含 ETF 名称)
             rows = conn.execute(
-                "SELECT DISTINCT k.code, COALESCE(s.name, '') AS name "
-                "FROM daily_kline k LEFT JOIN stock_list s ON k.code = s.code"
+                "SELECT DISTINCT k.code, COALESCE(s.name, e.name, '') AS name "
+                "FROM daily_kline k "
+                "LEFT JOIN stock_list s ON k.code = s.code "
+                "LEFT JOIN etf_list e ON k.code = e.code"
             ).fetchall()
         except Exception:
             return []
@@ -882,17 +1153,21 @@ def search_local(keyword: str, limit: int = 30) -> list:
 
 
 def name_of(code: str) -> str:
-    """按代码取名称(stock_list 已含 ETF 名称)。查不到返回空串。"""
+    """按代码取名称(依次查询 stock_list -> etf_list -> mutual_fund_rank)。查不到返回空串。"""
     if not code:
         return ""
+    code = str(code).zfill(6)
     with get_conn() as conn:
-        try:
-            row = conn.execute(
-                "SELECT name FROM stock_list WHERE code = ?", (code,)
-            ).fetchone()
-            return (row[0] if row and row[0] else "") or ""
-        except Exception:
-            return ""
+        for tbl in ("stock_list", "etf_list", "mutual_fund_rank"):
+            try:
+                row = conn.execute(
+                    f"SELECT name FROM {tbl} WHERE code = ?", (code,)
+                ).fetchone()
+                if row and row[0]:
+                    return str(row[0])
+            except Exception:
+                pass
+        return ""
 
 
 # ==================== AI 点评历史存档 ====================
@@ -937,6 +1212,410 @@ def load_ai_commentary(code: str = None, limit: int = 50) -> pd.DataFrame:
                 "ORDER BY created_at DESC LIMIT ?", conn, params=(limit,))
         except Exception:
             return pd.DataFrame(columns=cols)
+
+
+def save_signal_ledger(rows: list[dict]):
+    """写入或更新实盘/模拟盘信号跟踪账本。"""
+    if not rows:
+        return
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        for r in rows:
+            conn.execute(
+                """
+                INSERT INTO signal_ledger
+                    (signal_date, horizon, code, name, industry, setups,
+                     p_cond, p_tb, signal_close, max_buy, stop_loss, take_profit,
+                     entry_date, entry_price, exit_date, exit_price, return_pct,
+                     status, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(signal_date, horizon, code) DO UPDATE SET
+                    name         = COALESCE(excluded.name, signal_ledger.name),
+                    industry     = COALESCE(excluded.industry, signal_ledger.industry),
+                    setups       = COALESCE(excluded.setups, signal_ledger.setups),
+                    p_cond       = COALESCE(excluded.p_cond, signal_ledger.p_cond),
+                    p_tb         = COALESCE(excluded.p_tb, signal_ledger.p_tb),
+                    signal_close = COALESCE(excluded.signal_close, signal_ledger.signal_close),
+                    max_buy      = COALESCE(excluded.max_buy, signal_ledger.max_buy),
+                    stop_loss    = COALESCE(excluded.stop_loss, signal_ledger.stop_loss),
+                    take_profit  = COALESCE(excluded.take_profit, signal_ledger.take_profit),
+                    entry_date   = COALESCE(excluded.entry_date, signal_ledger.entry_date),
+                    entry_price  = COALESCE(excluded.entry_price, signal_ledger.entry_price),
+                    exit_date    = COALESCE(excluded.exit_date, signal_ledger.exit_date),
+                    exit_price   = COALESCE(excluded.exit_price, signal_ledger.exit_price),
+                    return_pct   = COALESCE(excluded.return_pct, signal_ledger.return_pct),
+                    status       = COALESCE(excluded.status, signal_ledger.status),
+                    updated_at   = excluded.updated_at
+                """,
+                (
+                    str(r.get("signal_date")), int(r.get("horizon", 10)), str(r.get("code")).zfill(6),
+                    r.get("name"), r.get("industry"), r.get("setups"),
+                    r.get("p_cond"), r.get("p_tb"), r.get("signal_close"),
+                    r.get("max_buy"), r.get("stop_loss"), r.get("take_profit"),
+                    r.get("entry_date"), r.get("entry_price"),
+                    r.get("exit_date"), r.get("exit_price"), r.get("return_pct"),
+                    r.get("status", "待开盘"), now,
+                ),
+            )
+
+
+def load_signal_ledger(horizon: int = None, limit: int = 120) -> pd.DataFrame:
+    """读取信号跟踪账本，按 signal_date 降序、p_cond 降序。"""
+    cols = [
+        "signal_date", "horizon", "code", "name", "industry", "setups",
+        "p_cond", "p_tb", "signal_close", "max_buy", "stop_loss", "take_profit",
+        "entry_date", "entry_price", "exit_date", "exit_price", "return_pct",
+        "status", "updated_at",
+    ]
+    with get_conn() as conn:
+        try:
+            if horizon is not None:
+                return pd.read_sql(
+                    "SELECT " + ",".join(cols) + " FROM signal_ledger "
+                    "WHERE horizon = ? ORDER BY signal_date DESC, p_cond DESC LIMIT ?",
+                    conn, params=(int(horizon), int(limit)),
+                )
+            return pd.read_sql(
+                "SELECT " + ",".join(cols) + " FROM signal_ledger "
+                "ORDER BY signal_date DESC, p_cond DESC LIMIT ?",
+                conn, params=(int(limit),),
+            )
+        except Exception:
+            return pd.DataFrame(columns=cols)
+
+
+def save_pit_financials(rows: list[tuple]):
+    """
+    批量写入历史季报序列 (Point-in-Time Financials)。
+    rows 元素为: (code, report_date, notice_date, eps, roe, rev_yoy, profit_yoy, bps, gross_margin, board_name)
+    """
+    if not rows:
+        return
+    with get_conn() as conn:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO pit_financials
+                (code, report_date, notice_date, eps, roe, rev_yoy, profit_yoy, bps, gross_margin, board_name)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            rows,
+        )
+
+
+def load_pit_financials() -> pd.DataFrame:
+    """读取全部历史季报序列，按 code, notice_date, report_date 升序排列。"""
+    cols = [
+        "code", "report_date", "notice_date", "eps", "roe",
+        "rev_yoy", "profit_yoy", "bps", "gross_margin", "board_name",
+    ]
+    with get_conn() as conn:
+        try:
+            df = pd.read_sql(
+                "SELECT " + ",".join(cols) + " FROM pit_financials "
+                "ORDER BY code ASC, notice_date ASC, report_date ASC",
+                conn,
+            )
+            return df
+        except Exception:
+            return pd.DataFrame(columns=cols)
+
+
+def save_capital_flow(rows: list[tuple]):
+    """
+    批量写入日内盘口大单比例与内外盘主动买盘流向。
+    rows 元素为: (code, date, buy_big_ratio, sell_big_ratio, net_big_ratio, outer_vol, inner_vol, active_buy_imb, net_inflow_yi)
+    """
+    if not rows:
+        return
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO capital_flow
+                (code, date, buy_big_ratio, sell_big_ratio, net_big_ratio,
+                 outer_vol, inner_vol, active_buy_imb, net_inflow_yi, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            [(*r, now) for r in rows],
+        )
+
+
+def load_latest_capital_flow() -> dict:
+    """读取每只股票最新一个交易日的主力资金流与盘口主动买盘失衡度。"""
+    with get_conn() as conn:
+        try:
+            max_d = conn.execute("SELECT MAX(date) FROM capital_flow").fetchone()[0]
+            if not max_d:
+                return {}
+            rows = conn.execute(
+                "SELECT code, date, buy_big_ratio, sell_big_ratio, net_big_ratio, "
+                "active_buy_imb, net_inflow_yi FROM capital_flow WHERE date = ?",
+                (str(max_d),),
+            ).fetchall()
+            return {
+                str(r[0]).zfill(6): {
+                    "date": str(r[1]),
+                    "buy_big_ratio": r[2],
+                    "sell_big_ratio": r[3],
+                    "net_big_ratio": r[4],
+                    "active_buy_imb": r[5],
+                    "net_inflow_yi": r[6],
+                }
+                for r in rows if r[0]
+            }
+        except Exception:
+            return {}
+
+
+def save_risk_calendar(rows: list[tuple]):
+    """
+    批量写入风险与催化事件日历 (限售股解禁 / 业绩预告预亏或暴增)。
+    rows 元素为: (code, event_type, event_date, severity, ratio_val, summary)
+    """
+    if not rows:
+        return
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO risk_calendar
+                (code, event_type, event_date, severity, ratio_val, summary, updated_at)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            [(*r, now) for r in rows],
+        )
+
+
+def load_risk_calendar_map() -> dict[str, list[dict]]:
+    """返回 {code: [{event_type, event_date, severity, ratio_val, summary}, ...]}。"""
+    with get_conn() as conn:
+        try:
+            rows = conn.execute(
+                "SELECT code, event_type, event_date, severity, ratio_val, summary "
+                "FROM risk_calendar ORDER BY event_date ASC"
+            ).fetchall()
+            out: dict[str, list[dict]] = {}
+            for code, et, ed, sev, rv, summ in rows:
+                if not code:
+                    continue
+                out.setdefault(str(code).zfill(6), []).append({
+                    "event_type": str(et or ""),
+                    "event_date": str(ed or ""),
+                    "severity": str(sev or "neutral"),
+                    "ratio_val": float(rv) if rv is not None else 0.0,
+                    "summary": str(summ or ""),
+                })
+            return out
+        except Exception:
+            return {}
+
+
+def save_subsector_map(rows: list[tuple]):
+    """写入股票->东财二级细分板块映射: rows 元素为 (code, board_name, board_code)。"""
+    if not rows:
+        return
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO subsector_map (code, board_name, board_code, updated_at)
+            VALUES (?,?,?,?)
+            """,
+            [(str(c).zfill(6), str(bn or ""), str(bc or ""), now) for c, bn, bc in rows if c and bn],
+        )
+
+
+def load_subsector_map() -> dict[str, str]:
+    """返回 {code: 二级细分板块名称}。"""
+    with get_conn() as conn:
+        try:
+            rows = conn.execute("SELECT code, board_name FROM subsector_map").fetchall()
+            return {str(r[0]).zfill(6): str(r[1]) for r in rows if r[0] and r[1]}
+        except Exception:
+            return {}
+
+
+def save_etf_snapshot(rows: list[tuple]):
+    """
+    批量写入场内 ETF 全量指标快照。
+    rows 元素为: (code, name, category, price, chg_pct, open, high, low,
+                 amount_yi, turnover, scale_yi, iopv, discount_rate, ret_20d, ret_60d, ret_250d)
+    """
+    if not rows:
+        return
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO etf_snapshot
+                (code, name, category, price, chg_pct, open, high, low,
+                 amount_yi, turnover, scale_yi, iopv, discount_rate,
+                 ret_20d, ret_60d, ret_250d, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            [(*r, now) for r in rows],
+        )
+
+
+def load_etf_snapshot() -> pd.DataFrame:
+    """读取本地已缓存的场内 ETF 全量指标快照表。"""
+    cols = [
+        "code", "name", "category", "price", "chg_pct", "open", "high", "low",
+        "amount_yi", "turnover", "scale_yi", "iopv", "discount_rate",
+        "ret_20d", "ret_60d", "ret_250d", "updated_at",
+    ]
+    with get_conn() as conn:
+        try:
+            return pd.read_sql("SELECT " + ",".join(cols) + " FROM etf_snapshot", conn)
+        except Exception:
+            return pd.DataFrame(columns=cols)
+
+
+def save_mutual_fund_rank(rows: list[tuple]):
+    """
+    批量写入场外公募基金业绩库（保留已核验缓存的 scale_yi, inst_ratio, max_dd_1y, max_dd_all）。
+    rows 元素为: (code, name, category, nav_date, unit_nav, acc_nav, day_chg,
+                 ret_1w, ret_1m, ret_3m, ret_6m, ret_1y, ret_2y, ret_3y, ret_ytd, ret_since, fee_pct)
+    """
+    if not rows:
+        return
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        conn.executemany(
+            """
+            INSERT INTO mutual_fund_rank
+                (code, name, category, nav_date, unit_nav, acc_nav, day_chg,
+                 ret_1w, ret_1m, ret_3m, ret_6m, ret_1y, ret_2y, ret_3y,
+                 ret_ytd, ret_since, fee_pct, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(code) DO UPDATE SET
+                name       = excluded.name,
+                category   = excluded.category,
+                nav_date   = excluded.nav_date,
+                unit_nav   = excluded.unit_nav,
+                acc_nav    = excluded.acc_nav,
+                day_chg    = excluded.day_chg,
+                ret_1w     = excluded.ret_1w,
+                ret_1m     = excluded.ret_1m,
+                ret_3m     = excluded.ret_3m,
+                ret_6m     = excluded.ret_6m,
+                ret_1y     = excluded.ret_1y,
+                ret_2y     = excluded.ret_2y,
+                ret_3y     = excluded.ret_3y,
+                ret_ytd    = excluded.ret_ytd,
+                ret_since  = excluded.ret_since,
+                fee_pct    = excluded.fee_pct,
+                updated_at = excluded.updated_at
+            """,
+            [(*r, now) for r in rows],
+        )
+
+
+def update_mutual_fund_deep_metrics(rows: list[tuple]):
+    """
+    批量回填场外公募基金的深度核验指标：
+    支持 5 元组 (scale_yi, inst_ratio, max_dd_1y, max_dd_all, code)
+    或 10 元组 (scale_yi, inst_ratio, max_dd_1y, max_dd_all, establish_years, sharpe_1y, vol_1y, manager_name, manager_years, code)
+    """
+    if not rows:
+        return
+    with get_conn() as conn:
+        for col, ctype in (
+            ("scale_yi", "REAL"), ("inst_ratio", "REAL"), ("max_dd_1y", "REAL"), ("max_dd_all", "REAL"),
+            ("establish_years", "REAL"), ("sharpe_1y", "REAL"), ("vol_1y", "REAL"),
+            ("manager_name", "TEXT"), ("manager_years", "REAL"),
+        ):
+            try:
+                conn.execute(f"ALTER TABLE mutual_fund_rank ADD COLUMN {col} {ctype}")
+            except Exception:
+                pass
+        if len(rows[0]) >= 10:
+            conn.executemany(
+                """
+                UPDATE mutual_fund_rank
+                SET scale_yi        = COALESCE(?, scale_yi),
+                    inst_ratio      = COALESCE(?, inst_ratio),
+                    max_dd_1y       = COALESCE(?, max_dd_1y),
+                    max_dd_all      = COALESCE(?, max_dd_all),
+                    establish_years = COALESCE(?, establish_years),
+                    sharpe_1y       = COALESCE(?, sharpe_1y),
+                    vol_1y          = COALESCE(?, vol_1y),
+                    manager_name    = COALESCE(?, manager_name),
+                    manager_years   = COALESCE(?, manager_years)
+                WHERE code = ?
+                """,
+                rows,
+            )
+        else:
+            conn.executemany(
+                """
+                UPDATE mutual_fund_rank
+                SET scale_yi   = COALESCE(?, scale_yi),
+                    inst_ratio = COALESCE(?, inst_ratio),
+                    max_dd_1y  = COALESCE(?, max_dd_1y),
+                    max_dd_all = COALESCE(?, max_dd_all)
+                WHERE code = ?
+                """,
+                rows,
+            )
+
+
+def load_mutual_fund_rank() -> pd.DataFrame:
+    """读取本地已缓存的场外公募开放式基金业绩表(含规模、机构占比、最大回撤、成立年限、夏普比率、波动率、基金经理)。"""
+    cols = [
+        "code", "name", "category", "nav_date", "unit_nav", "acc_nav", "day_chg",
+        "ret_1w", "ret_1m", "ret_3m", "ret_6m", "ret_1y", "ret_2y", "ret_3y",
+        "ret_ytd", "ret_since", "fee_pct",
+        "scale_yi", "inst_ratio", "max_dd_1y", "max_dd_all",
+        "establish_years", "sharpe_1y", "vol_1y", "manager_name", "manager_years",
+        "updated_at",
+    ]
+    with get_conn() as conn:
+        for col, ctype in (
+            ("scale_yi", "REAL"), ("inst_ratio", "REAL"), ("max_dd_1y", "REAL"), ("max_dd_all", "REAL"),
+            ("establish_years", "REAL"), ("sharpe_1y", "REAL"), ("vol_1y", "REAL"),
+            ("manager_name", "TEXT"), ("manager_years", "REAL"),
+        ):
+            try:
+                conn.execute(f"ALTER TABLE mutual_fund_rank ADD COLUMN {col} {ctype}")
+            except Exception:
+                pass
+        try:
+            return pd.read_sql("SELECT " + ",".join(cols) + " FROM mutual_fund_rank", conn)
+        except Exception:
+            return pd.DataFrame(columns=cols)
+
+
+def save_fund_nav_history(code: str, df: pd.DataFrame):
+    """保存单只场外基金的历史净值序列 (date, unit_nav, day_chg)。"""
+    if df is None or df.empty:
+        return
+    code = str(code).zfill(6)
+    rows = [
+        (code, str(r.date)[:10], float(r.unit_nav), float(r.day_chg) if r.day_chg is not None and r.day_chg == r.day_chg else 0.0)
+        for r in df.itertuples(index=False)
+        if r.unit_nav is not None and r.unit_nav == r.unit_nav
+    ]
+    if not rows:
+        return
+    with get_conn() as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO fund_nav_history (code, date, unit_nav, day_chg) VALUES (?,?,?,?)",
+            rows,
+        )
+
+
+def load_fund_nav_history(code: str) -> pd.DataFrame:
+    """读取单只场外基金的历史净值序列，按 date 升序。"""
+    code = str(code).zfill(6)
+    with get_conn() as conn:
+        try:
+            return pd.read_sql(
+                "SELECT date, unit_nav, day_chg FROM fund_nav_history WHERE code = ? ORDER BY date ASC",
+                conn, params=(code,),
+            )
+        except Exception:
+            return pd.DataFrame(columns=["date", "unit_nav", "day_chg"])
 
 
 def cache_summary() -> dict:

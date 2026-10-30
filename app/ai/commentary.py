@@ -120,7 +120,7 @@ def get_fundamental_ondemand(code: str) -> dict:
     profit_yoy/debt_ratio/dividend_ratio/report_date 及 _source。
     实时拉取失败时降级 _source="none",不抛异常。
     """
-    _keys = ("pe_ttm", "pb", "ps_ttm", "total_mv", "roe", "gross_margin",
+    _keys = ("pe_ttm", "pb", "ps_ttm", "total_mv", "float_mv", "roe", "gross_margin",
              "net_margin", "rev_yoy", "profit_yoy", "debt_ratio",
              "dividend_ratio", "report_date")
     row = db.get_fundamental(code)
@@ -373,8 +373,9 @@ def build_facts(code: str) -> dict:
     # 筹码分布(成本结构):本地日线三角分布衰减模型,与通达信标准一致。
     # 定位为"辅助参考、说趋势不报精确值"(股本近似,禁 AI 编造精确套牢比例)。
     try:
+        _mv_for_chip = fund.get("float_mv") or fund.get("total_mv")
         _chip = chip.compute_chip_distribution(
-            df, total_mv=fund.get("total_mv"))
+            df, total_mv=_mv_for_chip)
     except Exception:  # noqa
         _chip = None
 

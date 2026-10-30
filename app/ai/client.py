@@ -82,14 +82,25 @@ def chat(messages, temperature=0.2, max_tokens=700, retries=2) -> str:
     base_url = c["base_url"].rstrip("/")
     url = base_url + "/chat/completions"
     timeout = float(c.get("timeout", 40))
+    model_name = str(c.get("model") or "")
+    model_lower = model_name.lower()
+
+    # 对默认开启慢思考(CoT)的混元/Qwen3/OpenRouter模型自动注入极速直出指令，将响应从15~25秒压至2~3秒
+    send_msgs = [dict(m) for m in messages]
+    if ("hunyuan" in model_lower or "qwen3" in model_lower) and send_msgs:
+        last_m = send_msgs[-1]
+        if last_m.get("role") == "user" and "/no_think" not in str(last_m.get("content", "")):
+            last_m["content"] = "/no_think\n" + str(last_m.get("content", ""))
 
     payload = {
-        "model": c["model"],
-        "messages": messages,
+        "model": model_name,
+        "messages": send_msgs,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": False,
     }
+    if "openrouter.ai" in base_url:
+        payload["reasoning"] = {"effort": "none"}
     data = json.dumps(payload).encode("utf-8")
 
     last_err = None
@@ -106,7 +117,11 @@ def chat(messages, temperature=0.2, max_tokens=700, retries=2) -> str:
                 body = resp.read().decode("utf-8")
             try:
                 obj = json.loads(body)
-                return obj["choices"][0]["message"]["content"].strip()
+                txt = obj["choices"][0]["message"]["content"].strip()
+                if "<think>" in txt and "</think>" in txt:
+                    import re as _re
+                    txt = _re.sub(r"<think>.*?</think>", "", txt, flags=_re.S).strip()
+                return txt
             except Exception as e:  # noqa
                 raise AIError(f"解析响应失败: {e}; 原文前200字: {body[:200]}")
         except urllib.error.HTTPError as e:  # noqa

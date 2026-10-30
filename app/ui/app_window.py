@@ -11,8 +11,10 @@ UI 层 - DearPyGui 主界面
 运行:  python main.py
 """
 import os
+import queue
 import threading
 import time as _time
+import traceback
 from datetime import datetime
 
 import pandas as pd
@@ -35,6 +37,32 @@ from app.ai import ranker as ai_ranker
 from app.ai import nl_query as ai_nl
 from app.strategy.base import ALL_STRATEGIES
 from app.report import exporter
+from app.ui import probability_desk
+
+# 后台线程只负责取数。DearPyGui 只能在主线程改控件，否则进程会直接退出且没有 Traceback。
+_UI_JOBS = queue.Queue()
+
+
+def _post_ui(fn):
+    _UI_JOBS.put(fn)
+
+
+def _drain_ui(sender=None, app_data=None, user_data=None):
+    for _ in range(64):
+        try:
+            fn = _UI_JOBS.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            fn()
+        except Exception:
+            traceback.print_exc()
+    try:
+        if dpg.does_item_exist("mkt_refresh_btn"):
+            STATE["active_is_market"] = bool(dpg.is_item_visible("mkt_refresh_btn"))
+    except Exception:
+        pass
+
 
 # A 股配色:涨=红 跌=绿
 RED = (220, 40, 40, 255)
@@ -101,16 +129,83 @@ STATE = {
     "mkt_drag_h0": 0.0,         # 拖拽起始时该块高度
 }
 
-# 行情页各可调高度区块的默认高度(px)。拖拽分隔条实时改写这里对应的 child_window。
-MKT_SECTION_HEIGHTS = {
-    "sec_activity": 150,   # 涨跌家数/情绪 + 盘面量能/情绪温度
-    "sec_dist": 235,       # 涨跌幅分布直方图(竖直柱状图)
-    "sec_diag": 240,       # 板块强弱·资金诊断(高潜力/高风险左右平行)
-    "sec_index": 240,      # 核心指数表
-    "sec_board": 300,      # 热门板块表
+# 全局各页面可上下拖拽区块的默认高度(px)。拖拽分隔条实时改写并自动保存到 ui_layout.json。
+DEFAULT_SECTION_HEIGHTS = {
+    # Tab 1: 今日作战台 & 涨跌概率
+    "prob_regime_box": 136,   # 第一层·市场环境闸门 HUD 看板
+    "prob_detail_box": 66,    # 选中个股四层诊断与执行计划卡片
+    # Tab 2: K线 & 个股诊断
+    "kline_hud_box": 74,      # K线页顶部券商级报价与四层量化抬头
+    "ai_comment_win": 180,    # K线页 AI 深度点评展开区
+    # Tab 3: 行情
+    "sec_verdict": 58,        # 盘面速读
+    "sec_activity": 150,      # 涨跌家数/情绪 + 盘面量能/情绪温度
+    "sec_dist": 235,          # 涨跌幅分布直方图(竖直柱状图)
+    "sec_diag": 240,          # 板块强弱·资金诊断
+    "sec_index": 240,         # 核心指数表
+    "sec_board": 300,         # 热门板块表
+    # Tab 4: 策略样本外评测室
+    "regime_oos_table": 100,  # 第一层市场闸门样本外表现表
+    "rank_table": 165,        # 第二层六大选股策略对比表
+    "oos_curve_box": 192,     # 第三层组合净值与回撤曲线图
+    "oos_yearly_table": 140,  # 分年度归因表
+    # Tab 5: 基金 & ETF 选基中心
+    "fund_detail_box": 355,   # 基金产品详情面板(Tab切换大尺寸收益率/净值走势 + 阶段涨幅与同类排名)
+    # Tab 6: 自选持仓 / 盯盘
+    "watch_ai_win": 220,      # 自选页 AI 点评面板
+    "watch_table": 260,       # 自选持仓监控表
+    "alert_fired": 75,        # 触发的价格预警栏
 }
-MKT_SECTION_MIN = 80       # 拖拽时单块最小高度
+MKT_SECTION_HEIGHTS = dict(DEFAULT_SECTION_HEIGHTS)
+MKT_SECTION_MIN = 45       # 拖拽时单块最小高度
 MKT_SECTION_MAX = 900      # 拖拽时单块最大高度
+
+
+def _ui_layout_path() -> str:
+    return os.path.join(os.path.dirname(os.path.dirname(db.DB_PATH)), "ui_layout.json")
+
+
+def _load_ui_layout():
+    """启动时从 ui_layout.json 读取用户上次拖拽保存的各区块高度。"""
+    p = _ui_layout_path()
+    if not os.path.exists(p):
+        return
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            for k, v in saved.items():
+                if k in MKT_SECTION_HEIGHTS and isinstance(v, (int, float)):
+                    MKT_SECTION_HEIGHTS[k] = max(MKT_SECTION_MIN, min(MKT_SECTION_MAX, int(v)))
+            if MKT_SECTION_HEIGHTS.get("fund_detail_box", 355) < 330:
+                MKT_SECTION_HEIGHTS["fund_detail_box"] = 355
+    except Exception:
+        pass
+
+
+def _save_ui_layout():
+    """松开鼠标或重置布局时，将当前所有区块高度持久化保存到 ui_layout.json。"""
+    try:
+        with open(_ui_layout_path(), "w", encoding="utf-8") as f:
+            json.dump(MKT_SECTION_HEIGHTS, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def on_reset_ui_layout(sender=None, app_data=None, user_data=None):
+    """一键恢复所有可拖拽区块的默认高度并保存。"""
+    for k, h_def in DEFAULT_SECTION_HEIGHTS.items():
+        MKT_SECTION_HEIGHTS[k] = int(h_def)
+        if dpg.does_item_exist(k):
+            try:
+                dpg.set_item_height(k, int(h_def))
+            except Exception:
+                pass
+    _save_ui_layout()
+    _set_status("已恢复默认界面分区高度")
+
+
+_load_ui_layout()
 
 # L1 横截面多因子(智能版)在策略下拉框里的特殊 key。它不走逐股 evaluate,
 # 而是独立的全市场横截面打分路径(见 app/strategy/cross_section),故用 sentinel 区分。
@@ -188,11 +283,21 @@ def _mkt_drag_move(sender=None, app_data=None, user_data=None):
     h = max(MKT_SECTION_MIN, min(MKT_SECTION_MAX, h))
     dpg.set_item_height(tag, int(h))
     MKT_SECTION_HEIGHTS[tag] = int(h)
+    if tag == "fund_detail_box":
+        ph = max(180, int(h) - 82)
+        for ptag in ("fund_plot_ret", "fund_plot_nav", "fund_stage_table"):
+            if dpg.does_item_exist(ptag):
+                try:
+                    dpg.set_item_height(ptag, ph)
+                except Exception:
+                    pass
 
 
 def _mkt_drag_end(sender=None, app_data=None, user_data=None):
-    """松开鼠标:退出拖拽态。"""
-    STATE["mkt_drag"] = None
+    """松开鼠标:退出拖拽态,并将新高度自动持久化写入 ui_layout.json。"""
+    if STATE.get("mkt_drag"):
+        STATE["mkt_drag"] = None
+        _save_ui_layout()
 
 
 def _add_mkt_section_handle(section_tag):
@@ -387,8 +492,21 @@ def _refresh_cache_info():
 
 
 def _refresh_market_state():
-    """刷新左侧"大盘状态"——多头(红)/弱势(绿),供择时参考。"""
+    """刷新左侧"市场环境闸门"状态。优先使用四层量化引擎的三态判定。"""
     try:
+        from app.strategy import cockpit as ck
+        st = ck.load_cockpit_state()
+        if st and st.get("today_regime"):
+            tr = st["today_regime"]
+            reg = tr.get("regime")
+            cn = tr.get("regime_cn") or reg
+            d = st.get("asof") or tr.get("date") or ""
+            dpg.set_value("market_info", f"环境: {cn}  {d}")
+            col = (70, 225, 130) if reg == ck.REGIME_BULL else (
+                (240, 80, 80) if reg == ck.REGIME_BEAR else (255, 200, 80)
+            )
+            dpg.configure_item("market_info", color=col)
+            return
         mt = MarketTrend("sh000001")
         if not mt.ready:
             dpg.set_value("market_info", "大盘: 指数未拉取")
@@ -407,63 +525,97 @@ def _refresh_market_state():
 
 def on_update_data():
     """后台线程:更新股票列表 + 增量拉取部分日线 + 大盘指数。"""
+    n_req = int(dpg.get_value("update_count"))
+    force_full = bool(dpg.get_value("force_full"))
+    want_funda = bool(dpg.get_value("fetch_funda"))
+    want_etf = bool(dpg.get_value("fetch_etf"))
+
     def worker():
         try:
-            _set_status("正在获取列表(含主流股排序,首次稍慢)...")
-            df = fetcher.update_stock_list()
+            if n_req <= 1500:
+                _post_ui(lambda: _set_status("正在确认沪深300和中证500成分(约十秒)..."))
+            else:
+                _post_ui(lambda: _set_status("使用本地名单，准备拉取日线..."))
+            df = fetcher.update_stock_list(sort_mainstream=n_req <= 1500)
             codes = df["code"].tolist()
-            n = min(int(dpg.get_value("update_count")), len(codes))
-            _set_status(f"共 {len(codes)} 只,准备拉取前 {n} 只(主流股优先)日线...")
+            n = min(n_req, len(codes))
+            _post_ui(lambda: _set_status(
+                f"共 {len(codes)} 只,准备拉取前 {n} 只(主流股优先)日线..."))
 
             # 强制全量重拉:覆盖本地历史(用于修正旧脏数据),否则增量只补最新
-            force_full = bool(dpg.get_value("force_full"))
             incr = not force_full
             mode_tip = "全量重拉(覆盖历史)" if force_full else "增量"
 
             def cb(done, total, code):
-                _set_status(f"[{mode_tip}]拉取日线 {done}/{n}  当前:{code}")
+                if done == total or done % 200 == 0:
+                    _post_ui(lambda d=done, c=code: _set_status(
+                        f"[{mode_tip}]网络拉取今日增量 {d}/{n}  当前:{c}"))
 
-            # 首次全量从 2021 年起,保证回测有 4 年+样本;已有数据则自动增量
-            # 腾讯源可并发,10 线程拉取,400 只约 3-5 分钟
+            # 首次全量从 2021 年起。每只的几段日线一起抓，同时最多 20 路。
             fetcher.update_all_kline(codes[:n], start_date="20210101",
-                                     incremental=incr, progress_cb=cb, workers=10)
+                                     incremental=incr, progress_cb=cb, workers=16)
             # 顺带更新大盘指数(用于大盘趋势过滤)
-            _set_status("拉取大盘指数(上证综指)...")
+            _post_ui(lambda: _set_status("拉取大盘指数(上证综指)..."))
             fetcher.update_index_kline("sh000001", start_date="20210101")
 
-            # 拉取行业分类(巨潮,串行,增量:只查还没行业的;已分类的秒跳过)
+            # 拉取行业分类(巨潮,串行,增量:当缺失超过80只或强制全量时才补齐,避免每天为几十只无分类新股耗时)
             cached = db.list_cached_codes()
             miss = db.codes_without_industry(cached)
-            if miss:
-                _set_status(f"拉取行业分类 0/{len(miss)}(仅补缺失,可稍候)...")
+            if miss and (len(miss) > 80 or not incr):
+                _post_ui(lambda m=len(miss): _set_status(
+                    f"拉取行业分类 0/{m}(仅补缺失,可稍候)..."))
                 fetcher.update_industry(
                     cached, incremental=True,
-                    progress_cb=lambda d, t, c: _set_status(
-                        f"拉取行业分类 {d}/{t}  当前:{c}"))
+                    progress_cb=lambda d, t, c: _post_ui(
+                        lambda dd=d, tt=t, cc=c: _set_status(
+                            f"拉取行业分类 {dd}/{tt}  当前:{cc}")))
             # 拉取基本面/估值(百度+巨潮,串行,增量:只补缺失的;可选)
-            if bool(dpg.get_value("fetch_funda")):
+            if want_funda:
                 miss_f = db.codes_without_fundamental(cached)
                 if miss_f:
-                    _set_status(f"拉取基本面 0/{len(miss_f)}(每只1-2s,可稍候)...")
+                    _post_ui(lambda m=len(miss_f): _set_status(
+                        f"拉取基本面 0/{m}(每只1-2s,可稍候)..."))
                     fetcher.update_fundamental(
                         cached, incremental=True,
-                        progress_cb=lambda d, t, c: _set_status(
-                            f"拉取基本面 {d}/{t}  当前:{c}"))
+                        progress_cb=lambda d, t, c: _post_ui(
+                            lambda dd=d, tt=t, cc=c: _set_status(
+                                f"拉取基本面 {dd}/{tt}  当前:{cc}")))
             # 拉取 ETF(列表+日线,可选):约50只主流宽基/行业ETF,串行,增量
-            if bool(dpg.get_value("fetch_etf")):
-                _set_status("拉取 ETF 列表(主流宽基+行业约50只)...")
+            if want_etf:
+                _post_ui(lambda: _set_status("拉取 ETF 列表(主流宽基+行业约50只)..."))
                 etf_df = fetcher.update_etf_list(only_mainstream=True)
-                _set_status(f"拉取 ETF 日线 0/{len(etf_df)}...")
+                _post_ui(lambda m=len(etf_df): _set_status(f"拉取 ETF 日线 0/{m}..."))
                 fetcher.update_all_etf_kline(
                     start_date="20210101", incremental=incr,
-                    progress_cb=lambda d, t, c: _set_status(
-                        f"[{mode_tip}]拉取 ETF 日线 {d}/{t}  当前:{c}"))
+                    progress_cb=lambda d, t, c: _post_ui(
+                        lambda dd=d, tt=t, cc=c: _set_status(
+                            f"[{mode_tip}]拉取 ETF 日线 {dd}/{tt}  当前:{cc}")))
+
+            # 同步全市场当日主力大单盘口资金流(约1秒)与解禁/业绩预告排雷日历(约2秒)
+            try:
+                _post_ui(lambda: _set_status("正在同步全市场主力大单资金流与解禁/业绩预告排雷日历..."))
+                fetcher.update_capital_flow_batch(codes[:n])
+                fetcher.update_risk_calendar()
+            except Exception as e:
+                print(f"[warn] 同步资金流/排雷日历异常: {e}")
+
+            # 增量日线落盘后，自动刷新今日三周期(10/60/120日)作战台概率与候选池
+            try:
+                from app.strategy import cockpit as ck
+                ck.refresh_latest_cockpit_fast(
+                    progress_cb=lambda msg: _post_ui(lambda m=msg: _set_status(m)),
+                )
+                _post_ui(probability_desk.refresh)
+                _post_ui(_load_cached_ranking)
+            except Exception as e:
+                print(f"[warn] 自动刷新作战台状态失败: {e}")
+
             cached = db.list_cached_codes()
-            _set_status(f"数据更新完成,已缓存 {len(cached)} 只")
-            _refresh_cache_info()
-            _refresh_market_state()
+            _post_ui(lambda m=len(cached): _set_status(f"增量更新与本地整合完成 · 已缓存 {m} 只"))
+            _post_ui(_refresh_cache_info)
+            _post_ui(_refresh_market_state)
         except Exception as e:
-            _set_status(f"更新失败: {e}")
+            _post_ui(lambda err=e: _set_status(f"更新失败: {err}"))
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -714,8 +866,9 @@ def on_open_adaptive_weights():
         # ---- ② 对比回测 ----
         dpg.add_text("② 拿历史验证:你现在的权重 vs 系统建议的权重,哪个选股更强",
                      color=(120, 220, 160))
-        dpg.add_text("下面数字是在近 5 年历史上模拟选股的表现(已剔除大盘涨跌因素);"
-                     "未扣手续费,只用来比较两套权重谁更强,不是保证能赚这么多。",
+        dpg.add_text("下面只使用训练窗：卖出日不晚于 2023-12-31。这是样本内对照，不是测试窗结论。",
+                     wrap=840, color=(130, 130, 130))
+        dpg.add_text("收益为次日开盘买入、到期开盘卖出；涨停开盘不买、跌停开盘不卖；费用按换手扣除佣金和印花税。",
                      wrap=840, color=(130, 130, 130))
         with dpg.table(tag="aw_cmp_table", header_row=True, resizable=True,
                        policy=dpg.mvTable_SizingStretchProp, height=150, scrollY=True):
@@ -752,6 +905,11 @@ def on_run_adaptive():
             if p is None or p.empty:
                 dpg.set_value("aw_status", "没有足够的历史数据,请先更新数据")
                 return
+            from app.strategy.protocol import train_slice
+            p = train_slice(p)
+            if p is None or p.empty:
+                dpg.set_value("aw_status", "训练窗内没有可用样本")
+                return
             dpg.set_value("aw_status", "计算各因子历史预测力,得出建议权重...")
             summ, _ = fic.compute_ic(fwd_days=fwd, panel=p)
             der = aw.derive_weights(fwd_days=fwd, t_threshold=tthr,
@@ -771,8 +929,8 @@ def on_run_adaptive():
                 dpg.configure_item("aw_apply_btn", enabled=True)
             dpg.set_value(
                 "aw_status",
-                f"完成:用了 {len(p):,} 条历史记录 · {p['code'].nunique()} 只股票 · "
-                f"{p['date'].min()}~{p['date'].max()}")
+                f"训练窗完成（不是测试窗）: {p['date'].min()}~{p['date'].max()} · "
+                f"{p['code'].nunique()} 只股票。测试窗见 validity_record.txt")
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -844,9 +1002,9 @@ def _render_adaptive(der, res_def, res_ada, default_w, adaptive_w, panel):
     # 结论行
     if res_ada is not None and s_def == s_def and s_ada == s_ada:
         better = s_ada > s_def
-        verdict = ("✓ 历史验证:系统建议的权重更强,可以采用(注意这只是这段历史的结论)。"
+        verdict = ("训练窗里建议权重的夏普更高。这是样本内对照，不是测试窗结论。"
                    if better else
-                   "✗ 历史验证:系统建议的没比你现在的强,建议先别改,或换个预测天数再试。")
+                   "训练窗里建议权重的夏普没有更高。这是样本内对照，不是测试窗结论。")
         dpg.set_value("aw_note", dpg.get_value("aw_note") + "\n\n【一句话结论】" + verdict)
 
 
@@ -888,8 +1046,8 @@ def on_open_factor_lab():
 
     with dpg.window(label="因子体检 (L2:IC + 分组回测)", tag="fl_window",
                     width=940, height=760, pos=(160, 50), modal=False):
-        dpg.add_text("拿近 5 年真实历史,检验\"动量/趋势/量能\"这几个选股指标过去到底管不管用,"
-                     "以及照这套打分选出来的票,是不是真能跑赢差的票。",
+        dpg.add_text("这里只看训练窗（卖出日不晚于 2023-12-31）。"
+                     "测试窗只在 validity_record.txt 里算一次，换上面的天数不会去看测试窗。",
                      wrap=900, color=(160, 200, 255))
         dpg.add_text(
             "只检验有完整历史走势的 3 个技术指标(动量/趋势/量能)。"
@@ -932,8 +1090,9 @@ def on_open_factor_lab():
         # ---- 分组回测 ----
         dpg.add_text("② 分档验证:把全市场按打分分成几档,看最强档能不能跑赢最弱档",
                      color=(120, 220, 160))
-        dpg.add_text("下面的\"最强档减最弱档\"已经剔除了大盘涨跌,只看纯选股能力:正=能选出好票,负=方向反了。"
-                     "未扣手续费,是能力体检、不是保证能赚这么多。", wrap=900, color=(130, 130, 130))
+        dpg.add_text("分档使用次日开盘到到期开盘的可成交收益，并按该档换手扣除佣金和印花税。"
+                     "涨停开盘不买、跌停开盘不卖。此表是训练窗，不是测试窗结论。",
+                     wrap=900, color=(130, 130, 130))
         with dpg.plot(tag="fl_nav_plot", height=200, width=-1, no_box_select=True):
             dpg.add_plot_legend()
             dpg.add_plot_axis(dpg.mvXAxis, label="第几次换仓", tag="fl_navx")
@@ -966,16 +1125,25 @@ def on_run_factor_lab():
             if p is None or p.empty:
                 dpg.set_value("fl_status", "没有足够的历史数据,请先更新数据")
                 return
+            from app.strategy.protocol import train_slice
+            p = train_slice(p)
+            if p is None or p.empty:
+                dpg.set_value("fl_status", "训练窗内没有可用样本")
+                return
             dpg.set_value("fl_status", "检验每个指标的历史预测力...")
             summ, series = fic.compute_ic(fwd_days=fwd, panel=p)
             dpg.set_value("fl_status", "分档模拟选股...")
             res = qbt.run_quantile_backtest(
                 weights=weights, fwd_days=fwd, n_groups=ngrp, panel=p)
             _render_factor_lab(summ, res, p)
+            extra = ""
+            if res.get("excess_t") == res.get("excess_t"):
+                extra = (f" · 训练窗强档相对等权超额 {res.get('excess_mean', float('nan'))*100:+.2f}%"
+                         f"（t={res.get('excess_t', float('nan')):+.2f}，不是测试窗）")
             dpg.set_value(
                 "fl_status",
-                f"体检完成:用了 {len(p):,} 条历史记录 · {p['code'].nunique()} 只股票 · "
-                f"{p['date'].min()}~{p['date'].max()} · 换仓 {res['periods']} 次")
+                f"训练窗体检完成: {p['date'].min()}~{p['date'].max()} · "
+                f"换仓 {res['periods']} 次{extra}。测试窗见 validity_record.txt")
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1192,7 +1360,7 @@ def on_run_optimize():
                 best = grid.iloc[0]
                 dpg.set_value(
                     "bt_status",
-                    f"调优完成 最优: 止盈{best['take_profit']*100:.0f}% "
+                    f"样本内排序第一(不是测试窗结论): 止盈{best['take_profit']*100:.0f}% "
                     f"止损{best['stop_loss']*100:.0f}% 持有{int(best['hold_days'])}天 "
                     f"总收益{best['total_return']:.0f}%")
             else:
@@ -1213,9 +1381,9 @@ def _render_optimize(name, grid):
         dpg.delete_item("opt_window")
     with dpg.window(label=f"卖出参数调优 - {name}", tag="opt_window",
                     width=680, height=480, pos=(260, 120), modal=False):
-        dpg.add_text("按总收益排序,取前若干组合。第一行即该策略在本样本上的最优卖出参数。",
+        dpg.add_text("按总收益排序。第一行只是这份历史样本里的第一名，不能写成测试窗结论。",
                      wrap=640, color=(160, 200, 255))
-        dpg.add_text("提示:参数是对历史样本的最优拟合,实盘请留出安全边际。",
+        dpg.add_text("提示:这是样本内网格。因子有效性检验不使用这里的结果。",
                      wrap=640, color=(200, 160, 120))
         dpg.add_separator()
         if grid is None or grid.empty:
@@ -1286,7 +1454,7 @@ def on_run_param_search():
                 parts = [f"{labels.get(k, k)}={_pfmt(best[k])}" for k in keys]
                 dpg.set_value(
                     "bt_status",
-                    "寻优完成 最优买入参数: " + ", ".join(parts) +
+                    "样本内排序第一(不是测试窗结论) 买入参数: " + ", ".join(parts) +
                     f" | 总收益{best['total_return']:.0f}%")
             else:
                 dpg.set_value("bt_status", "寻优完成:该策略无可调买入参数或无有效结果")
@@ -1317,9 +1485,9 @@ def _render_param_search(name, grid, keys):
         dpg.delete_item("psearch_window")
     with dpg.window(label=f"买入参数寻优 - {name}", tag="psearch_window",
                     width=720, height=480, pos=(240, 110), modal=False):
-        dpg.add_text("遍历该策略声明的关键买入参数组合,按总收益排序。第一行即样本上的最优买入参数。",
+        dpg.add_text("遍历该策略声明的关键买入参数组合,按总收益排序。第一行只是样本内第一名，不是测试窗结论。",
                      wrap=680, color=(160, 200, 255))
-        dpg.add_text("卖出参数固定为回测面板当前值,所以差异只来自买入信号。参数为历史最优拟合,实盘留安全边际。",
+        dpg.add_text("卖出参数固定为回测面板当前值。这张表是样本内拟合，因子检验不使用它。",
                      wrap=680, color=(200, 160, 120))
         dpg.add_separator()
         if grid is None or grid.empty:
@@ -1922,72 +2090,650 @@ def _add_watch_code(code, note="搜索添加"):
     _refresh_watchlist()
 
 
-# ---------- ETF 榜单 ----------
+# ---------- 基金 & ETF 条件选基中心 (场内ETF 1700+只 & 场外公募 20000+只) ----------
+FUND_CATEGORIES = [
+    "全部类别",
+    "宽基指数",
+    "红利/高股息",
+    "科技/AI/芯片",
+    "医药/医疗",
+    "大消费/食品",
+    "新能源/汽车",
+    "金融/地产",
+    "军工/制造/周期",
+    "跨境/海外",
+    "商品/黄金",
+    "债券/固收",
+    "混合/其他主题",
+]
+
+
+def _init_fund_center():
+    """启动时从本地数据库加载已缓存的场内 ETF 快照与场外公募基金表。"""
+    try:
+        etf_df = db.load_etf_snapshot()
+        if etf_df is not None and not etf_df.empty:
+            STATE["etf_spot"] = etf_df
+        mf_df = db.load_mutual_fund_rank()
+        if mf_df is not None and not mf_df.empty:
+            STATE["mutual_fund_df"] = mf_df
+        _render_etf()
+    except Exception:
+        pass
+
+
+def _switch_fund_mode(mode: str):
+    """切换 'etf'(场内ETF基金) 与 'mutual'(场外开放式公募基金)。"""
+    STATE["fund_mode"] = mode
+    is_etf = mode == "etf"
+    if dpg.does_item_exist("fund_mode_etf_btn"):
+        dpg.configure_item("fund_mode_etf_btn", label=f"{'● ' if is_etf else '○ '}场内 ETF 基金 (可盘中交易·双击看K线)")
+    if dpg.does_item_exist("fund_mode_mf_btn"):
+        dpg.configure_item("fund_mode_mf_btn", label=f"{'● ' if not is_etf else '○ '}场外公募基金 (20000+只多周期业绩筛选)")
+    if dpg.does_item_exist("fund_etf_filter_bar"):
+        dpg.configure_item("fund_etf_filter_bar", show=is_etf)
+    if dpg.does_item_exist("fund_mf_filter_bar"):
+        dpg.configure_item("fund_mf_filter_bar", show=not is_etf)
+    _render_etf()
+
+
 def on_refresh_etf():
-    """后台线程:拉取 ETF 实时快照并渲染榜单。"""
+    """后台线程:同步当前模式下的全市场场内 ETF 快照或场外公募基金排行。"""
+    mode = STATE.get("fund_mode", "etf")
+
     def worker():
-        dpg.configure_item("etf_run_btn", enabled=False)
-        dpg.set_value("etf_status", "正在拉取 ETF 实时行情...")
+        _post_ui(lambda: dpg.configure_item("etf_run_btn", enabled=False) if dpg.does_item_exist("etf_run_btn") else None)
         try:
-            df = fetcher.fetch_etf_spot(only_registered=True)
-            if df is None or df.empty:
-                dpg.set_value("etf_status",
-                              "未获取到 ETF 行情(请先在左侧勾选『同时拉取ETF』更新数据)")
-                STATE["etf_spot"] = None
+            if mode == "mutual":
+                df = fetcher.sync_mutual_fund_rank(
+                    progress_cb=lambda m: _post_ui(lambda msg=m: dpg.set_value("etf_status", msg) if dpg.does_item_exist("etf_status") else None)
+                )
+                STATE["mutual_fund_df"] = df
             else:
+                df = fetcher.sync_all_etf_universe_and_spot(
+                    progress_cb=lambda m: _post_ui(lambda msg=m: dpg.set_value("etf_status", msg) if dpg.does_item_exist("etf_status") else None)
+                )
                 STATE["etf_spot"] = df
-                stale = (df["price"].fillna(0) <= 0).all()
-                tip = " (盘前/休市:最新价可能为0)" if stale else ""
-                dpg.set_value("etf_status", f"已加载 {len(df)} 只 ETF{tip}")
-                _render_etf()
+            _post_ui(_render_etf)
         except Exception as e:
-            dpg.set_value("etf_status", f"刷新失败: {e}")
+            _post_ui(lambda err=e: dpg.set_value("etf_status", f"刷新失败: {err}") if dpg.does_item_exist("etf_status") else None)
         finally:
-            dpg.configure_item("etf_run_btn", enabled=True)
+            _post_ui(lambda: dpg.configure_item("etf_run_btn", enabled=True) if dpg.does_item_exist("etf_run_btn") else None)
 
     threading.Thread(target=worker, daemon=True).start()
 
 
-def _render_etf():
-    """渲染 ETF 榜单表(按下拉框选择的字段排序)。"""
-    df = STATE.get("etf_spot")
+def apply_fund_preset(preset: str):
+    """一键应用经典基金筛选方案。"""
+    mode = STATE.get("fund_mode", "etf")
+    STATE["fund_ai_df"] = None
+    if dpg.does_item_exist("fund_ai_summary_box"):
+        dpg.configure_item("fund_ai_summary_box", show=False)
+    if preset == "reset":
+        if dpg.does_item_exist("fund_cat_combo"):
+            dpg.set_value("fund_cat_combo", "全部类别")
+        if dpg.does_item_exist("fund_kw_in"):
+            dpg.set_value("fund_kw_in", "")
+        for tag, val in (
+            ("etf_min_scale", 0.0), ("etf_min_amt", 0.0), ("etf_max_prem", 99.0),
+            ("etf_min_r20", -99.0), ("etf_min_r60", -99.0),
+            ("mf_min_r3m", -99.0), ("mf_min_r1y", -99.0), ("mf_min_r3y", -99.0), ("mf_max_fee", 9.9),
+            ("mf_max_dd", 99.0), ("mf_min_scale", 0.0), ("mf_max_scale", 9999.0), ("mf_max_inst", 100.0),
+        ):
+            if dpg.does_item_exist(tag):
+                dpg.set_value(tag, val)
+    elif preset == "core_liquid" and mode == "etf":
+        # 百亿高流动性核心宽基/行业龙头 ETF
+        if dpg.does_item_exist("fund_cat_combo"):
+            dpg.set_value("fund_cat_combo", "全部类别")
+        dpg.set_value("etf_min_scale", 50.0)
+        dpg.set_value("etf_min_amt", 1.0)
+        dpg.set_value("etf_max_prem", 0.5)
+        dpg.set_value("etf_min_r20", -99.0)
+        dpg.set_value("etf_min_r60", -99.0)
+        dpg.set_value("etf_sort", "按基金规模")
+        STATE["etf_col_sort_key"] = "scale_yi"
+        STATE["etf_col_sort_asc"] = False
+    elif preset == "discount_arb" and mode == "etf":
+        # 折价低吸(现价低于IOPV净值、规模>=5亿、成交>=0.2亿)
+        dpg.set_value("etf_min_scale", 5.0)
+        dpg.set_value("etf_min_amt", 0.2)
+        dpg.set_value("etf_max_prem", -0.05)
+        dpg.set_value("etf_sort", "按折价率(低溢价优先)")
+        STATE["etf_col_sort_key"] = "discount_rate"
+        STATE["etf_col_sort_asc"] = True
+    elif preset == "div_lowvol" and mode == "etf":
+        if dpg.does_item_exist("fund_cat_combo"):
+            dpg.set_value("fund_cat_combo", "红利/高股息")
+        dpg.set_value("etf_min_scale", 5.0)
+        dpg.set_value("etf_min_amt", 0.1)
+        dpg.set_value("etf_max_prem", 1.0)
+    elif preset == "mf_3y_winner" and mode == "mutual":
+        # 穿越牛熊长跑冠军基：近3年>=15%，近1年>=10%，近3月>=0%，费率<=0.15%
+        dpg.set_value("mf_min_r3m", 0.0)
+        dpg.set_value("mf_min_r1y", 10.0)
+        dpg.set_value("mf_min_r3y", 15.0)
+        dpg.set_value("mf_max_fee", 0.15)
+        dpg.set_value("mf_sort", "按近1年收益")
+        STATE["mf_col_sort_key"] = "ret_1y"
+        STATE["mf_col_sort_asc"] = False
+    _render_etf()
+
+
+def on_run_fund_ai_screen():
+    """调用本地 AI 模型(config.json) + 二阶段并发核验执行自然语言选基。"""
+    q = (dpg.get_value("fund_ai_query_in") or "").strip() if dpg.does_item_exist("fund_ai_query_in") else ""
+    if not q:
+        q = "帮我选几个年化百分之3左右，最大回撤百分之二，基金规模10-50亿，机构占比不超过百分之八十的基金"
+        if dpg.does_item_exist("fund_ai_query_in"):
+            dpg.set_value("fund_ai_query_in", q)
+
+    if dpg.does_item_exist("fund_kw_in"):
+        dpg.set_value("fund_kw_in", "")
+    STATE["fund_ai_sort_touched"] = False
+    if dpg.does_item_exist("fund_ai_btn"):
+        dpg.configure_item("fund_ai_btn", enabled=False)
+    if dpg.does_item_exist("etf_status"):
+        dpg.set_value("etf_status", f"🤖 正在通过本地 AI 引擎筛选: {q} ...")
+
+    def worker():
+        try:
+            from app.ai import fund_screener
+
+            def _early_fund_render(ftype, spec, df_hit):
+                def _do_early():
+                    STATE["fund_mode"] = ftype
+                    if ftype == "mutual":
+                        STATE["mutual_fund_df"] = db.load_mutual_fund_rank()
+                    STATE["fund_ai_df"] = df_hit
+                    STATE["fund_ai_spec"] = spec
+                    if dpg.does_item_exist("fund_etf_filter_bar"):
+                        dpg.configure_item("fund_etf_filter_bar", show=(ftype == "etf"))
+                    if dpg.does_item_exist("fund_mf_filter_bar"):
+                        dpg.configure_item("fund_mf_filter_bar", show=(ftype == "mutual"))
+                    if dpg.does_item_exist("fund_ai_summary_box") and dpg.does_item_exist("fund_ai_summary_txt"):
+                        dpg.configure_item("fund_ai_summary_box", show=True)
+                        fnl = spec.get("funnel") or f"已筛出 {len(df_hit)} 只"
+                        dpg.set_value(
+                            "fund_ai_summary_txt",
+                            f"🤖 AI 选基条件: 【{spec.get('explain', '')}】 | 漏斗: {fnl}\n正在调用本地 AI 生成优选点评...",
+                        )
+                    _render_etf(use_ai_df=True)
+                _post_ui(_do_early)
+
+            res = fund_screener.run_ai_fund_screen(
+                q,
+                progress_cb=lambda msg: _post_ui(
+                    lambda m=msg: dpg.set_value("etf_status", m) if dpg.does_item_exist("etf_status") else None
+                ),
+                on_rows_ready=_early_fund_render,
+            )
+
+            def apply_ui():
+                if not res.get("ok"):
+                    if dpg.does_item_exist("etf_status"):
+                        dpg.set_value("etf_status", f"⚠️ {res.get('error')}")
+                    return
+                ftype = res.get("fund_type", "mutual")
+                spec = res.get("spec") or {}
+                STATE["fund_mode"] = ftype
+                if ftype == "mutual":
+                    STATE["mutual_fund_df"] = db.load_mutual_fund_rank()
+                STATE["fund_ai_df"] = res.get("df")
+                STATE["fund_ai_spec"] = spec
+                if dpg.does_item_exist("fund_etf_filter_bar"):
+                    dpg.configure_item("fund_etf_filter_bar", show=(ftype == "etf"))
+                if dpg.does_item_exist("fund_mf_filter_bar"):
+                    dpg.configure_item("fund_mf_filter_bar", show=(ftype == "mutual"))
+                if dpg.does_item_exist("fund_ai_summary_box") and dpg.does_item_exist("fund_ai_summary_txt"):
+                    dpg.configure_item("fund_ai_summary_box", show=True)
+                    fnl = spec.get("funnel") or ""
+                    dpg.set_value(
+                        "fund_ai_summary_txt",
+                        f"🤖 AI 选基条件: 【{spec.get('explain', '')}】 | 漏斗: {fnl}\n{res.get('ai_summary', '')}",
+                    )
+                _render_etf(use_ai_df=True)
+
+            _post_ui(apply_ui)
+        except Exception as e:
+            _post_ui(
+                lambda err=e: dpg.set_value("etf_status", f"AI 选基出错: {err}")
+                if dpg.does_item_exist("etf_status") else None
+            )
+        finally:
+            _post_ui(
+                lambda: dpg.configure_item("fund_ai_btn", enabled=True)
+                if dpg.does_item_exist("fund_ai_btn") else None
+            )
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+_MF_COL_SPECS = (
+    ("基金代码", "code"),
+    ("基金简称", None),
+    ("赛道分类", None),
+    ("单位净值", "unit_nav"),
+    ("近1年%", "ret_1y"),
+    ("近3年%", "ret_3y"),
+    ("近1年回撤%", "max_dd_1y"),
+    ("成立回撤%", "max_dd_all"),
+    ("夏普1Y", "sharpe_1y"),
+    ("规模(亿)", "scale_yi"),
+    ("机构占比%", "inst_ratio"),
+    ("成立/经理", "establish_years"),
+    ("手续费%", "fee_pct"),
+    ("操作", None),
+)
+
+_ETF_COL_SPECS = (
+    ("代码", "code"),
+    ("ETF名称", None),
+    ("赛道分类", None),
+    ("现价", "price"),
+    ("今日涨跌%", "chg_pct"),
+    ("IOPV净值", "iopv"),
+    ("溢价率%", "discount_rate"),
+    ("规模(亿)", "scale_yi"),
+    ("成交额(亿)", "amount_yi"),
+    ("换手率%", "turnover"),
+    ("近20日%", "ret_20d"),
+    ("近60日%", "ret_60d"),
+    ("近1年%", "ret_250d"),
+    ("操作", None),
+)
+
+
+def _sync_sortable_table_cols(
+    table_tag: str,
+    schema_id: str,
+    col_specs: tuple,
+    active_key: str | None,
+    active_asc: bool,
+):
+    """通用可排序表格表头同步器：保留表头(slot 0)、仅清空数据行(slot 1)、高亮当前排序列并标注 ★ ▼/▲。"""
+    if not dpg.does_item_exist(table_tag):
+        return
+    schema_map = STATE.setdefault("_tbl_schemas", {})
+    skip_map = STATE.setdefault("_tbl_skip_auto_sort", {})
+    cols_0 = dpg.get_item_children(table_tag, 0) or []
+    if schema_map.get(table_tag) != schema_id or len(cols_0) != len(col_specs):
+        skip_map[table_tag] = True
+        dpg.delete_item(table_tag, children_only=True)
+        for idx, (lbl, s_key) in enumerate(col_specs):
+            if s_key is None:
+                dpg.add_table_column(
+                    label=lbl, parent=table_tag,
+                    no_sort=True, user_data=(idx, lbl, None),
+                )
+            else:
+                dpg.add_table_column(
+                    label=lbl, parent=table_tag,
+                    no_sort=False, prefer_sort_descending=True, prefer_sort_ascending=False,
+                    user_data=(idx, lbl, s_key),
+                )
+        schema_map[table_tag] = schema_id
+        cols_0 = dpg.get_item_children(table_tag, 0) or []
+    else:
+        for r_id in dpg.get_item_children(table_tag, 1) or []:
+            dpg.delete_item(r_id)
+
+    for col_id in cols_0:
+        ud = dpg.get_item_user_data(col_id)
+        if not ud:
+            continue
+        idx, base_lbl, s_key = ud
+        if active_key and s_key and s_key == active_key:
+            arrow = "▲" if active_asc else "▼"
+            dpg.configure_item(col_id, label=f"★ {base_lbl} {arrow}")
+            try:
+                dpg.highlight_table_column(table_tag, idx, (42, 82, 145, 70))
+            except Exception:
+                pass
+        else:
+            dpg.configure_item(col_id, label=base_lbl)
+            try:
+                dpg.unhighlight_table_column(table_tag, idx)
+            except Exception:
+                pass
+
+
+def _on_etf_table_sort(sender, app_data):
+    """点击基金/ETF表格表头列时触发：可量化列按该列排序并高亮，再点一次反向排序；非量化列无反应。"""
+    skip_map = STATE.setdefault("_tbl_skip_auto_sort", {})
+    if skip_map.pop(sender, False):
+        return
+    if not app_data:
+        return
+    col_id = app_data[0][0]
+    if not dpg.does_item_exist(col_id):
+        return
+    ud = dpg.get_item_user_data(col_id)
+    if not ud or not ud[2]:
+        return
+    _, _, s_key = ud
+    mode = STATE.get("fund_mode", "etf")
+    STATE["fund_ai_sort_touched"] = True
+    if mode == "mutual":
+        cur_k = STATE.get("mf_col_sort_key", "ret_1y")
+        cur_asc = bool(STATE.get("mf_col_sort_asc", False))
+        if cur_k == s_key:
+            STATE["mf_col_sort_asc"] = not cur_asc
+        else:
+            STATE["mf_col_sort_key"] = s_key
+            STATE["mf_col_sort_asc"] = s_key in ("code", "max_dd_1y", "max_dd_all", "fee_pct")
+    else:
+        cur_k = STATE.get("etf_col_sort_key", "amount_yi")
+        cur_asc = bool(STATE.get("etf_col_sort_asc", False))
+        if cur_k == s_key:
+            STATE["etf_col_sort_asc"] = not cur_asc
+        else:
+            STATE["etf_col_sort_key"] = s_key
+            STATE["etf_col_sort_asc"] = s_key in ("code", "discount_rate")
+    use_ai = bool(STATE.get("fund_ai_df") is not None and not STATE["fund_ai_df"].empty)
+    _render_etf(use_ai_df=use_ai)
+
+
+def _on_mf_sort_combo(sender, app_data):
+    scol = {
+        "按近1年收益": "ret_1y",
+        "按近3年收益": "ret_3y",
+        "按近3月收益": "ret_3m",
+        "按近1月收益": "ret_1m",
+        "按今年来收益": "ret_ytd",
+        "按日增长率": "day_chg",
+        "按近1年回撤(低优先)": "max_dd_1y",
+        "按基金规模": "scale_yi",
+    }.get(app_data, "ret_1y")
+    STATE["mf_col_sort_key"] = scol
+    STATE["mf_col_sort_asc"] = (scol == "max_dd_1y")
+    STATE["fund_ai_sort_touched"] = True
+    use_ai = bool(STATE.get("fund_ai_df") is not None and not STATE["fund_ai_df"].empty)
+    _render_etf(use_ai_df=use_ai)
+
+
+def _on_etf_sort_combo(sender, app_data):
+    if app_data == "按折价率(低溢价优先)":
+        STATE["etf_col_sort_key"] = "discount_rate"
+        STATE["etf_col_sort_asc"] = True
+    else:
+        scol = {
+            "按成交额": "amount_yi",
+            "按基金规模": "scale_yi",
+            "按今日涨跌": "chg_pct",
+            "按换手率": "turnover",
+            "按近20日涨幅": "ret_20d",
+            "按近60日涨幅": "ret_60d",
+            "按近1年涨幅": "ret_250d",
+        }.get(app_data, "amount_yi")
+        STATE["etf_col_sort_key"] = scol
+        STATE["etf_col_sort_asc"] = False
+    STATE["fund_ai_sort_touched"] = True
+    use_ai = bool(STATE.get("fund_ai_df") is not None and not STATE["fund_ai_df"].empty)
+    _render_etf(use_ai_df=use_ai)
+
+
+def _render_etf(use_ai_df: bool = False):
+    """根据当前模式与多维筛选条件渲染场内 ETF 表或场外公募基金表(支持点击表头列排序、高亮与反向排序)。"""
     if not dpg.does_item_exist("etf_table"):
         return
-    for ch in dpg.get_item_children("etf_table", 1) or []:
-        dpg.delete_item(ch)
-    if df is None or df.empty:
-        return
-    sort_by = dpg.get_value("etf_sort") if dpg.does_item_exist("etf_sort") else "按涨跌幅"
-    col = {"按涨跌幅": "chg_pct", "按成交额": "amount", "按最新价": "price"}.get(
-        sort_by, "chg_pct")
-    d = df.copy()
-    if col in d.columns:
-        d = d.sort_values(col, ascending=False, na_position="last").reset_index(drop=True)
-    for r in d.itertuples(index=False):
-        code = r.code
-        name = getattr(r, "name", "")
-        price = getattr(r, "price", None)
-        chg = getattr(r, "chg_pct", None)
-        with dpg.table_row(parent="etf_table"):
-            _sel = dpg.add_selectable(label=code, span_columns=True, user_data=code,
-                                      callback=_on_code_click)   # 双击代码 → 跳K线页
-            dpg.bind_item_theme(_sel, "row_hover")
-            dpg.add_text(str(name))
-            dpg.add_text(f"{price:.3f}" if price and price > 0 else "-")
-            if chg is not None and not pd.isna(chg):
-                dpg.add_text(f"{chg:+.2f}",
-                             color=RED if chg > 0 else (GREEN if chg < 0 else (150, 150, 150)))
+    mode = STATE.get("fund_mode", "etf")
+
+    cat_sel = dpg.get_value("fund_cat_combo") if dpg.does_item_exist("fund_cat_combo") else "全部类别"
+    kw = (dpg.get_value("fund_kw_in") or "").strip() if dpg.does_item_exist("fund_kw_in") else ""
+
+    if mode == "mutual":
+        scol = STATE.get("mf_col_sort_key", "ret_1y")
+        sasc = bool(STATE.get("mf_col_sort_asc", False))
+        show_hl = (not use_ai_df) or bool(STATE.get("fund_ai_sort_touched"))
+        _sync_sortable_table_cols("etf_table", "fund_mutual", _MF_COL_SPECS, scol if show_hl else None, sasc)
+
+        df = STATE.get("mutual_fund_df")
+        if df is None or df.empty:
+            df = db.load_mutual_fund_rank()
+            STATE["mutual_fund_df"] = df
+        if df is None or df.empty:
+            if dpg.does_item_exist("etf_status"):
+                dpg.set_value("etf_status", "本地尚无场外公募数据，请点『⚡ 同步最新基金数据』")
+            return
+        total_n = len(df)
+        if use_ai_df and STATE.get("fund_ai_df") is not None and not STATE["fund_ai_df"].empty:
+            d = STATE["fund_ai_df"].copy()
+            spec = STATE.get("fund_ai_spec") or {}
+            fnl = spec.get("funnel") or f"命中 {len(d)} 只"
+            if kw:
+                d_kw = d[d["code"].astype(str).str.contains(kw) | d["name"].astype(str).str.contains(kw, case=False)]
+                if not d_kw.empty:
+                    d = d_kw
+                    fnl = f"{fnl} (搜索 '{kw}' 命中 {len(d)} 只)"
+                else:
+                    d = df[df["code"].astype(str).str.contains(kw) | df["name"].astype(str).str.contains(kw, case=False)].copy()
+                    fnl = f"'{kw}' 未在当前AI严选池内，已为您在全库检索到 {len(d)} 只"
+            if STATE.get("fund_ai_sort_touched") and scol in d.columns:
+                if scol == "code":
+                    d = d.sort_values("code", ascending=sasc, na_position="last").reset_index(drop=True)
+                else:
+                    d["_sort_tmp"] = pd.to_numeric(d[scol], errors="coerce")
+                    d = d.sort_values("_sort_tmp", ascending=sasc, na_position="last").drop(columns=["_sort_tmp"]).reset_index(drop=True)
+            if dpg.does_item_exist("etf_status"):
+                dpg.set_value("etf_status", f"🤖 {fnl} · 条件: {spec.get('explain', '')}")
+        else:
+            d = df.copy()
+            if cat_sel and cat_sel != "全部类别":
+                d = d[d["category"] == cat_sel]
+            if kw:
+                d = d[d["code"].astype(str).str.contains(kw) | d["name"].astype(str).str.contains(kw, case=False)]
+            min_r3m = float(dpg.get_value("mf_min_r3m") or -99.0) if dpg.does_item_exist("mf_min_r3m") else -99.0
+            min_r1y = float(dpg.get_value("mf_min_r1y") or -99.0) if dpg.does_item_exist("mf_min_r1y") else -99.0
+            min_r3y = float(dpg.get_value("mf_min_r3y") or -99.0) if dpg.does_item_exist("mf_min_r3y") else -99.0
+            max_fee = float(dpg.get_value("mf_max_fee") or 9.9) if dpg.does_item_exist("mf_max_fee") else 9.9
+            if min_r3m > -90:
+                d = d[pd.to_numeric(d["ret_3m"], errors="coerce") >= min_r3m]
+            if min_r1y > -90:
+                d = d[pd.to_numeric(d["ret_1y"], errors="coerce") >= min_r1y]
+            if min_r3y > -90:
+                d = d[pd.to_numeric(d["ret_3y"], errors="coerce") >= min_r3y]
+            if max_fee < 9.0:
+                d = d[pd.to_numeric(d["fee_pct"], errors="coerce").fillna(0.15) <= max_fee]
+
+            if scol in d.columns:
+                if scol == "code":
+                    d = d.sort_values("code", ascending=sasc, na_position="last")
+                else:
+                    d["_sort_tmp"] = pd.to_numeric(d[scol], errors="coerce")
+                    d = d.sort_values("_sort_tmp", ascending=sasc, na_position="last").drop(columns=["_sort_tmp"])
+            hit_n = len(d)
+            d = d.head(250).reset_index(drop=True)
+            if dpg.does_item_exist("etf_status"):
+                dpg.set_value("etf_status", f"场外公募库共 {total_n} 只 · 当前筛选命中 {hit_n} 只 (显示前 {len(d)} 只)")
+
+        def _ret_cell(v):
+            if v is None or pd.isna(v):
+                dpg.add_text("—", color=(130, 130, 130))
             else:
-                dpg.add_text("-", color=(150, 150, 150))
-            dpg.add_text(f"{getattr(r, 'open', 0) or 0:.3f}")
-            dpg.add_text(f"{getattr(r, 'high', 0) or 0:.3f}")
-            dpg.add_text(f"{getattr(r, 'low', 0) or 0:.3f}")
-            amt = getattr(r, "amount", None)
-            dpg.add_text(_fmt_amount(amt) if amt else "-")
-            cur = float(price) if price and price > 0 else 0.0
-            dpg.add_button(label="+自选", small=True,
-                           callback=lambda s, a, u: _add_watch_from(u),
-                           user_data=(code, name, cur, "ETF榜单"))
+                fv = float(v)
+                dpg.add_text(f"{fv:+.2f}%", color=RED if fv > 0 else (GREEN if fv < 0 else (180, 180, 180)))
+
+        for r in d.itertuples(index=False):
+            code = str(r.code).zfill(6)
+            nm = str(r.name or "")
+            unav = r.unit_nav
+            dd1y = getattr(r, "max_dd_1y", None)
+            ddall = getattr(r, "max_dd_all", None)
+            shp1y = getattr(r, "sharpe_1y", None)
+            sc_yi = getattr(r, "scale_yi", None)
+            inst_r = getattr(r, "inst_ratio", None)
+            est_y = getattr(r, "establish_years", None)
+            mgr_nm = getattr(r, "manager_name", None)
+            mgr_y = getattr(r, "manager_years", None)
+            with dpg.table_row(parent="etf_table"):
+                _sel = dpg.add_selectable(
+                    label=code, span_columns=False, user_data=(code, "mutual"),
+                    callback=_on_fund_row_click,
+                )
+                dpg.bind_item_theme(_sel, "row_hover")
+                _sel_nm = dpg.add_selectable(
+                    label=nm[:14], span_columns=False, user_data=(code, "mutual"),
+                    callback=_on_fund_row_click,
+                )
+                dpg.bind_item_theme(_sel_nm, "row_hover")
+                dpg.add_text(str(r.category or ""), color=(180, 195, 215))
+                dpg.add_text(f"{float(unav):.4f}" if (unav is not None and not pd.isna(unav)) else "—")
+                _ret_cell(r.ret_1y)
+                _ret_cell(r.ret_3y)
+                dpg.add_text(
+                    f"-{float(dd1y):.2f}%" if (dd1y is not None and not pd.isna(dd1y)) else "—",
+                    color=(90, 215, 145) if (dd1y is not None and not pd.isna(dd1y) and float(dd1y) <= 2.5) else (210, 210, 210),
+                )
+                dpg.add_text(
+                    f"-{float(ddall):.2f}%" if (ddall is not None and not pd.isna(ddall)) else "—",
+                    color=(175, 185, 200),
+                )
+                dpg.add_text(
+                    f"{float(shp1y):.2f}" if (shp1y is not None and not pd.isna(shp1y)) else "—",
+                    color=(255, 215, 110) if (shp1y is not None and not pd.isna(shp1y) and float(shp1y) >= 1.2) else (195, 195, 195),
+                )
+                dpg.add_text(
+                    f"{float(sc_yi):.2f}" if (sc_yi is not None and not pd.isna(sc_yi)) else "—",
+                    color=(245, 210, 120) if (sc_yi is not None and not pd.isna(sc_yi) and float(sc_yi) >= 10) else (200, 200, 200),
+                )
+                dpg.add_text(
+                    f"{float(inst_r):.1f}%" if (inst_r is not None and not pd.isna(inst_r)) else "—",
+                    color=(150, 215, 255) if (inst_r is not None and not pd.isna(inst_r)) else (130, 130, 130),
+                )
+                if est_y is not None and not pd.isna(est_y):
+                    m_txt = f"{float(est_y):.1f}年/{str(mgr_nm or '')[:3]}" if (mgr_nm and not pd.isna(mgr_nm)) else f"{float(est_y):.1f}年"
+                else:
+                    m_txt = "—"
+                dpg.add_text(m_txt, color=(185, 205, 190))
+                fee = r.fee_pct
+                dpg.add_text(f"{float(fee):.2f}%" if (fee is not None and not pd.isna(fee)) else "—")
+                note = f"[公募] {r.category} 近1年{r.ret_1y}% 回撤{dd1y or '-'}% 规模{sc_yi or '-'}亿"
+                dpg.add_button(
+                    label="+自选", width=50,
+                    callback=lambda s, a, u: _add_watch_from(u),
+                    user_data=(code, nm, float(unav or 0.0), note),
+                )
+        return
+
+    # ---- 场内 ETF 模式 ----
+    scol = STATE.get("etf_col_sort_key", "amount_yi")
+    sasc = bool(STATE.get("etf_col_sort_asc", False))
+    show_hl = (not use_ai_df) or bool(STATE.get("fund_ai_sort_touched"))
+    _sync_sortable_table_cols("etf_table", "fund_etf", _ETF_COL_SPECS, scol if show_hl else None, sasc)
+
+    df = STATE.get("etf_spot")
+    if df is None or df.empty or "scale_yi" not in df.columns:
+        df = db.load_etf_snapshot()
+        STATE["etf_spot"] = df
+    if df is None or df.empty:
+        if dpg.does_item_exist("etf_status"):
+            dpg.set_value("etf_status", "本地尚无全市场 ETF 快照，请点『⚡ 同步最新基金数据』")
+        return
+
+    total_n = len(df)
+    if use_ai_df and STATE.get("fund_ai_df") is not None and not STATE["fund_ai_df"].empty:
+        d = STATE["fund_ai_df"].copy()
+        spec = STATE.get("fund_ai_spec") or {}
+        fnl = spec.get("funnel") or f"命中 {len(d)} 只"
+        if kw:
+            d = d[d["code"].astype(str).str.contains(kw) | d["name"].astype(str).str.contains(kw, case=False)]
+        if STATE.get("fund_ai_sort_touched") and scol in d.columns:
+            if scol == "code":
+                d = d.sort_values("code", ascending=sasc, na_position="last").reset_index(drop=True)
+            else:
+                d["_sort_tmp"] = pd.to_numeric(d[scol], errors="coerce")
+                d = d.sort_values("_sort_tmp", ascending=sasc, na_position="last").drop(columns=["_sort_tmp"]).reset_index(drop=True)
+        if dpg.does_item_exist("etf_status"):
+            dpg.set_value("etf_status", f"🤖 {fnl} · 条件: {spec.get('explain', '')}")
+    else:
+        d = df.copy()
+        if cat_sel and cat_sel != "全部类别":
+            d = d[d["category"] == cat_sel]
+        if kw:
+            d = d[d["code"].astype(str).str.contains(kw) | d["name"].astype(str).str.contains(kw, case=False)]
+
+        min_scale = float(dpg.get_value("etf_min_scale") or 0.0) if dpg.does_item_exist("etf_min_scale") else 0.0
+        min_amt = float(dpg.get_value("etf_min_amt") or 0.0) if dpg.does_item_exist("etf_min_amt") else 0.0
+        max_prem = float(dpg.get_value("etf_max_prem") or 99.0) if dpg.does_item_exist("etf_max_prem") else 99.0
+        min_r20 = float(dpg.get_value("etf_min_r20") or -99.0) if dpg.does_item_exist("etf_min_r20") else -99.0
+        min_r60 = float(dpg.get_value("etf_min_r60") or -99.0) if dpg.does_item_exist("etf_min_r60") else -99.0
+
+        if min_scale > 0:
+            d = d[pd.to_numeric(d["scale_yi"], errors="coerce").fillna(0) >= min_scale]
+        if min_amt > 0:
+            d = d[pd.to_numeric(d["amount_yi"], errors="coerce").fillna(0) >= min_amt]
+        if max_prem < 90:
+            d = d[pd.to_numeric(d["discount_rate"], errors="coerce").fillna(0) <= max_prem]
+        if min_r20 > -90:
+            d = d[pd.to_numeric(d["ret_20d"], errors="coerce").fillna(-999) >= min_r20]
+        if min_r60 > -90:
+            d = d[pd.to_numeric(d["ret_60d"], errors="coerce").fillna(-999) >= min_r60]
+
+        if scol in d.columns:
+            if scol == "code":
+                d = d.sort_values("code", ascending=sasc, na_position="last")
+            else:
+                d["_sort_tmp"] = pd.to_numeric(d[scol], errors="coerce")
+                d = d.sort_values("_sort_tmp", ascending=sasc, na_position="last").drop(columns=["_sort_tmp"])
+
+        hit_n = len(d)
+        d = d.head(250).reset_index(drop=True)
+        if dpg.does_item_exist("etf_status"):
+            dpg.set_value("etf_status", f"场内 ETF 共 {total_n} 只 · 当前筛选命中 {hit_n} 只 (双击代码直接打开 ETF K线)")
+
+    def _pct_cell(v):
+        if v is None or pd.isna(v):
+            dpg.add_text("—", color=(130, 130, 130))
+        else:
+            fv = float(v)
+            dpg.add_text(f"{fv:+.2f}%", color=RED if fv > 0 else (GREEN if fv < 0 else (185, 185, 185)))
+
+    for r in d.itertuples(index=False):
+        code = str(r.code).zfill(6)
+        nm = str(r.name or "")
+        price = r.price
+        chg = r.chg_pct
+        iopv = r.iopv
+        prem = r.discount_rate
+        scale = r.scale_yi
+        amt = r.amount_yi
+        turn = r.turnover
+        with dpg.table_row(parent="etf_table"):
+            _sel = dpg.add_selectable(
+                label=code, span_columns=False, user_data=(code, "etf"),
+                callback=_on_fund_row_click,
+            )
+            dpg.bind_item_theme(_sel, "row_hover")
+            _sel_nm = dpg.add_selectable(
+                label=nm[:12], span_columns=False, user_data=(code, "etf"),
+                callback=_on_fund_row_click,
+            )
+            dpg.bind_item_theme(_sel_nm, "row_hover")
+            dpg.add_text(str(r.category or ""), color=(165, 200, 235))
+            dpg.add_text(f"{float(price):.3f}" if (price is not None and not pd.isna(price) and price > 0) else "—")
+            _pct_cell(chg)
+            dpg.add_text(f"{float(iopv):.3f}" if (iopv is not None and not pd.isna(iopv) and iopv > 0) else "—")
+            if prem is not None and not pd.isna(prem):
+                pf_v = float(prem)
+                # 负数为折价(买便宜标绿)，正数>1%为高溢价(标红警示)
+                p_col = (60, 210, 120) if pf_v < 0 else ((240, 80, 80) if pf_v >= 1.0 else (200, 200, 200))
+                dpg.add_text(f"{pf_v:+.2f}%", color=p_col)
+            else:
+                dpg.add_text("—", color=(130, 130, 130))
+            dpg.add_text(f"{float(scale):.1f}" if (scale is not None and not pd.isna(scale) and scale > 0) else "—")
+            dpg.add_text(f"{float(amt):.2f}" if (amt is not None and not pd.isna(amt)) else "—")
+            dpg.add_text(f"{float(turn):.2f}%" if (turn is not None and not pd.isna(turn)) else "—")
+            _pct_cell(r.ret_20d)
+            _pct_cell(r.ret_60d)
+            _pct_cell(r.ret_250d)
+            cur = float(price) if (price is not None and not pd.isna(price) and price > 0) else 0.0
+            note = f"[ETF·{r.category}] 规模{scale or 0:.1f}亿 溢价率{prem or 0:+.2f}%"
+            dpg.add_button(
+                label="+自选", width=50,
+                callback=lambda s, a, u: _add_watch_from(u),
+                user_data=(code, nm, cur, note),
+            )
 
 
 def _fmt_amount(v):
@@ -2003,209 +2749,1295 @@ def _fmt_amount(v):
     return f"{v:.0f}"
 
 
-# ---------- 今日推荐 / 策略排行榜 ----------
+def _on_fund_row_click(sender, app_data, user_data):
+    """
+    基金表行点击回调：
+      - 单击任意基金（场外公募或场内ETF）：立即在上方展开/刷新「基金产品详情面板」(业绩走势+净值曲线+阶段涨幅与同类排名)；
+      - 双击场内 ETF：直接跳转到「K线 & 个股诊断」页查看日/周/月/分时 K 线与筹码峰。
+    """
+    if isinstance(user_data, (tuple, list)):
+        code, ftype = user_data[0], user_data[1]
+    else:
+        code, ftype = str(user_data), STATE.get("fund_mode", "etf")
+    code = str(code).zfill(6)
+    _show_fund_detail(code, ftype)
+
+    now = _time.monotonic()
+    last_c = STATE.get("_last_fund_click_code")
+    last_t = STATE.get("_last_fund_click_ts", 0.0)
+    STATE["_last_fund_click_code"] = code
+    STATE["_last_fund_click_ts"] = now
+    if code == last_c and (now - last_t) <= 0.40 and ftype == "etf":
+        STATE["_last_fund_click_ts"] = 0.0
+        _on_pick_code(code)
+
+
+def _switch_fund_detail_period(period_key: str):
+    """切换基金详情走势图的时间跨度: '1M'|'3M'|'6M'|'1Y'|'3Y'|'ALL'。
+    若当前基金净值已缓存，直接在主线程 0 毫秒原地更新曲线与坐标轴，不删建控件、不闪屏、不丢焦点。"""
+    STATE["fund_detail_period"] = period_key
+    cur_c = STATE.get("cur_fund_code")
+    cur_t = STATE.get("cur_fund_type", "mutual")
+    if not cur_c:
+        return
+    if (
+        STATE.get("_cur_fund_nav_code") == cur_c
+        and STATE.get("_cur_fund_nav_df") is not None
+        and not STATE["_cur_fund_nav_df"].empty
+        and dpg.does_item_exist("fund_plot_ret")
+    ):
+        _apply_fund_detail_period_inplace(period_key)
+    else:
+        _show_fund_detail(cur_c, cur_t, use_cached_nav=True)
+
+
+def _compute_fund_period_slice(ndf: pd.DataFrame, idf: pd.DataFrame | None, cat: str, period_key: str) -> dict:
+    """根据完整历史净值表 ndf 与所选周期 period_key，计算区间曲线、日期刻度、坐标上下界与回撤指标。"""
+    import numpy as np
+    from datetime import timedelta
+
+    all_dates = ndf["date"].astype(str).to_numpy()
+    all_unavs = pd.to_numeric(ndf["unit_nav"], errors="coerce").to_numpy(dtype=float)
+    if "day_chg" in ndf.columns and ndf["day_chg"].notna().any():
+        all_drets = pd.to_numeric(ndf["day_chg"], errors="coerce").fillna(0.0).to_numpy(dtype=float) / 100.0
+        all_drets[0] = 0.0
+        all_adj = np.cumprod(1.0 + all_drets)
+    else:
+        all_adj = all_unavs / max(1e-6, float(all_unavs[0]))
+
+    all_peaks = np.maximum.accumulate(all_adj)
+    all_dd = (all_adj - all_peaks) / np.where(all_peaks > 0, all_peaks, 1.0) * 100.0
+    mdd_idx_all = int(np.argmin(all_dd)) if len(all_dd) else 0
+    since_max_dd = abs(float(all_dd[mdd_idx_all])) if len(all_dd) else 0.0
+    rec_days_str = "未修复"
+    if len(all_adj) > mdd_idx_all:
+        pk_val = all_peaks[mdd_idx_all]
+        rec_cands = np.where(all_adj[mdd_idx_all:] >= pk_val)[0]
+        if len(rec_cands) > 0:
+            rec_idx = int(mdd_idx_all + rec_cands[0])
+            try:
+                d_trough = datetime.strptime(str(all_dates[mdd_idx_all])[:10], "%Y-%m-%d")
+                d_rec = datetime.strptime(str(all_dates[rec_idx])[:10], "%Y-%m-%d")
+                rec_days_str = f"{(d_rec - d_trough).days}天"
+            except Exception:
+                rec_days_str = f"{int(rec_cands[0])}交易日"
+
+    last_dt_str = str(all_dates[-1])
+    try:
+        last_dt = datetime.strptime(last_dt_str[:10], "%Y-%m-%d")
+    except Exception:
+        last_dt = datetime.now()
+    cal_days = {
+        "1M": 31, "3M": 92, "6M": 183, "1Y": 365, "3Y": 1095, "ALL": 36500,
+    }.get(period_key, 365)
+    cutoff_str = (last_dt - timedelta(days=cal_days)).strftime("%Y-%m-%d")
+    mask_sub = all_dates >= cutoff_str
+    if int(np.sum(mask_sub)) < 3:
+        mask_sub = np.arange(len(all_dates)) >= max(0, len(all_dates) - 22)
+
+    dates = [str(d)[:10] for d in all_dates[mask_sub].tolist()]
+    navs = all_unavs[mask_sub]
+    adj_sub = all_adj[mask_sub]
+    first_nav = float(navs[0]) if len(navs) and navs[0] > 0 else 1.0
+    last_nav = float(navs[-1]) if len(navs) else 1.0
+    first_adj = float(adj_sub[0]) if len(adj_sub) and adj_sub[0] > 0 else 1.0
+    first_date = dates[0] if dates else ""
+    last_date = dates[-1] if dates else ""
+    day_chg = float(ndf["day_chg"].iloc[-1]) if "day_chg" in ndf.columns and len(ndf) else 0.0
+
+    cum_pct = ((adj_sub / first_adj) - 1.0) * 100.0
+    sub_peaks = np.maximum.accumulate(adj_sub)
+    sub_dd = ((adj_sub - sub_peaks) / np.where(sub_peaks > 0, sub_peaks, 1.0)) * 100.0
+    period_max_dd = abs(float(np.min(sub_dd))) if len(sub_dd) else 0.0
+    daily_rets = np.diff(adj_sub) / np.where(adj_sub[:-1] > 0, adj_sub[:-1], 1.0) if len(adj_sub) > 1 else np.zeros(0)
+    rf_daily = 0.015 / 244.0
+    sd = float(np.std(daily_rets, ddof=1)) if len(daily_rets) > 5 else 0.0
+    sharpe = float(((np.mean(daily_rets) - rf_daily) / sd) * np.sqrt(244.0)) if sd > 1e-6 else 0.0
+
+    n_pts = len(dates)
+    xs = list(range(n_pts))
+    bench_pct = []
+    bench_name = "中证全债基准" if "债" in cat else "上证综指基准"
+    if "债" in cat:
+        bench_pct = [round(i * (3.65 / 245.0), 2) for i in range(n_pts)]
+    elif idf is not None and not idf.empty and dates:
+        imap = dict(zip(idf["date"].astype(str), pd.to_numeric(idf["close"], errors="coerce")))
+        b_vals = []
+        last_b = None
+        for d_str in dates:
+            v = imap.get(d_str)
+            if v is not None and np.isfinite(v) and v > 0:
+                last_b = float(v)
+            b_vals.append(last_b)
+        first_b = next((x for x in b_vals if x is not None and x > 0), None)
+        if first_b:
+            bench_pct = [round(((x if x else first_b) / first_b - 1.0) * 100.0, 2) for x in b_vals]
+
+    if n_pts <= 7:
+        tick_idxs = list(range(n_pts))
+    else:
+        n_ticks = 6
+        tick_idxs = sorted(set(int(round(k * (n_pts - 1) / (n_ticks - 1))) for k in range(n_ticks)))
+    date_ticks = tuple(
+        (str(dates[i])[5:10] if period_key in ("1M", "3M") else str(dates[i])[:10], float(i))
+        for i in tick_idxs
+    )
+
+    cum_list = [round(float(x), 2) for x in cum_pct]
+    nav_list = [round(float(x), 4) for x in navs]
+    dchg_sub = (
+        [round(float(x), 2) for x in pd.to_numeric(ndf["day_chg"], errors="coerce").fillna(0.0).to_numpy()[mask_sub]]
+        if "day_chg" in ndf.columns else [0.0] * n_pts
+    )
+    cur_cum = float(cum_list[-1]) if cum_list else 0.0
+    b_cum = float(bench_pct[-1]) if bench_pct else 0.0
+
+    x_min_lim = -max(0.5, n_pts * 0.015)
+    x_max_lim = max(1.0, (n_pts - 1) + max(0.5, n_pts * 0.02))
+    y_ret_all = cum_list + (bench_pct if (bench_pct and len(bench_pct) == n_pts) else [0.0])
+    yr_min, yr_max = (min(y_ret_all), max(y_ret_all)) if y_ret_all else (-1.0, 1.0)
+    yr_pad = max(0.25, (yr_max - yr_min) * 0.10)
+    yn_min, yn_max = (min(nav_list), max(nav_list)) if nav_list else (0.9, 1.1)
+    yn_pad = max(0.004, (yn_max - yn_min) * 0.10)
+
+    return {
+        "dates": dates,
+        "n_pts": n_pts,
+        "xs": xs,
+        "cum_list": cum_list,
+        "nav_list": nav_list,
+        "dchg_sub": dchg_sub,
+        "bench_pct": bench_pct if len(bench_pct) == n_pts else [0.0] * n_pts,
+        "bench_name": bench_name,
+        "date_ticks": date_ticks,
+        "first_date": first_date,
+        "last_date": last_date,
+        "first_nav": first_nav,
+        "last_nav": last_nav,
+        "day_chg": day_chg,
+        "cur_cum": cur_cum,
+        "b_cum": b_cum,
+        "since_max_dd": since_max_dd,
+        "rec_days_str": rec_days_str,
+        "period_max_dd": period_max_dd,
+        "sharpe": sharpe,
+        "x_min_lim": x_min_lim,
+        "x_max_lim": x_max_lim,
+        "yr_min_lim": yr_min - yr_pad,
+        "yr_max_lim": yr_max + yr_pad * 1.18,
+        "yn_min_lim": yn_min - yn_pad,
+        "yn_max_lim": yn_max + yn_pad * 1.18,
+    }
+
+
+def _apply_fund_axis_state():
+    """把当前 STATE['_fund_axis_cfg'] 的刻度和上下界同步应用到两个走势图的 X/Y 轴(切换 Tab 时也调用)。"""
+    cfg = STATE.get("_fund_axis_cfg")
+    if not cfg:
+        return
+    for xa_tag in ("fund_xa_ret", "fund_xa_nav"):
+        if dpg.does_item_exist(xa_tag):
+            try:
+                dpg.set_axis_ticks(xa_tag, cfg["date_ticks"])
+                dpg.set_axis_limits(xa_tag, cfg["x_min_lim"], cfg["x_max_lim"])
+            except Exception:
+                pass
+    if dpg.does_item_exist("fund_ay_ret"):
+        try:
+            dpg.set_axis_limits("fund_ay_ret", cfg["yr_min_lim"], cfg["yr_max_lim"])
+        except Exception:
+            pass
+    if dpg.does_item_exist("fund_ay_nav"):
+        try:
+            dpg.set_axis_limits("fund_ay_nav", cfg["yn_min_lim"], cfg["yn_max_lim"])
+        except Exception:
+            pass
+
+
+def _apply_fund_detail_period_inplace(period_key: str):
+    """在主线程原地秒切基金走势周期 (近1月/近3月/近6月/近1年/近3年/成立来)，不销毁重建图表。"""
+    ndf = STATE.get("_cur_fund_nav_df")
+    if ndf is None or ndf.empty:
+        return
+    cat = STATE.get("_cur_fund_cat", "混合/其他主题")
+    idf = STATE.get("_cur_fund_idx_df")
+    s = _compute_fund_period_slice(ndf, idf, cat, period_key)
+
+    STATE["fund_chart_hover"] = {
+        "dates": s["dates"],
+        "cum_pct": s["cum_list"],
+        "bench_pct": s["bench_pct"],
+        "bench_name": s["bench_name"],
+        "navs": s["nav_list"],
+        "day_chgs": s["dchg_sub"],
+    }
+    STATE["_fund_axis_cfg"] = s
+
+    # 1) 更新时间段按钮选中状态与高亮
+    for pk, plbl in (("1M", "近1月"), ("3M", "近3月"), ("6M", "近6月"), ("1Y", "近1年"), ("3Y", "近3年"), ("ALL", "成立来")):
+        btag = f"fund_pbtn_{pk}"
+        if dpg.does_item_exist(btag):
+            dpg.configure_item(btag, label=f"{'● ' if pk == period_key else ''}{plbl}")
+            if dpg.does_item_exist("period_on"):
+                dpg.bind_item_theme(btag, "period_on" if pk == period_key else 0)
+
+    # 2) 更新顶部风险指标与提示文字
+    if dpg.does_item_exist("fund_hdr_metrics"):
+        dpg.set_value(
+            "fund_hdr_metrics",
+            f" | 成立来最大回撤 {s['since_max_dd']:.2f}% (修复 {s['rec_days_str']}) | 区间回撤 {s['period_max_dd']:.2f}% | 夏普 {s['sharpe']:.2f}",
+        )
+    if dpg.does_item_exist("fund_hover_readout"):
+        dpg.set_value(
+            "fund_hover_readout",
+            f"  |  💡 移动鼠标查看每日明细 ({s['first_date']} ~ {s['last_date']}, 共 {s['n_pts']} 个交易日)",
+        )
+
+    # 3) 原地更新曲线数据、图例、标题与坐标轴范围
+    if dpg.does_item_exist("fund_series_ret"):
+        dpg.set_value("fund_series_ret", [s["xs"], s["cum_list"]])
+        dpg.configure_item("fund_series_ret", label=f"本基金 {s['cur_cum']:+.2f}%")
+        dpg.bind_item_theme("fund_series_ret", "line_red" if s["cur_cum"] >= 0 else "line_green")
+    if dpg.does_item_exist("fund_series_bench"):
+        dpg.set_value("fund_series_bench", [s["xs"], s["bench_pct"]])
+        dpg.configure_item("fund_series_bench", label=f"{s['bench_name']} {s['b_cum']:+.2f}%")
+    if dpg.does_item_exist("fund_series_nav"):
+        dpg.set_value("fund_series_nav", [s["xs"], s["nav_list"]])
+        dpg.configure_item("fund_series_nav", label=f"单位净值 {s['last_nav']:.4f}")
+
+    if dpg.does_item_exist("fund_tab_ret"):
+        dpg.configure_item("fund_tab_ret", label=f"📈 收益率走势 ({s['cur_cum']:+.2f}% vs 基准 {s['b_cum']:+.2f}%)")
+    if dpg.does_item_exist("fund_tab_nav"):
+        dpg.configure_item("fund_tab_nav", label=f"💰 单位净值走势 (最新 {s['last_nav']:.4f} · 日涨跌 {s['day_chg']:+.2f}%)")
+    if dpg.does_item_exist("fund_plot_ret"):
+        dpg.configure_item(
+            "fund_plot_ret",
+            label=f"复权收益率走势 ({s['first_date']} ~ {s['last_date']} · 本基金 {s['cur_cum']:+.2f}% vs {s['bench_name']} {s['b_cum']:+.2f}%)",
+        )
+    if dpg.does_item_exist("fund_plot_nav"):
+        dpg.configure_item(
+            "fund_plot_nav",
+            label=f"单位净值走势 ({s['first_date']}: {s['first_nav']:.4f}  →  {s['last_date']}: {s['last_nav']:.4f} · 日涨跌 {s['day_chg']:+.2f}%)",
+        )
+    if dpg.does_item_exist("fund_xa_ret"):
+        dpg.configure_item("fund_xa_ret", label=f"时间 ({s['first_date']} ~ {s['last_date']}, 共 {s['n_pts']} 个交易日)")
+    if dpg.does_item_exist("fund_xa_nav"):
+        dpg.configure_item("fund_xa_nav", label=f"时间 ({s['first_date']}: {s['first_nav']:.4f} -> {s['last_date']}: {s['last_nav']:.4f})")
+
+    for vtag in ("fund_ret_vline", "fund_nav_vline", "fund_ret_anno", "fund_nav_anno"):
+        if dpg.does_item_exist(vtag):
+            dpg.configure_item(vtag, show=False)
+
+    _apply_fund_axis_state()
+
+
+def _compute_peer_ranking(df_all: pd.DataFrame, code: str, category: str) -> tuple[list[dict], str]:
+    """
+    计算某只基金在所属赛道(category)内的各阶段涨幅、同类平均与同类排名(如 366/889 优秀/良好)。
+    返回 (stage_rows, highlight_badge)
+    """
+    if df_all is None or df_all.empty:
+        return [], ""
+    hit = df_all[df_all["code"].astype(str).str.zfill(6) == str(code).zfill(6)]
+    if hit.empty:
+        return [], ""
+    row = hit.iloc[0]
+    peers = df_all[df_all["category"] == category] if category else df_all
+    if len(peers) < 5:
+        peers = df_all
+
+    if "ret_1w" in df_all.columns:
+        stages = [
+            ("近1周", "ret_1w"),
+            ("近1月", "ret_1m"),
+            ("近3月", "ret_3m"),
+            ("近6月", "ret_6m"),
+            ("近1年", "ret_1y"),
+            ("近3年", "ret_3y"),
+            ("今年来", "ret_ytd"),
+        ]
+    else:
+        stages = [
+            ("今日", "chg_pct"),
+            ("近20日", "ret_20d"),
+            ("近60日", "ret_60d"),
+            ("近1年", "ret_250d"),
+        ]
+
+    stage_rows = []
+    beat_1y_pct = None
+    for label, col in stages:
+        if col not in peers.columns:
+            continue
+        val = row.get(col)
+        s = pd.to_numeric(peers[col], errors="coerce").dropna()
+        if len(s) == 0 or val is None or pd.isna(val):
+            stage_rows.append({
+                "stage": label, "val": None, "peer_avg": float(s.mean()) if len(s) else None,
+                "rank_str": "—", "grade": "—",
+            })
+            continue
+        fv = float(val)
+        avg_v = float(s.mean())
+        # 排名：收益率大于 fv 的同行数量 + 1
+        rk = int((s > fv).sum()) + 1
+        tot = len(s)
+        pct_top = rk / tot * 100.0
+        if pct_top <= 25.0:
+            grade = "优秀"
+        elif pct_top <= 50.0:
+            grade = "良好"
+        elif pct_top <= 75.0:
+            grade = "一般"
+        else:
+            grade = "偏弱"
+        if label == "近1年":
+            beat_1y_pct = int(round((1.0 - (rk - 1) / max(1, tot)) * 100.0))
+        stage_rows.append({
+            "stage": label,
+            "val": round(fv, 2),
+            "peer_avg": round(avg_v, 2),
+            "rank_str": f"{rk}/{tot}",
+            "grade": grade,
+        })
+
+    badge = f"近1年跑赢 {beat_1y_pct}% 同类" if beat_1y_pct is not None else ""
+    return stage_rows, badge
+
+
+def _show_fund_detail(code: str, ftype: str = "mutual", use_cached_nav: bool = False):
+    """在基金选基中心展开并渲染对标手机理财端的产品详情面板(含业绩走势%、净值走势、同类排名)。"""
+    code = str(code).zfill(6)
+    STATE["cur_fund_code"] = code
+    STATE["cur_fund_type"] = ftype
+    period_key = STATE.get("fund_detail_period", "1Y")
+
+    # 查找该基金的元数据行
+    mf_df = STATE.get("mutual_fund_df")
+    etf_df = STATE.get("etf_spot")
+    meta = {}
+    peer_df = mf_df if ftype == "mutual" else etf_df
+    if peer_df is not None and not peer_df.empty:
+        m_hit = peer_df[peer_df["code"].astype(str).str.zfill(6) == code]
+        if not m_hit.empty:
+            meta = m_hit.iloc[0].to_dict()
+
+    nm = str(meta.get("name") or db.name_of(code) or code)
+    cat = fetcher.classify_etf_category(nm)
+
+    if dpg.does_item_exist("fund_detail_box"):
+        dpg.configure_item("fund_detail_box", show=True)
+    if dpg.does_item_exist("fund_detail_box_handle"):
+        dpg.configure_item("fund_detail_box_handle", show=True)
+    if dpg.does_item_exist("fund_detail_content"):
+        if not (dpg.get_item_children("fund_detail_content", 1) or []):
+            dpg.add_text(
+                f"⏳ 正在加载 【{code}  {nm}】 历史净值与同类排名走势...",
+                parent="fund_detail_content", color=(255, 210, 110),
+            )
+        elif dpg.does_item_exist("fund_hover_readout"):
+            dpg.set_value("fund_hover_readout", f"  |  ⏳ 正在切换至 【{code}  {nm}】 ...")
+
+    def worker():
+        nav_df = STATE.get("_cur_fund_nav_df") if (use_cached_nav and STATE.get("_cur_fund_nav_code") == code) else None
+        if nav_df is None or nav_df.empty:
+            nav_df = fetcher.fetch_or_load_fund_nav(code)
+            STATE["_cur_fund_nav_code"] = code
+            STATE["_cur_fund_nav_df"] = nav_df
+
+        # 获取官方二级分类阶段涨幅、同类平均与同类排名 (缓存复用)
+        if use_cached_nav and STATE.get("_cur_fund_rank_code") == code and STATE.get("_cur_fund_stage_rows"):
+            stage_rows = STATE["_cur_fund_stage_rows"]
+            beat_badge = STATE.get("_cur_fund_beat_badge", "")
+        else:
+            stage_rows, beat_badge = ([], "")
+            if ftype == "mutual":
+                stage_rows, beat_badge = fetcher.fetch_official_fund_stage_rank(code)
+            if not stage_rows:
+                stage_rows, beat_badge = _compute_peer_ranking(peer_df, code, cat)
+            STATE["_cur_fund_rank_code"] = code
+            STATE["_cur_fund_stage_rows"] = stage_rows
+            STATE["_cur_fund_beat_badge"] = beat_badge
+
+        # 加载沪深300/上证指数作业绩对比基准线
+        idx_df = STATE.get("_cur_fund_idx_df")
+        if idx_df is None or idx_df.empty:
+            idx_df = db.load_index_kline("sh000001")
+            STATE["_cur_fund_idx_df"] = idx_df
+        STATE["_cur_fund_cat"] = cat
+
+        def render_ui(ndf=nav_df, idf=idx_df, s_rows=stage_rows, b_badge=beat_badge):
+            if STATE.get("cur_fund_code") != code:
+                return
+            if not dpg.does_item_exist("fund_detail_content"):
+                return
+            dpg.delete_item("fund_detail_content", children_only=True)
+
+            if ndf is None or ndf.empty:
+                dpg.add_text(f"{code} {nm} 暂无历史净值曲线数据", parent="fund_detail_content", color=(240, 180, 90))
+                return
+
+            cur_period = STATE.get("fund_detail_period", period_key)
+            s = _compute_fund_period_slice(ndf, idf, cat, cur_period)
+            STATE["fund_chart_hover"] = {
+                "dates": s["dates"],
+                "cum_pct": s["cum_list"],
+                "bench_pct": s["bench_pct"],
+                "bench_name": s["bench_name"],
+                "navs": s["nav_list"],
+                "day_chgs": s["dchg_sub"],
+            }
+            STATE["_fund_axis_cfg"] = s
+
+            r1y = meta.get("ret_1y") if "ret_1y" in meta else meta.get("ret_250d")
+            r3y = meta.get("ret_3y")
+
+            for _old_tag in (
+                "fund_detail_chart_tabs", "fund_tab_ret", "fund_tab_nav",
+                "fund_plot_ret", "fund_plot_nav", "fund_stage_table",
+                "fund_xa_ret", "fund_ay_ret", "fund_xa_nav", "fund_ay_nav",
+                "fund_series_ret", "fund_series_bench", "fund_series_nav",
+                "fund_ret_vline", "fund_ret_anno", "fund_nav_vline", "fund_nav_anno",
+                "fund_hover_readout", "fund_hdr_metrics",
+                "fund_pbtn_1M", "fund_pbtn_3M", "fund_pbtn_6M", "fund_pbtn_1Y", "fund_pbtn_3Y", "fund_pbtn_ALL",
+            ):
+                if dpg.does_item_exist(_old_tag):
+                    try:
+                        dpg.delete_item(_old_tag)
+                    except Exception:
+                        pass
+
+            # ---- 1) 顶部产品详情抬头：第1行展示核心指标 + 收起按钮；第2行展示时间段切换按钮 + 鼠标悬停实时读数 ----
+            with dpg.group(horizontal=True, parent="fund_detail_content"):
+                dpg.add_text(f"【{code}  {nm}】", color=(130, 200, 255))
+                dpg.add_text(f"[{cat}]", color=(255, 205, 110))
+                if b_badge:
+                    dpg.add_text(f" ★ {b_badge}", color=(235, 95, 95))
+                dpg.add_text(
+                    f" | 成立来最大回撤 {s['since_max_dd']:.2f}% (修复 {s['rec_days_str']}) | 区间回撤 {s['period_max_dd']:.2f}% | 夏普 {s['sharpe']:.2f}",
+                    tag="fund_hdr_metrics",
+                    color=(175, 215, 185),
+                )
+                if ftype == "etf":
+                    dpg.add_button(
+                        label="打开K线图", width=74, height=22,
+                        callback=lambda: _on_pick_code(code),
+                    )
+                dpg.add_button(
+                    label="收起详情", width=64, height=22,
+                    callback=lambda: (
+                        dpg.configure_item("fund_detail_box", show=False),
+                        dpg.configure_item("fund_detail_box_handle", show=False) if dpg.does_item_exist("fund_detail_box_handle") else None,
+                    ),
+                )
+
+            with dpg.group(horizontal=True, parent="fund_detail_content"):
+                dpg.add_text("时间段:", color=(140, 195, 255))
+                for pk, plbl in (("1M", "近1月"), ("3M", "近3月"), ("6M", "近6月"), ("1Y", "近1年"), ("3Y", "近3年"), ("ALL", "成立来")):
+                    btn_p = dpg.add_button(
+                        tag=f"fund_pbtn_{pk}",
+                        label=f"{'● ' if pk == cur_period else ''}{plbl}",
+                        width=58, height=22,
+                        user_data=pk,
+                        callback=lambda s_id, a_data, u_pk: _switch_fund_detail_period(u_pk),
+                    )
+                    if pk == cur_period and dpg.does_item_exist("period_on"):
+                        dpg.bind_item_theme(btn_p, "period_on")
+                dpg.add_text(
+                    f"  |  💡 移动鼠标查看每日明细 ({s['first_date']} ~ {s['last_date']}, 共 {s['n_pts']} 个交易日)",
+                    tag="fund_hover_readout",
+                    color=(255, 215, 120),
+                )
+
+            # ---- 2) 左右双栏布局（左：大尺寸 Tab 切换【📈 收益率走势 vs 💰 单位净值走势】 | 右：官方阶段涨幅与同类排名表） ----
+            box_h = int(dpg.get_item_height("fund_detail_box") or MKT_SECTION_HEIGHTS.get("fund_detail_box", 355))
+            if box_h < 330:
+                box_h = 355
+                try:
+                    dpg.set_item_height("fund_detail_box", box_h)
+                except Exception:
+                    pass
+            plot_h = max(205, box_h - 92)
+            cur_chart_tab = STATE.get("fund_detail_chart_tab", "fund_tab_ret")
+
+            def _on_chart_tab_change(sender, app_data):
+                try:
+                    alias = dpg.get_item_alias(app_data)
+                    if alias in ("fund_tab_ret", "fund_tab_nav"):
+                        STATE["fund_detail_chart_tab"] = alias
+                        _apply_fund_axis_state()
+                except Exception:
+                    pass
+
+            with dpg.group(horizontal=True, parent="fund_detail_content"):
+                cur_cum = s["cur_cum"]
+                b_cum = s["b_cum"]
+                first_date = s["first_date"]
+                last_date = s["last_date"]
+                first_nav = s["first_nav"]
+                last_nav = s["last_nav"]
+                day_chg = s["day_chg"]
+                bench_name = s["bench_name"]
+                n_pts = s["n_pts"]
+
+                with dpg.tab_bar(tag="fund_detail_chart_tabs", callback=_on_chart_tab_change):
+                    with dpg.tab(
+                        label=f"📈 收益率走势 ({cur_cum:+.2f}% vs 基准 {b_cum:+.2f}%)",
+                        tag="fund_tab_ret",
+                    ):
+                        with dpg.plot(
+                            tag="fund_plot_ret",
+                            label=f"复权收益率走势 ({first_date} ~ {last_date} · 本基金 {cur_cum:+.2f}% vs {bench_name} {b_cum:+.2f}%)",
+                            height=plot_h, width=765,
+                            no_mouse_pos=True, no_box_select=True, no_menus=True,
+                            pan_button=-1, fit_button=-1,
+                        ):
+                            dpg.add_plot_legend()
+                            xa1 = dpg.add_plot_axis(
+                                dpg.mvXAxis, tag="fund_xa_ret",
+                                label=f"时间 ({first_date} ~ {last_date}, 共 {n_pts} 个交易日)",
+                                lock_min=True, lock_max=True,
+                            )
+                            ay1 = dpg.add_plot_axis(
+                                dpg.mvYAxis, tag="fund_ay_ret", label="复权涨跌%",
+                                lock_min=True, lock_max=True,
+                            )
+                            s_f = dpg.add_line_series(
+                                s["xs"], s["cum_list"],
+                                tag="fund_series_ret",
+                                label=f"本基金 {cur_cum:+.2f}%", parent=ay1,
+                            )
+                            dpg.bind_item_theme(s_f, "line_red" if cur_cum >= 0 else "line_green")
+                            dpg.add_line_series(
+                                s["xs"], s["bench_pct"],
+                                tag="fund_series_bench",
+                                label=f"{bench_name} {b_cum:+.2f}%", parent=ay1,
+                            )
+                            dpg.set_axis_ticks(xa1, s["date_ticks"])
+                            dpg.set_axis_limits(xa1, s["x_min_lim"], s["x_max_lim"])
+                            dpg.set_axis_limits(ay1, s["yr_min_lim"], s["yr_max_lim"])
+                            # 鼠标移动竖线 + 实时时间与涨跌幅浮窗
+                            dpg.add_drag_line(
+                                tag="fund_ret_vline", vertical=True, default_value=float(n_pts - 1),
+                                color=(230, 235, 245, 190), thickness=1.2,
+                                show_label=False, no_inputs=True, no_cursor=True, no_fit=True, show=False,
+                            )
+                            dpg.add_plot_annotation(
+                                tag="fund_ret_anno", label="", default_value=(0.0, 0.0),
+                                offset=(12, -14), color=(235, 90, 90, 255),
+                                clamped=True, show=False,
+                            )
+
+                    with dpg.tab(
+                        label=f"💰 单位净值走势 (最新 {last_nav:.4f} · 日涨跌 {day_chg:+.2f}%)",
+                        tag="fund_tab_nav",
+                    ):
+                        with dpg.plot(
+                            tag="fund_plot_nav",
+                            label=f"单位净值走势 ({first_date}: {first_nav:.4f}  →  {last_date}: {last_nav:.4f} · 日涨跌 {day_chg:+.2f}%)",
+                            height=plot_h, width=765,
+                            no_mouse_pos=True, no_box_select=True, no_menus=True,
+                            pan_button=-1, fit_button=-1,
+                        ):
+                            dpg.add_plot_legend()
+                            xa2 = dpg.add_plot_axis(
+                                dpg.mvXAxis, tag="fund_xa_nav",
+                                label=f"时间 ({first_date}: {first_nav:.4f} -> {last_date}: {last_nav:.4f})",
+                                lock_min=True, lock_max=True,
+                            )
+                            ay2 = dpg.add_plot_axis(
+                                dpg.mvYAxis, tag="fund_ay_nav", label="单位净值",
+                                lock_min=True, lock_max=True,
+                            )
+                            dpg.add_line_series(
+                                s["xs"], s["nav_list"],
+                                tag="fund_series_nav",
+                                label=f"单位净值 {last_nav:.4f}", parent=ay2,
+                            )
+                            dpg.set_axis_ticks(xa2, s["date_ticks"])
+                            dpg.set_axis_limits(xa2, s["x_min_lim"], s["x_max_lim"])
+                            dpg.set_axis_limits(ay2, s["yn_min_lim"], s["yn_max_lim"])
+                            # 鼠标移动竖线 + 实时时间与单位净值/涨跌幅浮窗
+                            dpg.add_drag_line(
+                                tag="fund_nav_vline", vertical=True, default_value=float(n_pts - 1),
+                                color=(230, 235, 245, 190), thickness=1.2,
+                                show_label=False, no_inputs=True, no_cursor=True, no_fit=True, show=False,
+                            )
+                            dpg.add_plot_annotation(
+                                tag="fund_nav_anno", label="", default_value=(0.0, 0.0),
+                                offset=(12, -14), color=(85, 175, 250, 255),
+                                clamped=True, show=False,
+                            )
+
+                if cur_chart_tab in ("fund_tab_ret", "fund_tab_nav") and dpg.does_item_exist(cur_chart_tab):
+                    try:
+                        dpg.set_value("fund_detail_chart_tabs", cur_chart_tab)
+                    except Exception:
+                        pass
+
+                with dpg.group():
+                    r1y_s = f"{float(r1y):+.2f}%" if (r1y is not None and not pd.isna(r1y)) else "—"
+                    r3y_s = f"{float(r3y):+.2f}%" if (r3y is not None and not pd.isna(r3y)) else "—"
+                    dpg.add_text(
+                        f"近1年: {r1y_s}  |  近3年: {r3y_s}  |  日涨跌: {day_chg:+.2f}%  |  净值: {last_nav:.4f}",
+                        color=(255, 200, 100),
+                    )
+                    with dpg.table(
+                        tag="fund_stage_table",
+                        header_row=True, resizable=True, width=415, height=plot_h,
+                        policy=dpg.mvTable_SizingStretchProp, scrollY=True,
+                        borders_innerH=True, borders_outerH=True,
+                    ):
+                        for col in ("阶段时间", "本基金涨幅", "同类平均", "同类排名", "评级"):
+                            dpg.add_table_column(label=col)
+                        for sr in s_rows:
+                            v = sr["val"]
+                            pa = sr["peer_avg"]
+                            gr = sr["grade"]
+                            g_col = (235, 80, 80) if gr == "优秀" else (
+                                (245, 185, 80) if gr == "良好" else (165, 170, 180)
+                            )
+                            with dpg.table_row():
+                                dpg.add_text(sr["stage"])
+                                dpg.add_text(
+                                    f"{v:+.2f}%" if v is not None else "—",
+                                    color=RED if (v and v > 0) else (GREEN if (v and v < 0) else (180, 180, 180)),
+                                )
+                                dpg.add_text(
+                                    f"{pa:+.2f}%" if pa is not None else "—",
+                                    color=RED if (pa and pa > 0) else (GREEN if (pa and pa < 0) else (180, 180, 180)),
+                                )
+                                dpg.add_text(sr["rank_str"], color=(210, 215, 225))
+                                dpg.add_text(gr, color=g_col)
+
+        _post_ui(render_ui)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ---------- 策略样本外评测室 (原今日推荐 / 策略排行榜升级) ----------
 def on_run_ranking():
-    """后台线程:只跑【策略排行榜】(8策略回测,较慢),结果落盘缓存。
-    排行基于固定历史区间,一天内不变,算一次即可反复给推荐复用。"""
+    """后台线程:重新运行四层量化样本外评测引擎并刷新评测室与作战台。"""
     if not db.list_cached_codes():
         dpg.set_value("rank_status", "本地无数据,请先更新数据")
         return
 
     def worker():
-        dpg.configure_item("rank_run_btn", enabled=False)
-        dpg.configure_item("picks_run_btn", enabled=False)
+        _post_ui(lambda: dpg.configure_item("rank_run_btn", enabled=False) if dpg.does_item_exist("rank_run_btn") else None)
         try:
-            mkt = bool(dpg.get_value("rank_market"))
-            dpg.set_value("rank_status", "正在评估各策略历史表现(回测排名,较慢)...")
-            rank_df = ranking.rank_strategies(
-                market_filter=mkt,
-                progress_cb=lambda d, t, nm: dpg.set_value(
-                    "rank_status", f"回测策略 {d}/{t}: {nm}"),
+            from app.strategy import cockpit as ck
+            st = ck.run_cockpit(
+                rerun_winmodel=False,
+                progress_cb=lambda msg: _post_ui(lambda m=msg: dpg.set_value("rank_status", m)),
             )
-            STATE["rank_df"] = rank_df
-            ranking.save_rank_cache(rank_df, mkt)   # 落盘,供今日推荐复用
-            _render_ranking(rank_df)
-            cache = ranking.load_rank_cache() or {}
-            dpg.set_value(
-                "rank_status",
-                f"排行已更新({cache.get('computed_at', '')}) · "
-                f"共 {0 if rank_df is None else len(rank_df)} 个策略 · "
-                f"现在可点『生成今日推荐』(秒出)")
+            _post_ui(lambda s=st: _render_oos_lab(s))
+            _post_ui(probability_desk.refresh)
         except Exception as e:
-            dpg.set_value("rank_status", f"排行失败: {e}")
+            _post_ui(lambda err=e: dpg.set_value("rank_status", f"样本外评测失败: {err}"))
         finally:
-            dpg.configure_item("rank_run_btn", enabled=True)
-            dpg.configure_item("picks_run_btn", enabled=True)
+            _post_ui(lambda: dpg.configure_item("rank_run_btn", enabled=True) if dpg.does_item_exist("rank_run_btn") else None)
 
     threading.Thread(target=worker, daemon=True).start()
 
 
 def on_gen_picks():
-    """后台线程:只【生成今日推荐】。直接复用已缓存的策略排行(不再回测),
-    仅对最强的几个策略跑一次当日选股,秒级出结果。"""
-    if not db.list_cached_codes():
-        dpg.set_value("rank_status", "本地无数据,请先更新数据")
-        return
-    # 优先用内存里的排行,没有再读磁盘缓存
-    rank_df = STATE.get("rank_df")
-    cache = ranking.load_rank_cache()
-    if (rank_df is None or rank_df.empty) and cache:
-        rank_df = cache["rank_df"]
-        STATE["rank_df"] = rank_df
-        _render_ranking(rank_df)
-    if rank_df is None or rank_df.empty:
-        dpg.set_value(
-            "rank_status",
-            "还没有策略排行,请先点『刷新策略排行』(只需算一次,之后推荐秒出)")
-        return
-
-    def worker():
-        dpg.configure_item("rank_run_btn", enabled=False)
-        dpg.configure_item("picks_run_btn", enabled=False)
-        try:
-            tip = ""
-            if cache and cache.get("computed_at"):
-                tip = f"(排行算于 {cache['computed_at']}) "
-            dpg.set_value("rank_status", f"正在用最强策略生成今日推荐票...{tip}")
-            picks = ranking.today_picks(
-                rank_df, top_strategies=3, per_strategy=10,
-                progress_cb=lambda d, t, nm: dpg.set_value(
-                    "rank_status", f"选股 {d}/{t}: {nm}"))
-            STATE["picks_df"] = picks
-            _render_picks(picks)
-            n = 0 if picks is None or picks.empty else len(picks)
-            dpg.set_value("rank_status", f"完成 · 今日推荐 {n} 只 {tip}")
-        except Exception as e:
-            dpg.set_value("rank_status", f"生成推荐失败: {e}")
-        finally:
-            dpg.configure_item("rank_run_btn", enabled=True)
-            dpg.configure_item("picks_run_btn", enabled=True)
-
-    threading.Thread(target=worker, daemon=True).start()
+    """直接从已生成的四层量化状态刷新今日共振候选。"""
+    _load_cached_ranking()
 
 
 def _load_cached_ranking():
-    """启动时读取磁盘排行缓存,若有则渲染排行表并提示可直接生成推荐。"""
+    """读取 cockpit_state.json 并渲染样本外评测室的三大表格。"""
     if not dpg.does_item_exist("rank_table"):
         return
-    cache = ranking.load_rank_cache()
-    if not cache:
+    from app.strategy import cockpit as ck
+    st = ck.load_cockpit_state()
+    if not st:
+        dpg.set_value("rank_status", "尚未生成样本外评测记录,请点『重跑样本外评测』")
         return
-    rank_df = cache["rank_df"]
-    STATE["rank_df"] = rank_df
-    _render_ranking(rank_df)
+    _render_oos_lab(st)
+
+
+def _pct_ui(x):
+    try:
+        if x is None or x != x:
+            return "—"
+        return f"{float(x) * 100:.2f}%"
+    except Exception:
+        return "—"
+
+
+def _num_ui(x, nd=2):
+    try:
+        if x is None or x != x:
+            return "—"
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return "—"
+
+
+def _on_horizon_switched(horizon: int):
+    """当用户在作战台或评测室切换持有周期 (10/60/120) 时，同步更新评测室、左侧抽屉与K线标尺。"""
+    _load_cached_ranking()
+    _refresh_market_state()
+    _refresh_side_drawer()
+    cur_code = STATE.get("cur_code")
+    if cur_code:
+        _update_kline_info(cur_code)
+
+
+def on_toggle_sidebar(sender=None, app_data=None, user_data=None):
+    """一键折叠/展开左侧边栏，释放 100% 宽屏空间给表格与 K 线。"""
+    if not dpg.does_item_exist("left_panel"):
+        return
+    cur_show = bool(dpg.get_item_configuration("left_panel").get("show", True))
+    new_show = not cur_show
+    dpg.configure_item("left_panel", show=new_show)
+    lbl = "◀ 侧栏" if new_show else "▶ 展开侧栏"
+    for b_tag in ("prob_toggle_side_btn", "kl_toggle_side_btn"):
+        if dpg.does_item_exist(b_tag):
+            dpg.configure_item(b_tag, label=lbl)
+
+
+def _switch_drawer_mode(mode: str):
+    """切换左侧快速看盘抽屉的数据源: 'picks'(今日共振池) | 'watch'(自选池)。"""
+    STATE["drawer_mode"] = mode
+    _refresh_side_drawer()
+
+
+_DRAWER_COL_SPECS = (
+    ("代码", "code"),
+    ("名称", None),
+    ("胜率/现价", "p_tb"),
+    ("题材", None),
+)
+
+
+def _on_drawer_table_sort(sender, app_data):
+    skip_map = STATE.setdefault("_tbl_skip_auto_sort", {})
+    if skip_map.pop(sender, False) or not app_data:
+        return
+    col_id = app_data[0][0]
+    if not dpg.does_item_exist(col_id):
+        return
+    ud = dpg.get_item_user_data(col_id)
+    if not ud or not ud[2]:
+        return
+    _, _, s_key = ud
+    cur_k = STATE.get("drawer_sort_key", "p_tb")
+    cur_asc = bool(STATE.get("drawer_sort_asc", False))
+    if cur_k == s_key:
+        STATE["drawer_sort_asc"] = not cur_asc
+    else:
+        STATE["drawer_sort_key"] = s_key
+        STATE["drawer_sort_asc"] = (s_key == "code")
+    _refresh_side_drawer()
+
+
+def _refresh_side_drawer():
+    """刷新左侧『⚡ 快速看盘抽屉』列表，支持单击任意一行秒切 K 线与点击可量化列排序。"""
+    if not dpg.does_item_exist("side_drawer_table"):
+        return
+    mode = STATE.get("drawer_mode", "picks")
+    picks = probability_desk.get_current_picks()
+    wl = db.load_watchlist()
+    n_watch = 0 if (wl is None or wl.empty) else len(wl)
+
+    if dpg.does_item_exist("drawer_btn_picks"):
+        dpg.configure_item("drawer_btn_picks", label=f"{'● ' if mode == 'picks' else ''}共振池({len(picks)})")
+    if dpg.does_item_exist("drawer_btn_watch"):
+        dpg.configure_item("drawer_btn_watch", label=f"{'● ' if mode == 'watch' else ''}自选({n_watch})")
+
+    s_key = STATE.get("drawer_sort_key", "p_tb")
+    s_asc = bool(STATE.get("drawer_sort_asc", False))
+    _sync_sortable_table_cols("side_drawer_table", f"drawer_{mode}", _DRAWER_COL_SPECS, s_key, s_asc)
+
+    drawer_codes = []
+    cur_code = STATE.get("cur_code")
+
+    if mode == "watch":
+        if wl is not None and not wl.empty:
+            w_items = []
+            for _, r in wl.iterrows():
+                c = str(r["code"]).zfill(6)
+                nm = str(r["name"] or "")
+                q = probability_desk.get_stock_quant_info(c) or {}
+                p_tb = q.get("p_tb")
+                subsec = (q.get("subsector") or q.get("industry") or "")[:5]
+                p_txt = f"{p_tb*100:.1f}%" if p_tb else str(r.get("last_price") or r.get("buy_price") or "-")
+                w_items.append((c, nm, p_tb, p_txt, subsec))
+            if s_key == "code":
+                w_items.sort(key=lambda x: x[0], reverse=not s_asc)
+            else:
+                w_items.sort(key=lambda x: (float(x[2] or -1.0), x[0]), reverse=not s_asc)
+            for c, nm, p_tb, p_txt, subsec in w_items:
+                drawer_codes.append(c)
+                with dpg.table_row(parent="side_drawer_table"):
+                    sel = dpg.add_selectable(
+                        label=c, span_columns=True, user_data=c,
+                        default_value=(c == cur_code),
+                        callback=lambda s, a, u: _on_pick_code(u),
+                    )
+                    dpg.bind_item_theme(sel, "row_hover")
+                    dpg.add_text(nm[:5], color=RED if c == cur_code else (225, 225, 225))
+                    dpg.add_text(p_txt, color=(235, 95, 95) if (p_tb and p_tb >= 0.52) else (200, 200, 200))
+                    dpg.add_text(subsec, color=(150, 185, 220))
+    else:
+        p_items = list(picks)
+        if s_key == "code":
+            p_items.sort(key=lambda r: str(r.get("code") or ""), reverse=not s_asc)
+        else:
+            p_items.sort(key=lambda r: (float(r.get("p_tb") or r.get("p_cond") or -1.0), str(r.get("code") or "")), reverse=not s_asc)
+        for r in p_items:
+            c = str(r["code"]).zfill(6)
+            nm = str(r.get("name") or "")
+            drawer_codes.append(c)
+            p_tb = r.get("p_tb") or r.get("p_cond")
+            subsec = (r.get("subsector") or r.get("industry") or "")[:5]
+            with dpg.table_row(parent="side_drawer_table"):
+                sel = dpg.add_selectable(
+                    label=c, span_columns=True, user_data=c,
+                    default_value=(c == cur_code),
+                    callback=lambda s, a, u: _on_pick_code(u),
+                )
+                dpg.bind_item_theme(sel, "row_hover")
+                dpg.add_text(nm[:5], color=RED if c == cur_code else (225, 225, 225))
+                dpg.add_text(f"{float(p_tb)*100:.1f}%" if p_tb else "-", color=(235, 90, 90))
+                dpg.add_text(subsec, color=(150, 185, 220))
+
+    STATE["drawer_codes"] = drawer_codes
+
+
+def _step_drawer_stock(delta: int):
+    """按顺序切换上一只(delta=-1)或下一只(delta=+1)候选/自选股票并绘制 K 线。"""
+    codes = STATE.get("drawer_codes") or []
+    if not codes:
+        _refresh_side_drawer()
+        codes = STATE.get("drawer_codes") or []
+    if not codes:
+        return
+    cur = STATE.get("cur_code")
+    if cur in codes:
+        idx = (codes.index(cur) + delta) % len(codes)
+    else:
+        idx = 0
+    target = codes[idx]
+    _on_pick_code(target)
+    _refresh_side_drawer()
+
+
+def _on_key_step_stock(sender, app_data):
+    """支持键盘 PageUp/PageDown 或在 K 线页按 ↑/↓ 方向键快速翻看下一只股票 K 线。"""
+    if not STATE.get("cur_code"):
+        return
+    # 若正在搜索输入框内打字，不拦截按键
+    for inp in ("kl_search_in", "prob_search", "alert_code"):
+        if dpg.does_item_exist(inp) and dpg.is_item_active(inp):
+            return
+    if app_data in (dpg.mvKey_Prior, dpg.mvKey_Up):
+        _step_drawer_stock(-1)
+    elif app_data in (dpg.mvKey_Next, dpg.mvKey_Down):
+        _step_drawer_stock(1)
+
+
+def _sync_oos_horizon_buttons(h: int):
+    labels = {
+        10: ("oos_h_10", "短波段 (10日·两周)"),
+        60: ("oos_h_60", "中线 (60日·一季度)"),
+        120: ("oos_h_120", "长线 (120日·半年)"),
+    }
+    for hk, (tag, text) in labels.items():
+        if dpg.does_item_exist(tag):
+            prefix = "● " if int(h) == hk else "○ "
+            dpg.configure_item(tag, label=prefix + text)
+
+
+def _render_oos_lab(st: dict):
+    """渲染策略样本外评测室：按当前选中的持有周期 (10/60/120) 渲染三大表格。"""
+    from app.strategy import cockpit as ck
+
+    cur_h = probability_desk.get_current_horizon()
+    _sync_oos_horizon_buttons(cur_h)
+    h_map = st.get("horizons") or {}
+    hd = h_map.get(str(cur_h)) or st
+
+    asof = hd.get("asof") or st.get("asof") or ""
+    h = int(hd.get("horizon") or cur_h)
+    h_label = ck.HORIZON_LABELS.get(h, f"{h}日")
     dpg.set_value(
         "rank_status",
-        f"已载入上次排行(算于 {cache.get('computed_at', '?')}"
-        f",数据日 {cache.get('data_date', '?')}) · "
-        f"可直接点『生成今日推荐』;数据更新后建议重刷排行")
+        f"【{h_label}】样本外评测 · 数据截至 {asof} · 训练窗 <= {st.get('train_end')} · "
+        f"样本外测试窗 2024-01 ~ {asof} · 持有 {h} 个交易日(次日开盘买/到期开盘卖,已扣印花税与佣金)",
+    )
+
+    # 1) 渲染市场状态闸门对比表
+    if dpg.does_item_exist("regime_oos_table"):
+        dpg.delete_item("regime_oos_table", children_only=True)
+        for col in [
+            "市场环境状态", "建议总仓位", "训练窗(21-23)胜率", "训练窗盈亏比",
+            "测试窗(24-26)期数", "测试窗全市场胜率", "高分档固定胜率", "高分档实战胜率(止盈)", "高分档单期净赚",
+        ]:
+            dpg.add_table_column(label=col, parent="regime_oos_table")
+        tr_regs = hd.get("train_regimes") or {}
+        te_regs = hd.get("test_regimes") or {}
+        for reg in (ck.REGIME_BULL, ck.REGIME_NEUTRAL, ck.REGIME_BEAR):
+            tr_r = tr_regs.get(reg) or {}
+            te_r = te_regs.get(reg) or {}
+            col_c = (70, 225, 130) if reg == ck.REGIME_BULL else (
+                (240, 85, 85) if reg == ck.REGIME_BEAR else (255, 200, 80)
+            )
+            mn_top = te_r.get("mean_tb_top", te_r.get("mean_net_top"))
+            with dpg.table_row(parent="regime_oos_table"):
+                dpg.add_text(ck.regime_cn_of(reg, h), color=col_c)
+                dpg.add_text(_pct_ui(ck.REGIME_POS_CAP.get(reg, 0.0)))
+                dpg.add_text(_pct_ui(tr_r.get("win_tb") or tr_r.get("win_gross")))
+                dpg.add_text(_num_ui(tr_r.get("payoff")))
+                dpg.add_text(str(te_r.get("n_dates", 0)))
+                dpg.add_text(_pct_ui(te_r.get("win_all")), color=col_c)
+                dpg.add_text(_pct_ui(te_r.get("win_top_dec")), color=col_c)
+                dpg.add_text(_pct_ui(te_r.get("win_tb_top_dec") or te_r.get("win_top_dec")), color=col_c)
+                dpg.add_text(
+                    _pct_ui(mn_top),
+                    color=RED if (mn_top is not None and mn_top > 0) else GREEN,
+                )
+
+    # 2) 渲染策略样本外对比表
+    _render_ranking(hd.get("strategies") or [])
+
+    # 3) 渲染 2021~2026 组合净值曲线、水下回撤与分年度归因表
+    _render_tearsheet(hd.get("tearsheet") or {}, h)
+
+    # 4) 渲染今日共振候选与热门板块
+    _render_picks(hd.get("today_picks") or [])
 
 
-def _render_ranking(df):
-    """渲染策略排行榜表。"""
-    dpg.delete_item("rank_table", children_only=True)
-    for col in ["排名", "策略", "综合分", "年化%", "总收益%", "胜率%", "回撤%", "盈亏比", "交易数"]:
-        dpg.add_table_column(label=col, parent="rank_table")
-    if df is None or df.empty:
+def _render_tearsheet(ts: dict, horizon: int):
+    """在评测室绘制 2021~2026 组合净值曲线与水下回撤图 + 分年度归因表。"""
+    if dpg.does_item_exist("oos_curve_box"):
+        dpg.delete_item("oos_curve_box", children_only=True)
+        dates = ts.get("dates") or []
+        eq_g = ts.get("eq_gated") or []
+        eq_r = ts.get("eq_raw") or []
+        eq_b = ts.get("eq_bench") or []
+        dd_g = ts.get("dd_gated") or []
+        dd_b = ts.get("dd_bench") or []
+        if dates and eq_g:
+            xs = list(range(len(dates)))
+            step_lbl = max(1, len(dates) // 8)
+            ticks = tuple((str(dates[i])[2:7], float(i)) for i in range(0, len(dates), step_lbl))
+            oos_s = (ts.get("oos_stats") or {}).get("gated") or {}
+            full_s = (ts.get("full_stats") or {}).get("gated") or {}
+            dpg.add_text(
+                f"组合净值与回撤 (2021~2026 全样本年化 {_pct_ui(full_s.get('cagr'))}, 夏普 {_num_ui(full_s.get('sharpe'))} | "
+                f"2024~2026 样本外累计 {_pct_ui(oos_s.get('tot_ret'))}, 最大回撤 {_pct_ui(oos_s.get('max_dd'))}, 卡玛 {_num_ui(oos_s.get('calmar'))})",
+                parent="oos_curve_box", color=(255, 205, 110),
+            )
+            with dpg.group(horizontal=True, parent="oos_curve_box"):
+                with dpg.plot(label="净值曲线 (1.0起点)", height=155, width=490):
+                    dpg.add_plot_legend()
+                    xa = dpg.add_plot_axis(dpg.mvXAxis, label="")
+                    dpg.set_axis_ticks(xa, ticks)
+                    with dpg.plot_axis(dpg.mvYAxis, label="净值"):
+                        dpg.add_line_series(xs, eq_g, label="开启闸门+优选策略",
+                                            tag=f"plot_eq_g_{horizon}")
+                        dpg.add_line_series(xs, eq_r, label="全天候裸跑",
+                                            tag=f"plot_eq_r_{horizon}")
+                        dpg.add_line_series(xs, eq_b, label="全市场等权",
+                                            tag=f"plot_eq_b_{horizon}")
+                with dpg.plot(label="水下回撤曲线 (%)", height=155, width=450):
+                    dpg.add_plot_legend()
+                    xa2 = dpg.add_plot_axis(dpg.mvXAxis, label="")
+                    dpg.set_axis_ticks(xa2, ticks)
+                    with dpg.plot_axis(dpg.mvYAxis, label="回撤%"):
+                        dpg.add_line_series(xs, [d * 100.0 for d in dd_g], label="开启闸门回撤%")
+                        dpg.add_line_series(xs, [d * 100.0 for d in dd_b], label="全市场等权回撤%")
+
+    if dpg.does_item_exist("oos_yearly_table"):
+        dpg.delete_item("oos_yearly_table", children_only=True)
+        for col in ["年份", "样本属性", "开启闸门组合收益", "全天候裸跑收益", "全市场等权基准", "组合超额收益"]:
+            dpg.add_table_column(label=col, parent="oos_yearly_table")
+        for yr_row in (ts.get("yearly") or []):
+            is_oos = bool(yr_row.get("is_oos"))
+            gr = yr_row.get("gated_ret", 0.0)
+            rr = yr_row.get("raw_ret", 0.0)
+            br = yr_row.get("bench_ret", 0.0)
+            ex = yr_row.get("excess_ret", 0.0)
+            with dpg.table_row(parent="oos_yearly_table"):
+                dpg.add_text(str(yr_row.get("year")), color=(255, 210, 110) if is_oos else (190, 190, 190))
+                dpg.add_text("★ 样本外测试窗" if is_oos else "训练窗",
+                             color=(80, 220, 130) if is_oos else (160, 160, 160))
+                dpg.add_text(_pct_ui(gr), color=RED if gr > 0 else GREEN)
+                dpg.add_text(_pct_ui(rr), color=RED if rr > 0 else GREEN)
+                dpg.add_text(_pct_ui(br), color=RED if br > 0 else GREEN)
+                dpg.add_text(_pct_ui(ex), color=RED if ex > 0 else GREEN)
+
+
+_RANK_COL_SPECS = (
+    ("排名", "rank"),
+    ("策略名称", None),
+    ("样本外判定", None),
+    ("实战胜率(止盈)", "win_tb"),
+    ("固定到期胜率", "win_gross"),
+    ("较盲买提升", "lift"),
+    ("单期净赚", "mean_net"),
+    ("盈亏比", "payoff"),
+    ("裸跑胜率", "win_raw"),
+    ("训练窗(21-23)胜率", "win_train"),
+    ("策略极值条件说明", None),
+)
+
+_PICKS_COL_SPECS = (
+    ("代码", "code"),
+    ("名称", None),
+    ("行业", None),
+    ("现价", "close"),
+    ("条件胜率", "p_cond"),
+    ("截面概率", "p_up"),
+    ("盈亏比", "payoff"),
+    ("挂单上限", "max_buy"),
+    ("ATR止损", "stop_loss"),
+    ("目标止盈", "take_profit"),
+    ("建议仓位", "pos_pct"),
+    ("命中策略", None),
+    ("操作", None),
+)
+
+
+def _on_rank_table_sort(sender, app_data):
+    skip_map = STATE.setdefault("_tbl_skip_auto_sort", {})
+    if skip_map.pop(sender, False) or not app_data:
         return
-    for _, r in df.iterrows():
+    col_id = app_data[0][0]
+    if not dpg.does_item_exist(col_id):
+        return
+    ud = dpg.get_item_user_data(col_id)
+    if not ud or not ud[2]:
+        return
+    _, _, s_key = ud
+    cur_k = STATE.get("rank_sort_key", "rank")
+    cur_asc = bool(STATE.get("rank_sort_asc", True))
+    if cur_k == s_key:
+        STATE["rank_sort_asc"] = not cur_asc
+    else:
+        STATE["rank_sort_key"] = s_key
+        STATE["rank_sort_asc"] = (s_key == "rank")
+    _render_ranking(STATE.get("last_rank_strats") or [])
+
+
+def _on_picks_table_sort(sender, app_data):
+    skip_map = STATE.setdefault("_tbl_skip_auto_sort", {})
+    if skip_map.pop(sender, False) or not app_data:
+        return
+    col_id = app_data[0][0]
+    if not dpg.does_item_exist(col_id):
+        return
+    ud = dpg.get_item_user_data(col_id)
+    if not ud or not ud[2]:
+        return
+    _, _, s_key = ud
+    cur_k = STATE.get("picks_sort_key", "p_cond")
+    cur_asc = bool(STATE.get("picks_sort_asc", False))
+    if cur_k == s_key:
+        STATE["picks_sort_asc"] = not cur_asc
+    else:
+        STATE["picks_sort_key"] = s_key
+        STATE["picks_sort_asc"] = (s_key == "code")
+    _render_picks(STATE.get("last_picks_list") or [])
+
+
+def _render_ranking(strats):
+    """渲染六大策略样本外评测表（支持点击任意可量化列排序并高亮）。"""
+    if not dpg.does_item_exist("rank_table"):
+        return
+    STATE["last_rank_strats"] = list(strats or [])
+    s_key = STATE.get("rank_sort_key", "rank")
+    s_asc = bool(STATE.get("rank_sort_asc", True))
+    _sync_sortable_table_cols("rank_table", "rank_main", _RANK_COL_SPECS, s_key, s_asc)
+    if not strats:
+        return
+
+    def _r_val(s):
+        tg = s.get("test_gated") or {}
+        tr = s.get("test_raw") or {}
+        trg = s.get("train_gated") or {}
+        if s_key == "rank":
+            return float(s.get("rank") or 99)
+        if s_key == "win_tb":
+            return float(tg.get("win_tb", tg.get("win_gross")) or -99)
+        if s_key == "win_gross":
+            return float(tg.get("win_gross") or -99)
+        if s_key == "lift":
+            return float(tg.get("total_tb_lift", tg.get("total_win_lift")) or -99)
+        if s_key == "mean_net":
+            return float(tg.get("mean_tb_net", tg.get("mean_net")) or -99)
+        if s_key == "payoff":
+            return float(tg.get("tb_payoff") or tg.get("payoff") or -99)
+        if s_key == "win_raw":
+            return float(tr.get("win_tb") or tr.get("win_gross") or -99)
+        if s_key == "win_train":
+            return float(trg.get("win_tb") or trg.get("win_gross") or -99)
+        return float(s.get("rank") or 99)
+
+    sorted_strats = sorted(list(strats), key=_r_val, reverse=not s_asc)
+    for s in sorted_strats:
+        tg = s.get("test_gated") or {}
+        tr = s.get("test_raw") or {}
+        trg = s.get("train_gated") or {}
+        verified = bool(s.get("verified"))
+        is_chase = s.get("key") in ("high_mom_chase", "high_flyer_chase")
+        badge = "★ 样本外通过" if verified else ("反面对照(勿追高)" if is_chase else "观察")
+        badge_col = (70, 225, 130) if verified else ((240, 80, 80) if is_chase else (200, 200, 200))
+        wtb = tg.get("win_tb", tg.get("win_gross"))
+        wg = tg.get("win_gross")
+        mn = tg.get("mean_tb_net", tg.get("mean_net"))
+        lift = tg.get("total_tb_lift", tg.get("total_win_lift"))
+        pf = tg.get("tb_payoff") or tg.get("payoff")
         with dpg.table_row(parent="rank_table"):
-            dpg.add_text(str(int(r["rank"])))
-            dpg.add_text(str(r["name"]))
-            dpg.add_text(str(r["score"]))
-            cg = r["cagr"]
-            dpg.add_text(f"{cg}", color=RED if cg > 0 else GREEN)
-            tr = r["total_return"]
-            dpg.add_text(f"{tr}", color=RED if tr > 0 else GREEN)
-            dpg.add_text(f"{r['win_rate']}")
-            dpg.add_text(f"{r['max_dd']}", color=GREEN)
-            dpg.add_text(f"{r['profit_factor']}")
-            dpg.add_text(str(int(r["n_trades"])))
+            dpg.add_text(str(s.get("rank", "")))
+            dpg.add_text(str(s.get("name", "")), color=badge_col)
+            dpg.add_text(badge, color=badge_col)
+            dpg.add_text(_pct_ui(wtb), color=RED if (wtb and wtb >= 0.52) else GREEN)
+            dpg.add_text(_pct_ui(wg), color=RED if (wg and wg >= 0.51) else GREEN)
+            dpg.add_text(_pct_ui(lift), color=RED if (lift and lift > 0) else GREEN)
+            dpg.add_text(_pct_ui(mn), color=RED if (mn and mn > 0) else GREEN)
+            dpg.add_text(_num_ui(pf))
+            dpg.add_text(_pct_ui(tr.get("win_tb") or tr.get("win_gross")))
+            dpg.add_text(_pct_ui(trg.get("win_tb") or trg.get("win_gross")))
+            dpg.add_text(str(s.get("desc", "")), color=(180, 185, 195))
 
 
-def _render_picks(df):
-    """渲染今日推荐票表(可点看K线、加自选),含行业列。"""
-    dpg.delete_item("picks_table", children_only=True)
-    for col in ["代码", "名称", "行业", "现价", "来源策略", "策略排名", "命中", "得分", "操作"]:
-        dpg.add_table_column(label=col, parent="picks_table")
-    if df is None or df.empty:
+def _render_picks(picks_list):
+    """渲染今日高胜率共振候选表(可双击代码看K线、加自选、支持点击可量化列排序)。"""
+    if not dpg.does_item_exist("picks_table"):
+        return
+    STATE["last_picks_list"] = list(picks_list or [])
+    s_key = STATE.get("picks_sort_key", "p_cond")
+    s_asc = bool(STATE.get("picks_sort_asc", False))
+    _sync_sortable_table_cols("picks_table", "picks_main", _PICKS_COL_SPECS, s_key, s_asc)
+    if not picks_list:
         _render_hot_sectors(None)
         return
-    imap = db.load_industry_map()
-    for _, r in df.iterrows():
-        code = r["code"]
+    rows = list(picks_list)
+    if s_key == "code":
+        rows.sort(key=lambda r: str(r.get("code") or ""), reverse=not s_asc)
+    else:
+        rows.sort(key=lambda r: (float(r.get(s_key) or 0.0), str(r.get("code") or "")), reverse=not s_asc)
+    for r in rows:
+        code = str(r["code"])
+        name = str(r.get("name") or "")
+        close = float(r.get("close") or 0.0)
+        p_cond = r.get("p_cond")
+        p_up = r.get("p_up")
+        setups = " / ".join(r.get("setups") or [])
+        stop_l = float(r.get("stop_loss") or close * 0.95)
+        take_p = float(r.get("take_profit") or close * 1.08)
+        max_b = float(r.get("max_buy") or close * 1.015)
+        pos_p = float(r.get("pos_pct") or 0.0)
         with dpg.table_row(parent="picks_table"):
             _sel = dpg.add_selectable(
-                label=code, span_columns=True, user_data=code,
-                callback=_on_code_click,   # 双击代码 → 跳K线页
+                label=code, span_columns=False, user_data=code,
+                callback=_on_code_click,
             )
             dpg.bind_item_theme(_sel, "row_hover")
-            dpg.add_text(str(r["name"]))
-            dpg.add_text(imap.get(code, "-"))
-            dpg.add_text(str(r["close"]))
-            dpg.add_text(str(r["strategy"]))
-            dpg.add_text(str(int(r["strat_rank"])))
-            dpg.add_text(str(int(r["hits"])))
-            dpg.add_text(str(r["score"]))
+            dpg.add_text(name)
+            dpg.add_text(str(r.get("industry") or "-")[:10])
+            dpg.add_text(f"{close:.2f}")
+            dpg.add_text(_pct_ui(p_cond), color=RED if (p_cond and p_cond >= 0.53) else (220, 220, 220))
+            dpg.add_text(_pct_ui(p_up))
+            dpg.add_text(_num_ui(r.get("payoff")))
+            dpg.add_text(f"{max_b:.2f}", color=(255, 210, 120))
+            dpg.add_text(f"{stop_l:.2f}", color=(80, 200, 130))
+            dpg.add_text(f"{take_p:.2f}", color=(235, 90, 90))
+            dpg.add_text(f"{pos_p:.1f}%")
+            dpg.add_text(setups, color=(150, 210, 255))
+            note = f"条件胜率{_pct_ui(p_cond)} 止损{stop_l:.2f} 止盈{take_p:.2f} {setups}"
             dpg.add_button(
-                label="+自选", width=60,
+                label="+自选", width=55,
                 callback=lambda s, a, u: _add_watch_from(u),
-                user_data=(code, r["name"], float(r["close"]), f"来自{r['strategy']}"),
+                user_data=(code, name, close, note),
             )
-    # 统计热门板块:推荐票按行业聚合,数量降序
-    _render_hot_sectors(df)
+    _render_hot_sectors(picks_list)
 
 
-def _render_hot_sectors(df):
-    """统计今日推荐票的行业分布,展示上榜数量最多的热门板块。"""
+def _render_hot_sectors(picks_list):
+    """统计今日共振候选的行业分布,展示上榜数量最多的热门板块。"""
     if not dpg.does_item_exist("hot_sectors"):
         return
     dpg.delete_item("hot_sectors", children_only=True)
-    if df is None or df.empty:
-        dpg.add_text("(暂无推荐,生成后显示热门板块)", parent="hot_sectors",
-                     color=(130, 130, 130))
+    if not picks_list:
+        dpg.add_text("(暂无候选)", parent="hot_sectors", color=(130, 130, 130))
         return
-    imap = db.load_industry_map()
     from collections import Counter
-    cnt = Counter(imap.get(c, "未分类") for c in df["code"])
+    cnt = Counter((r.get("industry") or "未分类") for r in picks_list)
     top = cnt.most_common(8)
-    if not top:
-        dpg.add_text("(无行业数据,请先更新数据补齐行业)", parent="hot_sectors",
-                     color=(130, 130, 130))
-        return
     with dpg.group(horizontal=True, parent="hot_sectors"):
         for name, c in top:
             dpg.add_text(f"[{name} x{c}]", color=RED if c >= 2 else (200, 200, 200))
 
 
+_WATCH_COL_SPECS = (
+    ("代码", "code"),
+    ("名称", None),
+    ("加入日", "add_date"),
+    ("买入价", "buy"),
+    ("现价", "cur"),
+    ("今日涨跌%", "chg"),
+    ("浮动盈亏%", "pnl"),
+    ("移动止损线", "sl_p"),
+    ("目标止盈线", "tp_p"),
+    ("风控纪律状态", None),
+    ("PE分位", None),
+    ("PB分位", None),
+    ("备注", None),
+    ("操作", None),
+)
+
+
+def _on_watch_table_sort(sender, app_data):
+    skip_map = STATE.setdefault("_tbl_skip_auto_sort", {})
+    if skip_map.pop(sender, False) or not app_data:
+        return
+    col_id = app_data[0][0]
+    if not dpg.does_item_exist(col_id):
+        return
+    ud = dpg.get_item_user_data(col_id)
+    if not ud or not ud[2]:
+        return
+    _, _, s_key = ud
+    cur_k = STATE.get("watch_sort_key")
+    cur_asc = bool(STATE.get("watch_sort_asc", False))
+    if cur_k == s_key:
+        STATE["watch_sort_asc"] = not cur_asc
+    else:
+        STATE["watch_sort_key"] = s_key
+        STATE["watch_sort_asc"] = (s_key == "code")
+    _refresh_watchlist(use_realtime=bool(STATE.get("spot")))
+
+
 # ---------- 自选持仓 / 实时盯盘 ----------
 def _refresh_watchlist(use_realtime=False):
     """
-    刷新自选/持仓表,计算浮动盈亏。
+    刷新自选/持仓表,计算浮动盈亏(支持点击可量化表头列排序、高亮与反向排序)。
     use_realtime=False: 用本地最新收盘价(默认,离线可用)。
     use_realtime=True : 先拉一次全市场实时快照,用实时价算盈亏并显示涨跌幅。
     """
     if not dpg.does_item_exist("watch_table"):
         return
-    cols = ["代码", "名称", "加入日", "买入价", "现价", "今日涨跌%", "浮动盈亏%",
-            "PE分位", "PB分位", "备注", "操作"]
-    dpg.delete_item("watch_table", children_only=True)
     STATE["_watch_hl_row"] = None   # 行重建后旧高亮索引失效,重置避免误清/越界
-    for col in cols:
-        dpg.add_table_column(label=col, parent="watch_table")
+    s_key = STATE.get("watch_sort_key")
+    s_asc = bool(STATE.get("watch_sort_asc", False))
+    _sync_sortable_table_cols("watch_table", "watch_main", _WATCH_COL_SPECS, s_key, s_asc)
     wl = db.load_watchlist()
     if wl is None or wl.empty:
-        dpg.set_value("watch_status", "自选为空。可在选股结果或今日推荐里点『+自选』加入。")
+        dpg.set_value("watch_status", "自选为空。可在今日共振池或K线页点『+自选』加入。")
+        _refresh_side_drawer()
         return
 
     spot = STATE.get("spot") if use_realtime else None
-    # 陈旧判断必须【按自选票各自】判断:每只票的 stale 标记表示它自己是否用了昨收兜底
-    # (盘前/午休/停牌)。不能拿全市场 any(stale) 一刀切——全市场几乎永远有停牌票,
-    # 会导致所有票都被误判为陈旧、实时价永远不落库。
     total_pnl = []
     live_prices = {}   # 本次拿到的【真实时价】(非昨收兜底),批量写库持久化
     n_saved = 0        # 用到库存历史现价的只数
     n_live = 0         # 拿到真实时价的只数(用于表头标签)
+    w_rows = []
     for _, r in wl.iterrows():
         code = r["code"]
         q = spot.get(code) if spot else None
@@ -2221,8 +4053,6 @@ def _refresh_watchlist(use_realtime=False):
                 live_prices[code] = cur   # 只把真实时价(非昨收兜底)写库
                 n_live += 1
         else:
-            # 无实时快照:优先用库里持久化的最近现价(重开软件不丢),
-            # 没有再退回本地日线收盘价
             saved = r.get("last_price") if "last_price" in r.index else None
             if saved is not None and saved == saved and float(saved) > 0:
                 cur = float(saved)
@@ -2234,27 +4064,67 @@ def _refresh_watchlist(use_realtime=False):
                     cur = float(kl.iloc[-1]["close"])
                     price_src = "kline"
         buy = float(r["buy_price"] or 0.0)
-        # 现价有效(>0)且有买入价才算浮动盈亏,否则留空,避免拉不到价时误显示 -100%
         has_cur = cur is not None and cur > 0
         pnl = ((cur - buy) / buy * 100) if (has_cur and buy > 0) else None
         if pnl is not None:
             total_pnl.append(pnl)
+        try:
+            from app.strategy import cockpit as ck
+            cur_h = probability_desk.get_current_horizon()
+            trail_info = ck.evaluate_holding_stop_and_trailing(
+                code, buy_price=buy, add_date=str(r["add_date"]), cur_price=cur, horizon=cur_h,
+            )
+        except Exception:
+            trail_info = {}
+        w_rows.append({
+            "code": str(code),
+            "name": str(r["name"] or ""),
+            "add_date": str(r["add_date"] or ""),
+            "note": str(r["note"] or ""),
+            "buy": buy,
+            "cur": cur,
+            "has_cur": has_cur,
+            "chg": chg,
+            "pnl": pnl,
+            "price_src": price_src,
+            "sl_p": trail_info.get("stop_price"),
+            "tp_p": trail_info.get("tp_price"),
+            "st_txt": trail_info.get("status") or "—",
+            "tone": trail_info.get("tone") or "neutral",
+        })
+
+    if s_key:
+        if s_key in ("code", "add_date"):
+            w_rows.sort(key=lambda x: str(x.get(s_key) or ""), reverse=not s_asc)
+        else:
+            valid = [x for x in w_rows if x.get(s_key) is not None]
+            nulls = [x for x in w_rows if x.get(s_key) is None]
+            valid.sort(key=lambda x: (float(x.get(s_key)), x["code"]), reverse=not s_asc)
+            w_rows = valid + nulls
+
+    for item in w_rows:
+        code = item["code"]
+        buy = item["buy"]
+        cur = item["cur"]
+        has_cur = item["has_cur"]
+        chg = item["chg"]
+        pnl = item["pnl"]
+        price_src = item["price_src"]
+        sl_p = item["sl_p"]
+        tp_p = item["tp_p"]
+        st_txt = item["st_txt"]
+        tone = item["tone"]
         with dpg.table_row(parent="watch_table"):
-            # 注:此表行内含"持仓点评/移除"按钮与"买入价"输入框,不能用
-            # span_columns=True(跨列 selectable 会铺满整行并抢占点击,导致
-            # 同行按钮/输入框点不动)。故此表只高亮代码格,保留行内交互。
             _sel = dpg.add_selectable(label=code, span_columns=False, user_data=code,
                                       callback=_on_code_click)   # 双击代码 → 跳K线页
             dpg.bind_item_theme(_sel, "row_hover")
-            dpg.add_text(str(r["name"]))
-            dpg.add_text(str(r["add_date"]))
-            # 买入价:内联可编辑(加入价不一定是真实买入价)。改完即存库并重算盈亏
+            dpg.add_text(item["name"])
+            dpg.add_text(item["add_date"])
             dpg.add_input_float(default_value=buy, width=90, step=0,
                                 format="%.2f", tag=f"watch_buy_{code}",
                                 user_data=code, on_enter=True,
                                 callback=_on_edit_buy_price)
             if has_cur:
-                # 库存历史价(saved)标灰,提示这不是最新实时价
                 dpg.add_text(f"{cur:.2f}",
                              color=(150, 150, 150) if price_src == "saved"
                              else (230, 230, 230))
@@ -2270,10 +4140,18 @@ def _refresh_watchlist(use_realtime=False):
                 dpg.add_text("待行情", color=(150, 150, 150))
             else:
                 dpg.add_text("观察", color=(150, 150, 150))
-            # PE/PB 历史分位: 先占位, 后台线程批量算完回填(见下方 _kick_watch_valuation)
+            tone_col = {
+                "danger": (80, 220, 110),
+                "warn": (255, 185, 70),
+                "bull": (235, 85, 85),
+                "ok": (170, 215, 185),
+            }.get(tone, (160, 160, 160))
+            dpg.add_text(f"{sl_p:.2f}" if sl_p else "-", color=(80, 200, 130))
+            dpg.add_text(f"{tp_p:.2f}" if tp_p else "-", color=(235, 90, 90))
+            dpg.add_text(st_txt, color=tone_col)
             dpg.add_text("…", tag=f"watch_peval_{code}", color=(120, 120, 130))
             dpg.add_text("…", tag=f"watch_pbval_{code}", color=(120, 120, 130))
-            dpg.add_text(str(r["note"]))
+            dpg.add_text(item["note"])
             with dpg.group(horizontal=True):
                 dpg.add_button(label="持仓点评", width=76,
                                callback=on_ai_hold_comment,
@@ -2311,6 +4189,7 @@ def _refresh_watchlist(use_realtime=False):
         _codes = []
     if _codes:
         _kick_watch_valuation(_codes)
+    _refresh_side_drawer()
 
 
 def _kick_watch_valuation(codes):
@@ -3234,20 +5113,61 @@ def _val_pct_cell(value, pct):
     return f"{value:.1f}({pct:.0f}%)", col
 
 
+_BOARD_COL_SPECS = (
+    ("排名", None),
+    ("板块", None),
+    ("涨跌幅", "chg_pct"),
+    ("成交额", "amount"),
+    ("净额(全单)", "net_inflow"),
+    ("涨/跌家数", None),
+    ("PE分位", None),
+    ("PB分位", None),
+    ("领涨股", None),
+)
+
+
+def _on_board_table_sort(sender, app_data):
+    skip_map = STATE.setdefault("_tbl_skip_auto_sort", {})
+    if skip_map.pop(sender, False) or not app_data:
+        return
+    col_id = app_data[0][0]
+    if not dpg.does_item_exist(col_id):
+        return
+    ud = dpg.get_item_user_data(col_id)
+    if not ud or not ud[2]:
+        return
+    _, _, s_key = ud
+    cur_k = STATE.get("mkt_board_sort", "chg_pct")
+    cur_asc = bool(STATE.get("mkt_board_asc", False))
+    if cur_k == s_key:
+        STATE["mkt_board_asc"] = not cur_asc
+    else:
+        STATE["mkt_board_sort"] = s_key
+        STATE["mkt_board_asc"] = False
+    _render_board(STATE.get("mkt_board_df"))
+
+
 def _render_board(df):
-    """渲染热门板块表(已按 STATE['mkt_board_sort'] 排序)。"""
+    """渲染热门板块表(支持点击可量化表头列排序、高亮与反向排序)。"""
     if not dpg.does_item_exist("mkt_board_table"):
         return
-    dpg.delete_item("mkt_board_table", children_only=True)
-    for col in ["排名", "板块", "涨跌幅", "成交额", "净额(全单)",
-                "涨/跌家数", "PE分位", "PB分位", "领涨股"]:
-        dpg.add_table_column(label=col, parent="mkt_board_table")
+    # 先显式删除上一次带字符串別名的单元格，防止 DPG alias 残留导致二次刷新异常
+    old_n = len(STATE.get("mkt_board_names") or [])
+    for i in range(max(old_n, 120)):
+        for suf in ("name", "chg", "amt", "net", "up", "down", "pepct", "pbpct", "leader", "lc"):
+            alias = f"bcell{i}_{suf}"
+            if dpg.does_item_exist(alias):
+                try:
+                    dpg.delete_item(alias)
+                except Exception:
+                    pass
+    key = STATE.get("mkt_board_sort", "chg_pct")
+    asc = bool(STATE.get("mkt_board_asc", False))
+    _sync_sortable_table_cols("mkt_board_table", "mkt_board_main", _BOARD_COL_SPECS, key, asc)
     if df is None or df.empty:
         return
-    key = STATE.get("mkt_board_sort", "chg_pct")
     if key in df.columns:
-        asc = False  # 涨幅/净流入/成交额均降序看头部
-        df = df.sort_values(key, ascending=asc).reset_index(drop=True)
+        df = df.sort_values(key, ascending=asc, na_position="last").reset_index(drop=True)
     # 记录渲染顺序对应的板块名 → 供定时刷新时按位置原地更新数值(不重建表、不重排序)
     names_order = []
     for i, r in df.iterrows():
@@ -3352,22 +5272,28 @@ def on_sort_board(sender=None, app_data=None, user_data=None):
     _render_board(STATE.get("mkt_board_df"))
 
 
-def _fetch_market_all():
+def _fetch_market_all(progress_cb=None):
     """后台拉取行情主数据,返回 (idx_df, activity_dict, summary_dict, board_df,
-    vol_dict, pool_dict)。这些都相对快(<5s),可进 10s 定时刷新循环。
-    涨跌幅分布(全市场快照~20s)不在此列,由独立慢速线程 _mkt_dist_worker 处理。"""
+    vol_dict, pool_dict)。每轮强制拉取最新一轮腾讯全市场实时快照，每步带独立超时保护。"""
+    if progress_cb:
+        progress_cb("正在拉取核心指数与全市场实时快照...")
+    market_data.force_refresh_spot()
     idx_df = market_data.fetch_index_spot()
+    if progress_cb:
+        progress_cb("正在计算全市场涨跌情绪与总貌...")
     act = market_data.fetch_market_activity()
     summ = market_data.fetch_market_summary()
+    if progress_cb:
+        progress_cb("正在拉取行业板块与资金流...")
     board = market_data.fetch_industry_board()
-    # 量能对比: 今日量与5日基准都在数据层从新浪日线取(同为"股"口径,
-    # 规避实时快照"沪按手/深按股"的单位陷阱), 此处无需再传今日量。
+    if progress_cb:
+        progress_cb("正在计算两市量能对比与涨停梯队...")
     try:
         vol = market_data.fetch_volume_compare()
     except Exception:  # noqa
         vol = {}
     try:
-        pool = market_data.fetch_limit_pool()   # 涨停/炸板池(~4s, 带45s缓存)
+        pool = market_data.fetch_limit_pool()
     except Exception:  # noqa
         pool = {}
     return idx_df, act, summ, board, vol, pool
@@ -3384,36 +5310,33 @@ def _kick_updown_dist():
         STATE["mkt_dist_inflight"] = True
         try:
             dist = market_data.fetch_updown_dist()
-            if not (dist and dist.get("bins")):
-                # 本轮全市场快照拉取失败/全被判 stale → bins 为空。此时【绝不能】用空数据
-                # 覆盖已画好的柱状图(否则出现"note 有旧数字、柱图却变加载中占位"的残缺态)。
-                # 已有成功分布则原样保留、直接跳过本轮;从未成功过才渲染首次占位提示。
-                prev = STATE.get("mkt_dist")
-                if not (prev and prev.get("bins")):
-                    _render_updown_dist(dist)
-                return
-            STATE["mkt_dist"] = dist
-            _render_updown_dist(dist)
-            # 分布(spot 全市场快照)是"上涨/下跌家数"的权威口径来源。它比涨跌家数区
-            # 慢~20s 回填,回来后重绘一次涨跌家数区,把首屏用 legu 占位的数字统一成
-            # spot 口径(消除"405/482"两个上涨数不一致),并落一条当日盘面宽度历史。
-            act = STATE.get("mkt_act")
-            summ = STATE.get("mkt_summ")
-            idx_df = STATE.get("mkt_idx_df")
-            if act is not None:
+
+            def apply(dist=dist):
+                if not (dist and dist.get("bins")):
+                    prev = STATE.get("mkt_dist")
+                    if not (prev and prev.get("bins")):
+                        _render_updown_dist(dist)
+                    return
+                STATE["mkt_dist"] = dist
+                _render_updown_dist(dist)
+                act = STATE.get("mkt_act")
+                summ = STATE.get("mkt_summ")
+                idx_df = STATE.get("mkt_idx_df")
+                if act is not None:
+                    try:
+                        _render_market(idx_df, act, summ)
+                    except Exception:  # noqa
+                        pass
                 try:
-                    _render_market(idx_df, act, summ)
+                    _persist_breadth(dist, STATE.get("mkt_pool"), idx_df)
                 except Exception:  # noqa
                     pass
-            try:
-                _persist_breadth(dist, STATE.get("mkt_pool"), idx_df)
-            except Exception:  # noqa
-                pass
-            # 分布回来后, 结论才有权威广度口径, 重绘一次盘面速读
-            try:
-                _render_market_verdict()
-            except Exception:  # noqa
-                pass
+                try:
+                    _render_market_verdict()
+                except Exception:  # noqa
+                    pass
+
+            _post_ui(apply)
         except Exception as e:  # noqa
             import traceback
             traceback.print_exc()
@@ -3438,12 +5361,13 @@ def _kick_board_trend():
         try:
             trend = market_data.fetch_board_trend(names)
             if trend:
-                STATE["mkt_board_trend"] = {
-                    **(STATE.get("mkt_board_trend") or {}), **trend}
-                # 用最新板块数据重绘诊断表(把回填的趋势/量比显示出来)
-                board = STATE.get("mkt_board_df")
-                if board is not None:
-                    _render_board_diagnosis(board)
+                def apply(trend=trend):
+                    STATE["mkt_board_trend"] = {
+                        **(STATE.get("mkt_board_trend") or {}), **trend}
+                    board = STATE.get("mkt_board_df")
+                    if board is not None:
+                        _render_board_diagnosis(board)
+                _post_ui(apply)
         except Exception:  # noqa
             import traceback
             traceback.print_exc()
@@ -3500,13 +5424,14 @@ def _kick_sector_val():
                         and need_backfill is None:
                     need_backfill = nm
 
-            # 重绘一次板块表, 把估值分位显示出来
-            board2 = STATE.get("mkt_board_df")
-            if board2 is not None:
-                try:
-                    _render_board(board2)
-                except Exception:  # noqa
-                    pass
+            def apply():
+                board2 = STATE.get("mkt_board_df")
+                if board2 is not None:
+                    try:
+                        _render_board(board2)
+                    except Exception:  # noqa
+                        pass
+            _post_ui(apply)
         except Exception:  # noqa
             import traceback
             traceback.print_exc()
@@ -3544,12 +5469,14 @@ def _kick_sector_backfill(name):
                 cache = dict(STATE.get("mkt_sector_val") or {})
                 cache[name] = rec
                 STATE["mkt_sector_val"] = cache
-                board = STATE.get("mkt_board_df")
-                if board is not None:
-                    try:
-                        _render_board(board)
-                    except Exception:  # noqa
-                        pass
+                def apply():
+                    board = STATE.get("mkt_board_df")
+                    if board is not None:
+                        try:
+                            _render_board(board)
+                        except Exception:  # noqa
+                            pass
+                _post_ui(apply)
         except Exception:  # noqa
             import traceback
             traceback.print_exc()
@@ -3561,96 +5488,40 @@ def _kick_sector_backfill(name):
 
 def on_refresh_market(sender=None, app_data=None, user_data=None):
     """刷新「行情」页数据(后台线程拉取,回主线程渲染,不阻塞界面)。"""
+    if STATE.get("mkt_refresh_inflight"):
+        return
+    STATE["mkt_refresh_inflight"] = True
     if dpg.does_item_exist("mkt_status"):
         dpg.set_value("mkt_status", "正在拉取大盘行情...")
+    if dpg.does_item_exist("mkt_refresh_btn"):
+        dpg.configure_item("mkt_refresh_btn", enabled=False, label="拉取中...")
+
+    def _prog(msg):
+        _post_ui(lambda m=msg: dpg.set_value("mkt_status", m) if dpg.does_item_exist("mkt_status") else None)
 
     def worker():
         try:
-            idx_df, act, summ, board, vol, pool = _fetch_market_all()
+            payload = _fetch_market_all(progress_cb=_prog)
+            dist = market_data.fetch_updown_dist()
         except Exception as e:  # noqa
-            if dpg.does_item_exist("mkt_status"):
-                dpg.set_value("mkt_status", f"行情拉取失败: {e}")
+            def fail(err=e):
+                STATE["mkt_refresh_inflight"] = False
+                if dpg.does_item_exist("mkt_refresh_btn"):
+                    dpg.configure_item("mkt_refresh_btn", enabled=True, label="刷新行情")
+                if dpg.does_item_exist("mkt_status"):
+                    dpg.set_value("mkt_status", f"行情拉取失败: {err}")
+            _post_ui(fail)
             return
-        try:
-            _render_market(idx_df, act, summ)
-            _render_market_mood(vol, pool)
-            STATE["mkt_board_df"] = board
-            STATE["mkt_idx_df"] = idx_df
-            STATE["mkt_act"] = act
-            STATE["mkt_summ"] = summ
-            STATE["mkt_vol"] = vol
-            STATE["mkt_pool"] = pool
-            _render_board(board)
-            _render_board_diagnosis(board)
-            _render_market_verdict()
-            # 多日趋势/量比(同花顺行业指数日线)对入选两端板块慢速回填
-            _kick_board_trend()
-            # 板块 PE/PB 中位数+历史分位(慢速回填, 按天缓存, 不阻塞主表)
-            _kick_sector_val()
-            ts = act.get("统计日期") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            tag = "(定时刷新中)" if STATE.get("mkt_poll_on") else ""
-            if dpg.does_item_exist("mkt_status"):
-                dpg.set_value("mkt_status", f"已更新 · 数据时间 {ts} {tag}")
-        except Exception as e:  # noqa
-            if dpg.does_item_exist("mkt_status"):
-                dpg.set_value("mkt_status", f"行情渲染失败: {e}")
 
-    threading.Thread(target=worker, daemon=True).start()
-    # 涨跌幅分布(全市场快照慢)单独起一次慢速拉取, 不阻塞上面的主刷新
-    _kick_updown_dist()
-
-
-def _selected_is_market(sel) -> bool:
-    """判断某个 tab 选中值 sel 是否指向『行情』tab。
-    兼容不同 DPG 版本:sel 可能是 int id,也可能是 str 别名。
-    - int:直接与 get_alias_id('tab_market') 比;
-    - str:先与别名字符串 'tab_market' 比,再尝试解析成 id 比。"""
-    if sel is None or sel == 0:
-        return False
-    try:
-        mid = dpg.get_alias_id("tab_market")
-    except Exception:
-        mid = None
-    # str 别名直接比对
-    if isinstance(sel, str):
-        if sel == "tab_market":
-            return True
-        try:
-            return dpg.get_alias_id(sel) == mid
-        except Exception:
-            return False
-    # int id 比对
-    try:
-        return int(sel) == int(mid)
-    except Exception:
-        return False
-
-
-def _on_main_tab_changed(sender=None, app_data=None, user_data=None):
-    """主标签栏切换回调(主线程触发)。把『当前是否停在行情页』记进 STATE,
-    供定时刷新线程读取。app_data 为当前选中 tab 的 id/别名。
-    注意:UI 值读取非线程安全,所以只在此主线程回调里读一次并缓存,
-    后台线程只读 STATE 这个纯字典。"""
-    try:
-        STATE["active_is_market"] = _selected_is_market(app_data)
-    except Exception:
-        pass
-
-
-def _is_market_tab_active() -> bool:
-    """当前是否正停在『行情』tab(供定时刷新线程调用)。
-    只读 STATE 缓存的纯布尔值,不在后台线程碰 UI(线程安全)。"""
-    return bool(STATE.get("active_is_market"))
-
-
-def _mkt_poll_worker():
-    """行情页定时刷新线程:每 MKT_POLL_INTERVAL 秒拉一次并重绘。
-    仅当界面正停在『行情』tab 时才真正拉取;切到其他 tab 时静默跳过本轮,
-    避免用户在别的界面时后台仍在发网络请求、刷新看不到的页面。"""
-    while STATE.get("mkt_poll_on"):
-        if _is_market_tab_active():
+        def apply(data=payload, dist_data=dist):
+            STATE["mkt_refresh_inflight"] = False
+            if dpg.does_item_exist("mkt_refresh_btn"):
+                dpg.configure_item("mkt_refresh_btn", enabled=True, label="刷新行情")
+            idx_df, act, summ, board, vol, pool = data
             try:
-                idx_df, act, summ, board, vol, pool = _fetch_market_all()
+                if dist_data and dist_data.get("bins"):
+                    STATE["mkt_dist"] = dist_data
+                    _render_updown_dist(dist_data)
                 _render_market(idx_df, act, summ)
                 _render_market_mood(vol, pool)
                 STATE["mkt_board_df"] = board
@@ -3659,53 +5530,171 @@ def _mkt_poll_worker():
                 STATE["mkt_summ"] = summ
                 STATE["mkt_vol"] = vol
                 STATE["mkt_pool"] = pool
-                # 定时刷新只原地更新板块表数值,不重建表/不重排序,
-                # 保持用户当前滚动位置(体感不跳)
-                _update_board_values(board)
+                _render_board(board)
                 _render_board_diagnosis(board)
                 _render_market_verdict()
-                # 涨跌幅分布慢(全市场快照~20s),独立慢速线程拉,不拖累本轮
-                _kick_updown_dist()
-                # 多日趋势/量比对入选两端板块慢速回填
                 _kick_board_trend()
-                # 板块 PE/PB 中位数+历史分位(慢速回填, 按天缓存)
                 _kick_sector_val()
                 ts = act.get("统计日期") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                sync_clk = datetime.now().strftime("%H:%M:%S")
+                STATE["mkt_last_ts"] = ts
+                STATE["mkt_last_sync_clock"] = sync_clk
+                tag = "(⏱ 定时刷新开启中)" if STATE.get("mkt_poll_on") else ""
                 if dpg.does_item_exist("mkt_status"):
-                    dpg.set_value("mkt_status", f"已更新 · 数据时间 {ts} (定时刷新中)")
+                    dpg.set_value("mkt_status", f"已更新 · 行情时间 {ts} | 本地同步 {sync_clk} {tag}")
             except Exception as e:  # noqa
-                # 拉取/渲染失败也显示到界面,别只 print 到看不见的控制台
-                import traceback
                 traceback.print_exc()
                 if dpg.does_item_exist("mkt_status"):
-                    dpg.set_value("mkt_status", f"定时刷新失败:{e} ({datetime.now().strftime('%H:%M:%S')})")
+                    dpg.set_value("mkt_status", f"行情渲染失败: {e}")
+
+        _post_ui(apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _selected_is_market(sel) -> bool:
+    """判断某个 tab 选中值 sel 是否指向『行情』tab。"""
+    if sel is None or sel == 0:
+        return False
+    try:
+        mid = dpg.get_alias_id("tab_market")
+    except Exception:
+        mid = None
+    if isinstance(sel, str):
+        if sel == "tab_market":
+            return True
+        try:
+            return dpg.get_alias_id(sel) == mid
+        except Exception:
+            return False
+    try:
+        return int(sel) == int(mid)
+    except Exception:
+        return False
+
+
+def _on_main_tab_changed(sender=None, app_data=None, user_data=None):
+    """主标签栏切换回调(主线程触发)。切到『行情』页且尚未加载过数据时自动拉取一次。"""
+    try:
+        is_mkt = _selected_is_market(app_data)
+        STATE["active_is_market"] = is_mkt
+        if is_mkt and STATE.get("mkt_idx_df") is None and not STATE.get("mkt_refresh_inflight"):
+            on_refresh_market()
+    except Exception:
+        pass
+
+
+def _is_market_tab_active() -> bool:
+    """当前是否正停在『行情』tab(供定时刷新线程调用)。"""
+    return bool(STATE.get("active_is_market"))
+
+
+def _mkt_poll_worker():
+    """行情页定时刷新线程:每 MKT_POLL_INTERVAL 秒拉一次并重绘，带每秒实时倒计时反馈。"""
+    poll_seq = 0
+    while STATE.get("mkt_poll_on"):
+        if _is_market_tab_active():
+            if not STATE.get("mkt_refresh_inflight"):
+                poll_seq += 1
+                cur_seq = poll_seq
+                STATE["mkt_refresh_inflight"] = True
+                last_ts = STATE.get("mkt_last_ts") or "—"
+                _post_ui(
+                    lambda sq=cur_seq, lt=last_ts: dpg.set_value(
+                        "mkt_status", f"⏱ 正在同步最新盘面 (第{sq}次自动刷新 · 上次行情 {lt})..."
+                    ) if dpg.does_item_exist("mkt_status") else None
+                )
+                try:
+                    payload = _fetch_market_all()
+                    dist = market_data.fetch_updown_dist()
+                except Exception as e:  # noqa
+                    traceback.print_exc()
+                    STATE["mkt_refresh_inflight"] = False
+                    def fail(err=e):
+                        if dpg.does_item_exist("mkt_status"):
+                            dpg.set_value("mkt_status", f"定时刷新失败:{err} ({datetime.now().strftime('%H:%M:%S')})")
+                    _post_ui(fail)
+                    payload = None
+                    dist = None
+                if payload is not None:
+                    def apply(data=payload, dist_data=dist, sq=cur_seq):
+                        STATE["mkt_refresh_inflight"] = False
+                        idx_df, act, summ, board, vol, pool = data
+                        try:
+                            if dist_data and dist_data.get("bins"):
+                                STATE["mkt_dist"] = dist_data
+                                _render_updown_dist(dist_data)
+                            _render_market(idx_df, act, summ)
+                            _render_market_mood(vol, pool)
+                            STATE["mkt_board_df"] = board
+                            STATE["mkt_idx_df"] = idx_df
+                            STATE["mkt_act"] = act
+                            STATE["mkt_summ"] = summ
+                            STATE["mkt_vol"] = vol
+                            STATE["mkt_pool"] = pool
+                            _update_board_values(board)
+                            _render_board_diagnosis(board)
+                            _render_market_verdict()
+                            _kick_board_trend()
+                            _kick_sector_val()
+                            ts = act.get("统计日期") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            sync_clk = datetime.now().strftime("%H:%M:%S")
+                            STATE["mkt_last_ts"] = ts
+                            STATE["mkt_last_sync_clock"] = sync_clk
+                            if dpg.does_item_exist("mkt_status"):
+                                dpg.set_value(
+                                    "mkt_status",
+                                    f"已更新 · 行情时间 {ts} | 本地同步 {sync_clk} (⏱ 第{sq}次自动刷新 · {MKT_POLL_INTERVAL}秒后更新)",
+                                )
+                        except Exception as e:  # noqa
+                            traceback.print_exc()
+                            if dpg.does_item_exist("mkt_status"):
+                                dpg.set_value("mkt_status", f"定时刷新失败:{e} ({datetime.now().strftime('%H:%M:%S')})")
+                    _post_ui(apply)
         else:
-            # 不在行情页,跳过本轮(把原因显示出来,便于排查"勾了却不刷新")
-            if dpg.does_item_exist("mkt_status"):
-                cur = dpg.get_value("mkt_status") or ""
-                if "已暂停" not in cur:
-                    dpg.set_value("mkt_status", "定时刷新已暂停(当前不在行情页,切回自动恢复)")
-        for _ in range(MKT_POLL_INTERVAL * 2):
+            def pause_note():
+                if dpg.does_item_exist("mkt_status"):
+                    cur = dpg.get_value("mkt_status") or ""
+                    if "已暂停" not in cur:
+                        dpg.set_value("mkt_status", "定时刷新已暂停(当前不在行情页,切回自动恢复)")
+            _post_ui(pause_note)
+
+        # 每秒更新一次倒计时，让用户直观看到 10 秒定时器正在工作
+        for rem in range(MKT_POLL_INTERVAL, 0, -1):
             if not STATE.get("mkt_poll_on"):
                 break
-            _time.sleep(0.5)
+            if _is_market_tab_active() and not STATE.get("mkt_refresh_inflight"):
+                ts_show = STATE.get("mkt_last_ts")
+                clk_show = STATE.get("mkt_last_sync_clock")
+                if ts_show:
+                    _post_ui(
+                        lambda r_sec=rem, sq=poll_seq, t_s=ts_show, c_s=clk_show: dpg.set_value(
+                            "mkt_status",
+                            f"已更新 · 行情时间 {t_s} | 本地同步 {c_s} (⏱ 第{sq}次自动刷新 · {r_sec}秒后下次更新)",
+                        ) if (dpg.does_item_exist("mkt_status") and STATE.get("mkt_poll_on")) else None
+                    )
+            for _ in range(2):
+                if not STATE.get("mkt_poll_on"):
+                    break
+                _time.sleep(0.5)
 
 
 def on_toggle_mkt_poll(sender=None, app_data=None, user_data=None):
     """行情页『盘中定时刷新』开关回调。app_data 为 checkbox 新值。"""
     want = bool(app_data)
     if want and not STATE.get("mkt_poll_on"):
-        # 关键:这个复选框本身就在行情页上,用户能勾到它,当下必然停在行情页。
-        # 所以勾选即直接置 True——不去读 tab_bar 的选中值(其类型在不同 DPG
-        # 版本 int/str 不一,硬比较易恒 False,正是之前"勾了也不刷新"的根因)。
-        # 之后切走由 _on_main_tab_changed 回调更新为 False,切回再置回 True。
         STATE["active_is_market"] = True
         STATE["mkt_poll_on"] = True
+        if dpg.does_item_exist("mkt_status"):
+            dpg.set_value("mkt_status", f"⏱ 盘中定时刷新已开启(每{MKT_POLL_INTERVAL}秒) · 正在同步最新盘面...")
         t = threading.Thread(target=_mkt_poll_worker, daemon=True)
         STATE["mkt_poll_thread"] = t
         t.start()
     elif not want:
         STATE["mkt_poll_on"] = False
+        ts_show = STATE.get("mkt_last_ts")
+        if ts_show and dpg.does_item_exist("mkt_status"):
+            dpg.set_value("mkt_status", f"已更新 · 行情时间 {ts_show} (定时刷新已关闭)")
 
 
 def _build_market_snapshot():
@@ -3773,29 +5762,32 @@ def on_ai_comment_market(sender=None, app_data=None, user_data=None):
 
         def _on_delta(piece):
             buf["s"] += piece
-            if dpg.does_item_exist("mkt_ai_text"):
-                dpg.set_value("mkt_ai_text", buf["s"])
+            cur_s = buf["s"]
+            _post_ui(lambda t=cur_s: dpg.set_value("mkt_ai_text", t) if dpg.does_item_exist("mkt_ai_text") else None)
 
-        try:
-            res = ai_commentary.comment_market(snapshot, on_delta=_on_delta)
-            if res.get("ok"):
-                dpg.set_value("mkt_ai_text", res["text"])
-                dpg.set_value("mkt_ai_disclaimer", res["disclaimer"])
-                dpg.configure_item("mkt_ai_disclaimer", show=True)
-                # 情绪评级彩色标签(偏暖=红 偏冷=绿,遵循 A 股惯例)
-                sent = res.get("sentiment")
-                if dpg.does_item_exist("mkt_ai_sentiment") and sent:
-                    color = {"偏暖": (230, 60, 60), "偏冷": (40, 170, 80),
-                             "中性": (200, 180, 90)}.get(sent, (200, 200, 200))
-                    dpg.set_value("mkt_ai_sentiment", f"  市场情绪:{sent}")
-                    dpg.configure_item("mkt_ai_sentiment", color=color, show=True)
-            else:
-                dpg.set_value("mkt_ai_text",
-                              f"点评失败:\n{res.get('error', '未知错误')}")
-                dpg.configure_item("mkt_ai_disclaimer", show=False)
-        finally:
-            if dpg.does_item_exist("mkt_ai_btn"):
-                dpg.configure_item("mkt_ai_btn", enabled=True, label="AI点评大盘")
+        res = ai_commentary.comment_market(snapshot, on_delta=_on_delta)
+
+        def finish(r=res):
+            try:
+                if r.get("ok"):
+                    dpg.set_value("mkt_ai_text", r["text"])
+                    dpg.set_value("mkt_ai_disclaimer", r["disclaimer"])
+                    dpg.configure_item("mkt_ai_disclaimer", show=True)
+                    sent = r.get("sentiment")
+                    if dpg.does_item_exist("mkt_ai_sentiment") and sent:
+                        color = {"偏暖": (230, 60, 60), "偏冷": (40, 170, 80),
+                                 "中性": (200, 180, 90)}.get(sent, (200, 200, 200))
+                        dpg.set_value("mkt_ai_sentiment", f"  市场情绪:{sent}")
+                        dpg.configure_item("mkt_ai_sentiment", color=color, show=True)
+                else:
+                    dpg.set_value("mkt_ai_text",
+                                  f"点评失败:\n{r.get('error', '未知错误')}")
+                    dpg.configure_item("mkt_ai_disclaimer", show=False)
+            finally:
+                if dpg.does_item_exist("mkt_ai_btn"):
+                    dpg.configure_item("mkt_ai_btn", enabled=True, label="AI点评大盘")
+
+        _post_ui(finish)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -3810,6 +5802,7 @@ def _on_pick_code(code, hint=None):
     STATE["intraday_code"] = None   # 换标的:分时图需完整重建
     STATE["ai_hint"] = hint          # 策略上下文(仅本次选中的标的有效)
     show_kline(code, "D")           # 先画好K线
+    _refresh_side_drawer()          # 同步高亮左侧看盘抽屉当前选中行
     # 再切到「选股 & K线」tab(用 int id 最稳,别名字符串在部分DPG版本 set_value 不接受)
     try:
         if dpg.does_item_exist("main_tabs") and dpg.does_item_exist("tab_kline"):
@@ -4090,40 +6083,91 @@ def _compose_kline_info(code):
     # 技术面:RSI(14) 按当前周期实时算,超买/超卖分色
     rsi_val = _latest_rsi(code, STATE.get("cur_period", "D"))
     fields.append(_seg_rsi(rsi_val))
-    # 筹码面:获利盘比例 + 平均成本(始终按日线算,价格维度指标)
+    # 筹码面:获利盘比例 + 平均成本 + 90%成本区间(始终按日线算,价格维度指标)
     try:
         _cd = db.load_kline(code)
-        _chip = chip.compute_chip_distribution(_cd, total_mv=f.get("total_mv"))
+        _mv_chip = f.get("float_mv") or f.get("total_mv")
+        _chip = chip.compute_chip_distribution(_cd, total_mv=_mv_chip)
     except Exception:  # noqa
         _chip = None
     if _chip is not None:
         pf = _chip["profit_ratio"] * 100
         lc = _chip["last_close"]
         ac = _chip["avg_cost"]
-        # 获利盘:高=浮盈多(潜在抛压),低=普遍套牢(超跌)。语义偏中性,用状态色
         pf_col = RSI_OVERBOUGHT if pf >= 85 else (
             RSI_OVERSOLD if pf <= 15 else INFO_NEUTRAL)
         fields.append([("获利盘 ", INFO_LABEL), (f"{pf:.0f}%", pf_col)])
-        # 现价相对平均成本:上方红(强)、下方绿(弱)
         ac_col = RED if lc >= ac else GREEN
         fields.append([("平均成本 ", INFO_LABEL), (f"{ac:.2f}", ac_col)])
-    if f.get("gross_margin") is not None:
-        fields.append(_seg_signed("毛利率", f.get("gross_margin")))
+
+    # 优先从 pit_financials 补充最新季报的 净利同比 / 营收同比 / 毛利率 / 二级细分板块
+    rev_yoy = f.get("rev_yoy")
+    profit_yoy = f.get("profit_yoy")
+    gross_m = f.get("gross_margin")
+    subsec = ""
+    try:
+        with db.get_conn() as conn:
+            pr = conn.execute(
+                "SELECT rev_yoy, profit_yoy, gross_margin, board_name, report_date "
+                "FROM pit_financials WHERE code=? ORDER BY report_date DESC LIMIT 1",
+                (str(code).zfill(6),),
+            ).fetchone()
+        if pr:
+            if rev_yoy is None and pr[0] is not None:
+                rev_yoy = pr[0]
+            if profit_yoy is None and pr[1] is not None:
+                profit_yoy = pr[1]
+            if gross_m is None and pr[2] is not None:
+                gross_m = pr[2]
+            if pr[3]:
+                subsec = str(pr[3])
+            if not f.get("report_date") and pr[4]:
+                f["report_date"] = str(pr[4])
+    except Exception:
+        pass
+
+    if gross_m is not None:
+        fields.append(_seg_signed("毛利率", gross_m))
     if f.get("net_margin") is not None:
         fields.append(_seg_signed("净利率", f.get("net_margin")))
-    # ③ 涨跌语义:营收/净利同比,增长红、下滑绿(最有信息量,重点分色)
-    if f.get("rev_yoy") is not None:
-        fields.append(_seg_signed("营收同比", f.get("rev_yoy")))
-    if f.get("profit_yoy") is not None:
-        fields.append(_seg_signed("净利同比", f.get("profit_yoy")))
-    # 负债率:中性偏事实(高未必坏,行业差异大),不涂红绿
+    if rev_yoy is not None:
+        fields.append(_seg_signed("营收同比", rev_yoy))
+    if profit_yoy is not None:
+        fields.append(_seg_signed("净利同比", profit_yoy))
     if f.get("debt_ratio") is not None:
-        fields.append(_seg_neutral("负债率",
-                                   _fmt_num(f.get("debt_ratio"), 2, "%")))
-    # 尾部补充:行业分位 + 财报期(灰显)
-    # 说明:percentile = 同行中比它更便宜(PE更低)的占比。低=便宜,高=贵。
-    # 直接用"比X%同行便宜"的正向措辞,避免"高于X%"字面歧义(见AI点评同源修复)。
-    tail = ""
+        fields.append(_seg_neutral("负债率", _fmt_num(f.get("debt_ratio"), 2, "%")))
+
+    # 主力大单盘口资金流 (capital_flow)
+    try:
+        cf = db.load_latest_capital_flow().get(str(code).zfill(6))
+        if cf:
+            inf_yi = cf.get("net_inflow_yi")
+            nb_r = cf.get("net_big_ratio")
+            imb = cf.get("active_buy_imb")
+            if inf_yi is not None and nb_r is not None:
+                cf_col = RED if float(inf_yi) > 0 else (GREEN if float(inf_yi) < 0 else INFO_NEUTRAL)
+                imb_txt = "外盘主买" if (imb and imb > 0.03) else ("内盘主卖" if (imb and imb < -0.03) else "多空均衡")
+                fields.append([
+                    ("主力净流 ", INFO_LABEL),
+                    (f"{float(inf_yi):+.2f}亿(大单净比{float(nb_r)*100:+.1f}%·{imb_txt})", cf_col),
+                ])
+    except Exception:
+        pass
+
+    # 解禁与业绩预告排雷/催化日历 (risk_calendar)
+    try:
+        evs = db.load_risk_calendar_map().get(str(code).zfill(6)) or []
+        for ev in evs[:2]:
+            sev = ev.get("severity")
+            summ = ev.get("summary") or ""
+            ev_col = (240, 80, 80) if sev == "veto" else ((255, 190, 80) if sev == "warn" else RED)
+            tag_p = "🚨排雷 " if sev == "veto" else ("⚠提醒 " if sev == "warn" else "★催化 ")
+            fields.append([(tag_p, INFO_LABEL), (summ, ev_col)])
+    except Exception:
+        pass
+
+    # 尾部补充:二级细分题材 + 行业分位 + 财报期(灰显)
+    tail = f"[{subsec}] " if subsec else ""
     if pe_pct:
         p = pe_pct["percentile"]
         cheaper = 100.0 - p
@@ -4161,8 +6205,36 @@ def _set_info_message(msg, color=INFO_LABEL):
         dpg.add_text(msg, parent="kline_info", color=color)
 
 
+def _add_cur_kline_to_watch():
+    code = STATE.get("cur_code")
+    if not code:
+        _set_status("请先选择一只股票查看K线")
+        return
+    q = probability_desk.get_stock_quant_info(code)
+    if q:
+        setups = "/".join(q.get("setups") or []) or "K线跟踪"
+        note = f"条件胜率{q.get('p_cond', 0)*100:.1f}% 止损{q.get('stop_loss', 0):.2f} 止盈{q.get('take_profit', 0):.2f} {setups}"
+        _add_watch_from((code, q.get("name") or code, float(q.get("close") or 0), note))
+    else:
+        _add_watch_code(code, "K线页添加")
+
+
 def _update_kline_info(code):
-    """更新 K 线上方基本面信息栏。本地有秒显示,缺失则后台拉取回填,不卡界面。"""
+    """更新 K 线上方四层量化标尺 + 基本面信息栏。本地有秒显示,缺失则后台拉取回填,不卡界面。"""
+    if dpg.does_item_exist("kline_quant_info"):
+        q = probability_desk.get_stock_quant_info(code)
+        if q:
+            setups = " / ".join(q.get("setups") or []) or "未触发极值形态(常规截面)"
+            h = q.get("horizon", 10)
+            dpg.set_value(
+                "kline_quant_info",
+                f"【{h}日周期标尺】 条件胜率 {_pct_ui(q.get('p_cond'))} (截面概率 {_pct_ui(q.get('p_up'))}, "
+                f"年价格分位 {_pct_ui(q.get('pos250'))}, 盈亏比 {_num_ui(q.get('payoff'))}) | "
+                f"挂单上限 {q.get('max_buy'):.2f} | 周期止损 {q.get('stop_loss'):.2f} | "
+                f"目标止盈 {q.get('take_profit'):.2f} | 建议仓位 {q.get('pos_pct'):.1f}% | 形态: {setups}",
+            )
+        else:
+            dpg.set_value("kline_quant_info", "")
     if not dpg.does_item_exist("kline_info"):
         return
     # ETF 无个股基本面,直接清空信息栏
@@ -4216,15 +6288,33 @@ def show_kline(code, period=None):
 
     df = db.load_kline(code)
     if df.empty:
-        _set_status(f"{code} 无本地数据")
-        return
+        # 若该代码为场内 ETF 且本地尚未拉取日线，自动秒拉前复权日线后立即绘图
+        if str(code).startswith(("51", "56", "58", "15")):
+            try:
+                _set_status(f"正在按需拉取 ETF {code} 历史日线...")
+                df = fetcher.update_etf_kline(code, start_date="20210101", incremental=True)
+            except Exception:
+                df = pd.DataFrame()
+        if df is None or df.empty:
+            _set_status(f"{code} 无本地K线数据(场外公募基金为每日净值制，无盘中K线)")
+            return
     # 日线聚合成周/月线
     if period in ("W", "M"):
         df = ind.resample_period(df, period)
+    # 先在完整历史序列上计算均线(MA250/MA60/BOLL/MACD)，再按用户选择的视野截取显示根数，
+    # 这样直接用 fit_axis_data 就能自由滚轮缩放和鼠标左键拖拽，绝不调用 set_axis_limits 锁死坐标轴！
+    df["ma250"] = df["close"].astype(float).rolling(250, min_periods=90).mean()
     df = ind.enrich(df)
-    # 按周期取合理根数,使各周期时间跨度接近(否则同为120根:日线仅半年、周线2.3年、月线10年,对不上)
-    # DPG 渲染上千根蜡烛也很流畅,性能非瓶颈;日线放到全量(本地约1335根≈5年),支持滚轮缩放/拖动查看
-    tail_n = {"D": 2000, "W": 250, "M": 200}.get(period, 2000)
+    zoom_mode = dpg.get_value("kl_zoom_combo") if dpg.does_item_exist("kl_zoom_combo") else "近9个月(180根)"
+    if period == "D":
+        tail_n = {
+            "近半年(120根)": 120,
+            "近9个月(180根)": 180,
+            "近一年(250根)": 250,
+            "全部历史": 2000,
+        }.get(zoom_mode, 180)
+    else:
+        tail_n = {"W": 180, "M": 120}.get(period, 180) if zoom_mode != "全部历史" else 500
     df = df.tail(tail_n).reset_index(drop=True)
     pname = {"D": "日线", "W": "周线", "M": "月线"}.get(period, "日线")
     nm = db.name_of(code)
@@ -4286,18 +6376,62 @@ def show_kline(code, period=None):
                 lx, ly = _line_xy(xs, df[col])
                 if lx:
                     dpg.add_line_series(lx, ly, label=lbl, parent=ky)
+            # 可选叠加：年线 (MA250) 与布林带 (BOLL)
+            if dpg.does_item_exist("kl_opt_ma250") and dpg.get_value("kl_opt_ma250") and "ma250" in df.columns:
+                lx, ly = _line_xy(xs, df["ma250"])
+                if lx:
+                    dpg.add_line_series(lx, ly, label="MA250(年线)", parent=ky)
+            if dpg.does_item_exist("kl_opt_boll") and dpg.get_value("kl_opt_boll"):
+                for col, lbl in [("boll_up", "BOLL上轨"), ("boll_low", "BOLL下轨")]:
+                    if col in df.columns:
+                        lx, ly = _line_xy(xs, df[col])
+                        if lx:
+                            dpg.add_line_series(lx, ly, label=lbl, parent=ky)
             # 平均成本参考线(横贯K线主图,与右侧筹码栏同价位对齐)
             try:
                 _cdf0 = db.load_kline(code)
                 _fm0 = db.get_fundamental(code) or {}
-                _chip0 = chip.compute_chip_distribution(
-                    _cdf0, total_mv=_fm0.get("total_mv"))
+                _mv0 = _fm0.get("float_mv") or _fm0.get("total_mv")
+                _chip0 = chip.compute_chip_distribution(_cdf0, total_mv=_mv0)
             except Exception:  # noqa
                 _chip0 = None
             if _chip0 is not None:
                 _ac0 = _chip0["avg_cost"]
                 dpg.add_line_series([xs[0], xs[-1]], [_ac0, _ac0], parent=ky,
                                     label=f"平均成本 {_ac0:.2f}")
+            # 目标止盈线 & ATR止损线 (默认开启，可在顶栏勾选开关；超出当前K线区间过远时不画入主图以免撑扁K线)
+            p_min_bar = float(min(lows)) if lows else 0.0
+            p_max_bar = float(max(highs)) if highs else 0.0
+            p_span = max(0.01, p_max_bar - p_min_bar)
+            show_sl_tp = (not dpg.does_item_exist("kl_opt_sltp")) or bool(dpg.get_value("kl_opt_sltp"))
+            if show_sl_tp:
+                q_info = probability_desk.get_stock_quant_info(code)
+                if q_info:
+                    _sl = q_info.get("stop_loss")
+                    _tp = q_info.get("take_profit")
+                    if _tp and _tp > 0 and float(_tp) <= p_max_bar + p_span * 0.35:
+                        s_tp = dpg.add_line_series([xs[0], xs[-1]], [float(_tp), float(_tp)], parent=ky,
+                                                   label=f"目标止盈 {_tp:.2f}")
+                        dpg.bind_item_theme(s_tp, "line_red")
+                    if _sl and _sl > 0 and float(_sl) >= p_min_bar - p_span * 0.35:
+                        s_sl = dpg.add_line_series([xs[0], xs[-1]], [float(_sl), float(_sl)], parent=ky,
+                                                   label=f"ATR止损 {_sl:.2f}")
+                        dpg.bind_item_theme(s_sl, "line_green")
+            # 最新现价参考线 + 右侧醒目价格标签(一眼看清当前价格在K线与筹码峰的位置)
+            last_c = float(closes[-1])
+            prev_c_last = float(closes[-2]) if n >= 2 else float(opens[-1])
+            last_chg = ((last_c - prev_c_last) / prev_c_last * 100.0) if prev_c_last > 0 else 0.0
+            dpg.add_line_series([xs[0], xs[-1]], [last_c, last_c], parent=ky,
+                                label=f"现价 {last_c:.2f}")
+            p_anno_col = (235, 75, 75, 255) if last_chg >= 0 else (50, 195, 110, 255)
+            dpg.add_plot_annotation(
+                label=f"◀ 现价 {last_c:.2f} ({last_chg:+.2f}%)",
+                default_value=(xs[-1], last_c),
+                offset=(-12, 0),
+                color=p_anno_col,
+                clamped=True,
+                parent="kplot",
+            )
             # 自定义悬停提示(跟随鼠标定位到最近蜡烛),初始隐藏
             dpg.add_plot_annotation(
                 tag="kanno", label="", default_value=(0, 0),
@@ -4391,11 +6525,13 @@ def show_kline(code, period=None):
                         los_x, los_p, parent=cy, horizontal=True,
                         weight=_thick, label=f"套牢盘 {100 - _pf:.0f}%")
                     dpg.bind_item_theme(bid, "bar_green")
-                # 平均成本线(在筹码栏内也标一条,与左侧K线的成本线同价位)
+                # 平均成本线与最新现价线(在筹码栏内同时标出,与左侧K线同价位对齐)
                 _ac = _chip["avg_cost"]
                 _xm = float(max(_ch))
                 dpg.add_line_series([0.0, _xm], [_ac, _ac], parent=cy,
                                     label=f"均本 {_ac:.2f}")
+                dpg.add_line_series([0.0, _xm], [last_c, last_c], parent=cy,
+                                    label=f"现价 {last_c:.2f}")
                 dpg.fit_axis_data("chipx")
                 dpg.fit_axis_data("chipy")
 
@@ -4409,34 +6545,48 @@ def show_kline(code, period=None):
                                   no_gridlines=True)
 
     # 缓存本次绘制的K线数据,供鼠标悬停提示回调按索引取值
+    _fm_kl = db.get_fundamental(code) or {}
+    _float_mv_yi = _fm_kl.get("float_mv") or _fm_kl.get("total_mv") or 0.0
     STATE["kl_bars"] = {
         "n": n,
         "dates": dates,
         "open": opens, "close": closes, "high": highs, "low": lows,
+        "amount_yi": (df["amount"].astype(float) / 1e8).tolist() if "amount" in df.columns else [0.0] * n,
+        "float_mv_yi": float(_float_mv_yi) if _float_mv_yi else 0.0,
         "rsi": rsis,
     }
 
-    dpg.set_value("kline_title", f"{pname} / 成交额 / MACD - {label}")
-    # 切回 K 线:清空分时专用的涨跌幅/后缀,避免残留上一只票的红绿数字
+    # 标题栏直接醒目展示：当前最新价 + 涨跌额 + 涨跌幅% + 最新日期 + 今开/最高/最低/成交额
+    last_d = str(dates[-1])
+    last_o, last_h, last_l, last_c = float(opens[-1]), float(highs[-1]), float(lows[-1]), float(closes[-1])
+    prev_c_bar = float(closes[-2]) if n >= 2 else last_o
+    chg_amt = last_c - prev_c_bar
+    chg_pct = (chg_amt / prev_c_bar * 100.0) if prev_c_bar > 0 else 0.0
+    last_amt_yi = float(df["amount"].iloc[-1]) / 1e8 if "amount" in df.columns else 0.0
+    turn_str = f"  换手 {last_amt_yi / float(_float_mv_yi) * 100:.2f}%" if (_float_mv_yi and float(_float_mv_yi) > 0) else ""
+
+    dpg.set_value("kline_title", f"{pname} · {label}   ")
     if dpg.does_item_exist("kline_title_chg"):
-        dpg.set_value("kline_title_chg", "")
+        dpg.set_value("kline_title_chg", f"现价 {last_c:.2f}  ({chg_amt:+.2f} / {chg_pct:+.2f}%)")
+        dpg.configure_item(
+            "kline_title_chg",
+            color=RED if chg_pct > 0 else (GREEN if chg_pct < 0 else (210, 210, 210)),
+        )
     if dpg.does_item_exist("kline_title_suffix"):
-        dpg.set_value("kline_title_suffix", "")
-    _set_status(f"已绘制 {label} 的{pname}图表")
+        dpg.set_value(
+            "kline_title_suffix",
+            f"   [{last_d}]  开 {last_o:.2f}  高 {last_h:.2f}  低 {last_l:.2f}  额 {last_amt_yi:.2f}亿{turn_str}",
+        )
+    _set_status(f"已绘制 {label} 的{pname}图表 (现价 {last_c:.2f}, {chg_pct:+.2f}%)")
 
 
 def on_ai_comment(sender=None, app_data=None, user_data=None, force=False):
-    """对当前 K 线标的生成 AI 综合点评(后台线程,不阻塞界面)。
-
-    AI 把系统算好/实时拉取的技术面+基本面指标翻译成人话+提示风险+结构化评级,
-    不给买卖建议(见 app/ai)。force=True 时跳过当天缓存强制重新生成。
-    """
+    """对当前 K 线标的生成 AI 综合点评(后台线程,回主线程渲染,不阻塞界面)。"""
     code = STATE.get("cur_code")
     if not code:
         dpg.set_value("ai_comment_text", "请先在左侧或搜索选中一只股票再点评。")
         dpg.configure_item("ai_comment_win", show=True)
         return
-    # 未配置模型:直接给引导,不发起请求
     if not ai_configured():
         dpg.set_value("ai_comment_text", ai_config_hint())
         dpg.configure_item("ai_comment_disclaimer", show=False)
@@ -4445,6 +6595,16 @@ def on_ai_comment(sender=None, app_data=None, user_data=None, force=False):
 
     nm = db.name_of(code) or ""
     hint = STATE.get("ai_hint") or ""
+    if not hint:
+        q = probability_desk.get_stock_quant_info(code)
+        if q:
+            setups = "、".join(q.get("setups") or []) or "常规截面评估"
+            hint = (
+                f"[{q.get('horizon', 10)}日周期] 四层量化：{setups} | "
+                f"条件胜率 {_pct_ui(q.get('p_cond'))} | 截面概率 {_pct_ui(q.get('p_up'))} | "
+                f"年价格分位 {_pct_ui(q.get('pos250'))} | 建议止损 {q.get('stop_loss')} | "
+                f"目标止盈 {q.get('take_profit')}"
+            )
     dpg.configure_item("ai_comment_win", show=True)
     dpg.configure_item("ai_comment_disclaimer", show=False)
     for _b in ("ai_rating_badge", "ai_risk_badge", "ai_cache_badge"):
@@ -4460,50 +6620,50 @@ def on_ai_comment(sender=None, app_data=None, user_data=None, force=False):
             dpg.configure_item(tag, color=color, show=True)
 
     def worker():
-        # 流式回调:边生成边把增量追加到点评文本(缓存命中时不会触发)
-        stream = {"buf": "", "head": ""}
+        stream = {"buf": "", "head": f"【{code} {nm}】\n" if nm else f"【{code}】\n"}
 
         def _on_delta(piece):
             stream["buf"] += piece
-            if dpg.does_item_exist("ai_comment_text"):
-                dpg.set_value("ai_comment_text", stream["head"] + stream["buf"])
+            cur_txt = stream["head"] + stream["buf"]
+            _post_ui(lambda t=cur_txt: dpg.set_value("ai_comment_text", t) if dpg.does_item_exist("ai_comment_text") else None)
 
-        # 先算出 head 前缀(需要 facts,但流式回调早于 res 返回,故预取名称)
-        stream["head"] = f"【{code} {nm}】\n" if nm else f"【{code}】\n"
         res = ai_commentary.comment_stock(code, strategy_hint=hint,
                                           force_refresh=force,
                                           on_delta=_on_delta)
-        try:
-            if res.get("ok"):
-                f = res["facts"]
-                head = f"【{f['code']} {f['name']}】{f['industry']}\n"
-                dpg.set_value("ai_comment_text", head + res["text"])
-                dpg.set_value("ai_comment_disclaimer", res["disclaimer"])
-                dpg.configure_item("ai_comment_disclaimer", show=True)
-                # 结构化评级彩色标签(A股惯例:偏多=红,偏空=绿)
-                rating = res.get("rating")
-                if rating == "偏多":
-                    _badge("ai_rating_badge", "  评级:偏多", (230, 60, 60))
-                elif rating == "偏空":
-                    _badge("ai_rating_badge", "  评级:偏空", (40, 170, 80))
-                elif rating == "中性":
-                    _badge("ai_rating_badge", "  评级:中性", (200, 180, 90))
-                risk = res.get("risk")
-                if risk == "高":
-                    _badge("ai_risk_badge", "  风险:高", (230, 60, 60))
-                elif risk == "中":
-                    _badge("ai_risk_badge", "  风险:中", (220, 160, 60))
-                elif risk == "低":
-                    _badge("ai_risk_badge", "  风险:低", (120, 180, 120))
-                if res.get("cached"):
-                    _badge("ai_cache_badge", "  (当日缓存,点刷新重生成)",
-                           (130, 130, 130))
-            else:
-                dpg.set_value("ai_comment_text", f"点评失败:\n{res.get('error', '未知错误')}")
-                dpg.configure_item("ai_comment_disclaimer", show=False)
-        finally:
-            if dpg.does_item_exist("ai_comment_btn"):
-                dpg.configure_item("ai_comment_btn", enabled=True, label="AI点评")
+
+        def finish(r=res):
+            try:
+                if r.get("ok"):
+                    f = r["facts"]
+                    head = f"【{f['code']} {f['name']}】{f['industry']}\n"
+                    dpg.set_value("ai_comment_text", head + r["text"])
+                    dpg.set_value("ai_comment_disclaimer", r["disclaimer"])
+                    dpg.configure_item("ai_comment_disclaimer", show=True)
+                    rating = r.get("rating")
+                    if rating == "偏多":
+                        _badge("ai_rating_badge", "  评级:偏多", (230, 60, 60))
+                    elif rating == "偏空":
+                        _badge("ai_rating_badge", "  评级:偏空", (40, 170, 80))
+                    elif rating == "中性":
+                        _badge("ai_rating_badge", "  评级:中性", (200, 180, 90))
+                    risk = r.get("risk")
+                    if risk == "高":
+                        _badge("ai_risk_badge", "  风险:高", (230, 60, 60))
+                    elif risk == "中":
+                        _badge("ai_risk_badge", "  风险:中", (220, 160, 60))
+                    elif risk == "低":
+                        _badge("ai_risk_badge", "  风险:低", (120, 180, 120))
+                    if r.get("cached"):
+                        _badge("ai_cache_badge", "  (当日缓存,点刷新重生成)",
+                               (130, 130, 130))
+                else:
+                    dpg.set_value("ai_comment_text", f"点评失败:\n{r.get('error', '未知错误')}")
+                    dpg.configure_item("ai_comment_disclaimer", show=False)
+            finally:
+                if dpg.does_item_exist("ai_comment_btn"):
+                    dpg.configure_item("ai_comment_btn", enabled=True, label="AI深度点评")
+
+        _post_ui(finish)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -4530,7 +6690,27 @@ def _on_kline_hover(sender, app_data):
     o, c = bars["open"][idx], bars["close"][idx]
     h, low = bars["high"][idx], bars["low"][idx]
     d = bars["dates"][idx]
-    chg = ((c - o) / o * 100) if o else 0.0
+    prev_c = bars["close"][idx - 1] if idx > 0 else o
+    chg_prev = ((c - prev_c) / prev_c * 100.0) if prev_c else 0.0
+    chg_intra = ((c - o) / o * 100.0) if o else 0.0
+    # 成交额与换手率、日内承接结构
+    amt_line = ""
+    amts = bars.get("amount_yi")
+    if amts and idx < len(amts):
+        ay_val = amts[idx]
+        fmv = bars.get("float_mv_yi") or 0.0
+        turn_s = f"  换手 {ay_val / fmv * 100:.2f}%" if (fmv > 0 and ay_val > 0) else ""
+        amt_line = f"\n成交 {ay_val:.2f}亿{turn_s}"
+    # K线上下影线微观承接提示
+    span = h - low
+    micro_line = ""
+    if span > 1e-4:
+        lo_sh = (min(o, c) - low) / span
+        hi_sh = (h - max(o, c)) / span
+        if lo_sh >= 0.42 and lo_sh > hi_sh * 1.5:
+            micro_line = "\n盘口: 长下影探底承接"
+        elif hi_sh >= 0.42 and hi_sh > lo_sh * 1.5:
+            micro_line = "\n盘口: 长上影上方抛压"
     # RSI(14):该根K线的相对强弱,附超买/超卖状态
     rsi_line = ""
     rv = bars.get("rsi", [None] * bars["n"])[idx]
@@ -4542,12 +6722,95 @@ def _on_kline_hover(sender, app_data):
     except (TypeError, ValueError):
         pass
     txt = (f"{d}\n开 {o:.2f}  收 {c:.2f}\n"
-           f"高 {h:.2f}  低 {low:.2f}\n涨跌 {'+' if chg >= 0 else ''}{chg:.2f}%"
-           f"{rsi_line}")
-    # 提示框锚定到该蜡烛索引、Y 跟随鼠标,颜色随涨跌
-    col = (230, 90, 90, 255) if c >= o else (90, 200, 120, 255)
+           f"高 {h:.2f}  低 {low:.2f}\n"
+           f"涨跌 {chg_prev:+.2f}% (实体 {chg_intra:+.2f}%)"
+           f"{amt_line}{rsi_line}{micro_line}")
+    # 提示框锚定到该蜡烛索引、Y 跟随鼠标,颜色随收盘涨跌(或实体阴阳)
+    col = (230, 90, 90, 255) if c >= prev_c else (90, 200, 120, 255)
     dpg.configure_item("kanno", label=txt, default_value=(idx, my),
                        color=col, show=True)
+
+
+def _on_fund_plot_hover(sender, app_data):
+    """鼠标在基金详情图(收益率走势 / 单位净值走势)移动时:显示跟随竖线 + 当前时间与涨跌幅/净值浮窗。"""
+    hc = STATE.get("fund_chart_hover")
+    if not hc:
+        return
+    dates = hc.get("dates") or []
+    n = len(dates)
+    if n <= 0:
+        return
+
+    # 1) 检查是否悬停在『复权收益率走势』图上
+    if dpg.does_item_exist("fund_plot_ret") and dpg.is_item_hovered("fund_plot_ret"):
+        try:
+            mx, _ = dpg.get_plot_mouse_pos()
+        except Exception:
+            return
+        idx = max(0, min(n - 1, int(round(mx))))
+        dt_s = dates[idx]
+        f_pct = float(hc["cum_pct"][idx])
+        d_chg = float(hc["day_chgs"][idx])
+        b_list = hc.get("bench_pct") or []
+        b_name = hc.get("bench_name") or "基准"
+        b_txt = f"\n{b_name}: {float(b_list[idx]):+.2f}%" if idx < len(b_list) else ""
+        lbl = f"{dt_s}\n区间涨跌: {f_pct:+.2f}% (当日 {d_chg:+.2f}%){b_txt}"
+        off_x = -125 if idx > n * 0.72 else 14
+        col = (235, 85, 85, 255) if f_pct >= 0 else (75, 205, 125, 255)
+        if dpg.does_item_exist("fund_ret_vline"):
+            dpg.set_value("fund_ret_vline", float(idx))
+            dpg.configure_item("fund_ret_vline", show=True)
+        if dpg.does_item_exist("fund_ret_anno"):
+            dpg.configure_item(
+                "fund_ret_anno", label=lbl, default_value=(float(idx), f_pct),
+                offset=(off_x, -16), color=col, show=True,
+            )
+        if dpg.does_item_exist("fund_hover_readout"):
+            b_inline = f"  |  {b_name}: {float(b_list[idx]):+.2f}%" if idx < len(b_list) else ""
+            dpg.set_value(
+                "fund_hover_readout",
+                f"  |  📅 {dt_s}   区间涨跌幅: {f_pct:+.2f}% (当日 {d_chg:+.2f}%)   单位净值: {hc['navs'][idx]:.4f}{b_inline}",
+            )
+        return
+    else:
+        if dpg.does_item_exist("fund_ret_vline") and dpg.get_item_configuration("fund_ret_vline").get("show"):
+            dpg.configure_item("fund_ret_vline", show=False)
+        if dpg.does_item_exist("fund_ret_anno") and dpg.get_item_configuration("fund_ret_anno").get("show"):
+            dpg.configure_item("fund_ret_anno", show=False)
+
+    # 2) 检查是否悬停在『单位净值走势』图上
+    if dpg.does_item_exist("fund_plot_nav") and dpg.is_item_hovered("fund_plot_nav"):
+        try:
+            mx, _ = dpg.get_plot_mouse_pos()
+        except Exception:
+            return
+        idx = max(0, min(n - 1, int(round(mx))))
+        dt_s = dates[idx]
+        nv = float(hc["navs"][idx])
+        d_chg = float(hc["day_chgs"][idx])
+        f_pct = float(hc["cum_pct"][idx])
+        lbl = f"{dt_s}\n单位净值: {nv:.4f}\n当日涨跌: {d_chg:+.2f}% (区间 {f_pct:+.2f}%)"
+        off_x = -125 if idx > n * 0.72 else 14
+        col = (235, 85, 85, 255) if d_chg >= 0 else (75, 205, 125, 255)
+        if dpg.does_item_exist("fund_nav_vline"):
+            dpg.set_value("fund_nav_vline", float(idx))
+            dpg.configure_item("fund_nav_vline", show=True)
+        if dpg.does_item_exist("fund_nav_anno"):
+            dpg.configure_item(
+                "fund_nav_anno", label=lbl, default_value=(float(idx), nv),
+                offset=(off_x, -16), color=col, show=True,
+            )
+        if dpg.does_item_exist("fund_hover_readout"):
+            dpg.set_value(
+                "fund_hover_readout",
+                f"  |  📅 {dt_s}   单位净值: {nv:.4f}   当日涨跌: {d_chg:+.2f}% (区间涨跌幅: {f_pct:+.2f}%)",
+            )
+        return
+    else:
+        if dpg.does_item_exist("fund_nav_vline") and dpg.get_item_configuration("fund_nav_vline").get("show"):
+            dpg.configure_item("fund_nav_vline", show=False)
+        if dpg.does_item_exist("fund_nav_anno") and dpg.get_item_configuration("fund_nav_anno").get("show"):
+            dpg.configure_item("fund_nav_anno", show=False)
 
 
 # ---------- 构建界面 ----------
@@ -4563,245 +6826,157 @@ def build_ui():
 
     with dpg.window(tag="root"):
         with dpg.group(horizontal=True):
-            # ===== 左侧控制面板 =====
-            with dpg.child_window(width=320, tag="left_panel"):
-                dpg.add_text("A 股选股工具", color=(80, 160, 255))
-                dpg.add_separator()
-
-                dpg.add_text("本地数据", color=(120, 220, 160))
-                dpg.add_text("", tag="cache_info", wrap=300, color=(160, 200, 255))
-                dpg.add_text("", tag="market_info", wrap=300, color=(150, 150, 150))
-                dpg.add_separator()
-
-                dpg.add_text("1. 更新数据(可选)")
-                dpg.add_input_int(label="拉取只数", default_value=400,
-                                  tag="update_count", width=120, min_value=1)
+            # ===== 左侧控制面板：紧凑数据区 + ⚡快速选股看盘抽屉 (支持一键折叠) =====
+            with dpg.child_window(width=285, tag="left_panel"):
                 with dpg.group(horizontal=True):
-                    dpg.add_button(label="主流400", width=88,
-                                   callback=lambda: dpg.set_value("update_count", 400))
-                    dpg.add_button(label="1500", width=88,
-                                   callback=lambda: dpg.set_value("update_count", 1500))
-                    dpg.add_button(label="全A股", width=88,
-                                   callback=lambda: dpg.set_value("update_count", 6000))
-                dpg.add_button(label="更新股票数据", callback=on_update_data, width=280)
-                dpg.add_checkbox(label="同时拉取基本面(PE/PB/ROE/市值,较慢)",
-                                 default_value=False, tag="fetch_funda")
-                dpg.add_checkbox(label="同时拉取ETF(主流宽基+行业约50只)",
-                                 default_value=False, tag="fetch_etf")
-                dpg.add_checkbox(label="强制全量重拉(覆盖历史,修复脏数据)",
-                                 default_value=False, tag="force_full",
-                                 callback=lambda s, a: dpg.configure_item(
-                                     "force_full_hint", show=bool(a)))
-                dpg.add_text("已勾选:将覆盖本地全部历史日线(而非只补最新)。\n"
-                             "用于修正旧的成交量/成交额脏数据,耗时与首次相当。",
-                             tag="force_full_hint", show=False,
-                             wrap=300, color=(255, 180, 90))
-                dpg.add_text("主流股(沪深300+中证500)优先,并发拉取并同步\n"
-                             "大盘指数+行业。400只约3-5分钟;全A股(5000+)\n"
-                             "首次约30-50分钟,选股/回测也更慢,按需选择。\n"
-                             "基本面每只1-2s串行,勾选后首次较慢,增量缓存。",
-                             wrap=300, color=(130, 130, 130))
-                dpg.add_separator()
-
-                dpg.add_text("2. 选择策略")
-                dpg.add_text("用一句话选股(AI 翻译成筛选条件,本地引擎执行):",
-                             color=(120, 220, 160), wrap=300)
-                dpg.add_input_text(
-                    tag="nl_query_in", width=280,
-                    hint="如:市值500亿以内的MACD金叉前8只",
-                    callback=on_nl_scan, on_enter=True)
-                with dpg.group(horizontal=True):
-                    dpg.add_button(label="AI 选股", callback=on_nl_scan,
-                                   width=138, height=28, tag="nl_scan_btn")
+                    dpg.add_text("量化交易终端", color=(80, 175, 255))
                     dpg.add_button(
-                        label="示例", width=138, height=28,
-                        callback=lambda: dpg.set_value(
-                            "nl_query_in", "低估值高ROE的白马股,PE不超过25,前10只"))
-                dpg.add_text("", tag="nl_query_hint", wrap=300,
-                             color=(160, 200, 255))
+                        label="◀ 隐藏侧栏", width=82, height=22,
+                        callback=on_toggle_sidebar,
+                    )
+                dpg.add_text("", tag="cache_info", wrap=268, color=(160, 200, 255))
+                dpg.add_text("", tag="market_info", wrap=268, color=(150, 210, 160))
+
+                with dpg.group(horizontal=True):
+                    dpg.add_button(
+                        label="⚡ 极速增量更新", callback=on_update_data,
+                        width=165, height=28,
+                    )
+                    dpg.add_input_int(
+                        label="", default_value=6000,
+                        tag="update_count", width=92, min_value=1, step=0,
+                    )
+                with dpg.collapsing_header(label="更新高级选项 (财报/ETF/重拉)", default_open=False):
+                    with dpg.group(horizontal=True):
+                        dpg.add_button(label="主流400", width=78,
+                                       callback=lambda: dpg.set_value("update_count", 400))
+                        dpg.add_button(label="1500", width=78,
+                                       callback=lambda: dpg.set_value("update_count", 1500))
+                        dpg.add_button(label="全A股", width=78,
+                                       callback=lambda: dpg.set_value("update_count", 6000))
+                    dpg.add_checkbox(label="同时深拉财报(较慢)", default_value=False, tag="fetch_funda")
+                    dpg.add_checkbox(label="同时拉取ETF(约50只)", default_value=False, tag="fetch_etf")
+                    dpg.add_checkbox(
+                        label="强制全量重拉(覆盖历史)", default_value=False, tag="force_full",
+                        callback=lambda s, a: dpg.configure_item("force_full_hint", show=bool(a)),
+                    )
+                    dpg.add_text("将覆盖全部历史日线，耗时较长。", tag="force_full_hint",
+                                 show=False, wrap=260, color=(255, 180, 90))
+                dpg.add_text("就绪", tag="status_text", wrap=268, color=(255, 200, 100))
+                dpg.add_text("", tag="side_strategy", wrap=268, color=(175, 185, 200))
                 dpg.add_separator()
 
-                dpg.add_text("或手动选择策略")
-                dpg.add_combo(
-                    [CROSS_SECTION_LABEL] + list(STRATEGY_LABEL2KEY.keys()),
-                    default_value=list(STRATEGY_LABEL2KEY.keys())[0],
-                    callback=on_strategy_change, tag="strategy_combo", width=280,
-                )
+                # ---- ⚡ 快速看盘抽屉：在 K 线页或任意页单击直接切图，免去切 Tab 来回翻找 ----
                 with dpg.group(horizontal=True):
-                    dpg.add_text("取前N只(仅智能版):", color=(130, 130, 130))
-                    dpg.add_input_int(tag="cs_top_n", default_value=50,
-                                      min_value=1, max_value=300, width=90,
-                                      step=10)
-                dpg.add_child_window(tag="param_area", height=170, border=False)
-                dpg.add_separator()
-
-                dpg.add_checkbox(label="基本面过滤(对选股结果二次筛)",
-                                 default_value=False, tag="funda_on")
+                    dpg.add_text("⚡ 快速看盘", color=(120, 220, 160))
+                    dpg.add_button(
+                        label="▲上一只", width=58, height=22,
+                        callback=lambda: _step_drawer_stock(-1),
+                    )
+                    dpg.add_button(
+                        label="▼下一只", width=58, height=22,
+                        callback=lambda: _step_drawer_stock(1),
+                    )
                 with dpg.group(horizontal=True):
-                    dpg.add_slider_float(label="PE≤", default_value=60, min_value=0,
-                                         max_value=200, format="%.0f", width=110,
-                                         tag="funda_pe")
-                    dpg.add_slider_float(label="PB≤", default_value=10, min_value=0,
-                                         max_value=30, format="%.1f", width=110,
-                                         tag="funda_pb")
-                with dpg.group(horizontal=True):
-                    dpg.add_slider_float(label="ROE%≥", default_value=0, min_value=-20,
-                                         max_value=40, format="%.0f", width=110,
-                                         tag="funda_roe")
-                    dpg.add_slider_float(label="市值亿≥", default_value=0, min_value=0,
-                                         max_value=2000, format="%.0f", width=110,
-                                         tag="funda_mv")
-                dpg.add_checkbox(label="剔除无基本面数据的票", default_value=False,
-                                 tag="funda_dropmiss")
-                dpg.add_text("阈值为0=该项不启用;需先勾选『同时拉取基本面』\n"
-                             "更新过数据。滑到最大值也相当于不限制。",
-                             wrap=300, color=(130, 130, 130))
-                dpg.add_separator()
-
-                dpg.add_text("3. 执行")
-                dpg.add_button(label="开始选股", callback=on_run_scan, width=280, height=36)
-                dpg.add_button(label="回测当前策略", callback=on_open_backtest, width=280, height=30)
-                with dpg.group(horizontal=True):
-                    dpg.add_button(label="导出报告", callback=on_export_report,
-                                   width=160, height=30)
-                    dpg.add_button(label="打开目录", callback=on_open_report_dir,
-                                   width=112, height=30)
-                dpg.add_text("导出为 Excel + HTML(含排行榜/今日推荐/选股\n"
-                             "结果/自选持仓),存到 reports/ 目录。",
-                             wrap=300, color=(130, 130, 130))
-                dpg.add_separator()
-                dpg.add_text("就绪", tag="status_text", wrap=300, color=(255, 200, 100))
+                    dpg.add_button(
+                        label="● 共振池(30)", tag="drawer_btn_picks",
+                        width=128, height=24, callback=lambda: _switch_drawer_mode("picks"),
+                    )
+                    dpg.add_button(
+                        label="自选(0)", tag="drawer_btn_watch",
+                        width=128, height=24, callback=lambda: _switch_drawer_mode("watch"),
+                    )
+                with dpg.table(
+                    tag="side_drawer_table", header_row=True, resizable=True,
+                    policy=dpg.mvTable_SizingStretchProp,
+                    height=-1, scrollY=True, freeze_rows=1,
+                    sortable=True, sort_tristate=False, callback=_on_drawer_table_sort,
+                ):
+                    for col in ("代码", "名称", "胜率/现价", "题材"):
+                        dpg.add_table_column(label=col)
 
             # ===== 右侧:标签页 =====
             with dpg.child_window(tag="right_panel"):
                 with dpg.tab_bar(tag="main_tabs",
                                  callback=_on_main_tab_changed):
-                    # --- Tab 1: 选股 & K线 ---
-                    with dpg.tab(label="选股 & K线", tag="tab_kline"):
+                    with dpg.tab(label="今日作战台 & 涨跌概率", tag="tab_prob"):
+                        probability_desk.mount(
+                            on_code=_on_pick_code,
+                            on_add_watch=_add_watch_from,
+                            post_ui=_post_ui,
+                            on_horizon_changed=_on_horizon_switched,
+                            section_heights=MKT_SECTION_HEIGHTS,
+                            add_drag_handle=_add_mkt_section_handle,
+                            on_reset_layout=on_reset_ui_layout,
+                            on_toggle_sidebar=on_toggle_sidebar,
+                        )
+                    # --- Tab 1: K线 & 个股深度诊断 ---
+                    with dpg.tab(label="K线 & 个股诊断", tag="tab_kline"):
+                        # --- 侧栏开关 + 上下翻票 + 搜索 + 周期 + AI点评 + 叠加与视野 ---
                         with dpg.group(horizontal=True):
-                            dpg.add_text("选股结果(点代码看K线,点+自选加入持仓跟踪)")
-                            dpg.add_button(label="AI精排Top10", width=110, height=24,
-                                           tag="ai_rank_btn", callback=on_ai_rank)
-                            dpg.add_button(label="批量点评(晨报)", width=120, height=24,
-                                           tag="ai_batch_btn",
-                                           callback=lambda: on_ai_batch("results"))
-                            dpg.add_button(label="组合解读", width=90, height=24,
-                                           tag="ai_pf_btn",
-                                           callback=lambda: on_ai_portfolio("results"))
-                            dpg.add_text("", tag="ai_rank_hint", color=(130, 130, 130))
-                        with dpg.table(tag="result_table", header_row=True,
-                                       resizable=True, policy=dpg.mvTable_SizingStretchProp,
-                                       height=210, scrollY=True, freeze_rows=1):
-                            for col in ["代码", "名称", "行业", "现价", "PE", "PB",
-                                        "ROE%", "市值亿", "得分", "说明", "操作"]:
-                                dpg.add_table_column(label=col)
-                        # --- AI 精排结果面板(默认隐藏,精排后展开) ---
-                        with dpg.child_window(tag="ai_rank_win", height=228,
-                                              border=True, show=False):
-                            with dpg.group(horizontal=True):
-                                dpg.add_text("AI 精排优选", color=(160, 200, 255))
-                                dpg.add_text("", tag="ai_rank_status",
-                                             color=(150, 150, 150))
-                                dpg.add_button(label="关闭", width=48, height=22,
-                                               callback=lambda: dpg.configure_item(
-                                                   "ai_rank_win", show=False))
-                            dpg.add_text(
-                                "说明:此处评级/风险是 AI 在本批候选池内『横向相对比较』"
-                                "后给出的,依据为压缩后的关键指标;与 K 线页『AI 综合点评』"
-                                "对单只做『深度绝对评级』(事实更全、含筹码/多周期)口径不同,"
-                                "两者可能不一致,均属正常。",
-                                wrap=820, color=(150, 150, 150))
-                            with dpg.table(tag="ai_rank_table", header_row=True,
-                                           resizable=True,
-                                           policy=dpg.mvTable_SizingStretchProp,
-                                           height=150, scrollY=True):
-                                for col in ["#", "代码", "名称", "行业",
-                                            "评级", "风险", "入选理由"]:
-                                    dpg.add_table_column(label=col)
-                            dpg.add_text("", tag="ai_rank_disclaimer",
-                                         wrap=820, color=(150, 150, 150))
-                        # --- AI 批量点评晨报面板(默认隐藏) ---
-                        with dpg.child_window(tag="ai_batch_win", height=200,
-                                              border=True, show=False):
-                            with dpg.group(horizontal=True):
-                                dpg.add_text("AI 批量点评晨报", tag="ai_batch_title",
-                                             color=(160, 200, 255))
-                                dpg.add_button(label="复制", width=48, height=22,
-                                               callback=_copy_ai_text,
-                                               user_data=["ai_batch_title",
-                                                          "ai_batch_report",
-                                                          "ai_batch_text"])
-                                dpg.add_button(label="打开目录", width=76, height=22,
-                                               callback=on_open_report_dir)
-                                dpg.add_button(label="关闭", width=48, height=22,
-                                               callback=lambda: dpg.configure_item(
-                                                   "ai_batch_win", show=False))
-                            dpg.add_text("", tag="ai_batch_report",
-                                         wrap=820, color=(120, 220, 160))
-                            with dpg.child_window(height=120, border=False):
-                                dpg.add_text("", tag="ai_batch_text", wrap=810,
-                                             color=(225, 225, 225))
-                        # --- AI 组合解读面板(默认隐藏,流式) ---
-                        with dpg.child_window(tag="ai_pf_win", height=190,
-                                              border=True, show=False):
-                            with dpg.group(horizontal=True):
-                                dpg.add_text("AI 组合解读", tag="ai_pf_title",
-                                             color=(160, 200, 255))
-                                dpg.add_button(label="复制", width=48, height=22,
-                                               callback=_copy_ai_text,
-                                               user_data=["ai_pf_title",
-                                                          "ai_pf_text",
-                                                          "ai_pf_disclaimer"])
-                                dpg.add_button(label="关闭", width=48, height=22,
-                                               callback=lambda: dpg.configure_item(
-                                                   "ai_pf_win", show=False))
-                            dpg.add_text("", tag="ai_pf_text", wrap=820,
-                                         color=(225, 225, 225))
-                            dpg.add_text("", tag="ai_pf_disclaimer", wrap=820,
-                                         color=(150, 150, 150), show=False)
-                        dpg.add_separator()
-                        # --- 搜索:在本地已拉取的股票/ETF 中模糊搜索(代码或名称) ---
-                        with dpg.group(horizontal=True):
-                            dpg.add_text("搜索:")
+                            dpg.add_button(
+                                label="◀ 侧栏", tag="kl_toggle_side_btn",
+                                width=58, height=26, callback=on_toggle_sidebar,
+                            )
+                            dpg.add_button(
+                                label="▲", width=28, height=26,
+                                callback=lambda: _step_drawer_stock(-1),
+                            )
+                            dpg.add_button(
+                                label="▼", width=28, height=26,
+                                callback=lambda: _step_drawer_stock(1),
+                            )
                             dpg.add_input_text(
-                                tag="kl_search_in", hint="输入代码或名称(如 600519 / 茅台 / 沪深300)",
-                                width=320, callback=on_search_kline,
+                                tag="kl_search_in", hint="代码/名称搜索",
+                                width=150, callback=on_search_kline,
                                 on_enter=False)
-                            dpg.add_button(label="搜索", width=54, height=26,
-                                           callback=on_search_kline)
-                            dpg.add_button(label="清除", width=54, height=26,
+                            dpg.add_button(label="清", width=32, height=26,
                                            callback=lambda: (dpg.set_value("kl_search_in", ""),
                                                              on_search_kline()))
                             dpg.add_text("", tag="kl_search_hint", color=(130, 130, 130))
+                            dpg.add_button(label="日", width=38, height=26,
+                                           tag="pd_day",
+                                           callback=lambda: _switch_period("D"))
+                            dpg.add_button(label="周", width=38, height=26,
+                                           tag="pd_week",
+                                           callback=lambda: _switch_period("W"))
+                            dpg.add_button(label="月", width=38, height=26,
+                                           tag="pd_month",
+                                           callback=lambda: _switch_period("M"))
+                            dpg.add_button(label="分时", width=46, height=26,
+                                           tag="pd_min",
+                                           callback=lambda: _switch_period("MIN"))
+                            dpg.add_button(label="AI深度点评", width=84, height=26,
+                                           tag="ai_comment_btn",
+                                           callback=on_ai_comment)
+                            dpg.add_button(label="+加自选(带止损)", width=114, height=26,
+                                           callback=_add_cur_kline_to_watch)
+                            dpg.add_checkbox(
+                                label="止损/止盈线", tag="kl_opt_sltp", default_value=True,
+                                callback=lambda: show_kline(STATE["cur_code"], STATE.get("cur_period", "D")) if STATE.get("cur_code") else None,
+                            )
+                            dpg.add_checkbox(
+                                label="年线", tag="kl_opt_ma250", default_value=False,
+                                callback=lambda: show_kline(STATE["cur_code"], STATE.get("cur_period", "D")) if STATE.get("cur_code") else None,
+                            )
+                            dpg.add_checkbox(
+                                label="BOLL", tag="kl_opt_boll", default_value=False,
+                                callback=lambda: show_kline(STATE["cur_code"], STATE.get("cur_period", "D")) if STATE.get("cur_code") else None,
+                            )
+                            dpg.add_combo(
+                                ["近半年(120根)", "近9个月(180根)", "近一年(250根)", "全部历史"],
+                                default_value="近9个月(180根)", width=114, tag="kl_zoom_combo",
+                                callback=lambda: show_kline(STATE["cur_code"], STATE.get("cur_period", "D")) if STATE.get("cur_code") else None,
+                            )
                         # 搜索结果区(默认隐藏,有结果时显示按钮列表,点击看K线)
                         dpg.add_child_window(tag="kl_search_box", height=118,
                                              border=True, show=False)
-                        dpg.add_separator()
-                        with dpg.group(horizontal=True):
-                            dpg.add_text("周期:")
-                            dpg.add_button(label="日", width=44, height=26,
-                                           tag="pd_day",
-                                           callback=lambda: _switch_period("D"))
-                            dpg.add_button(label="周", width=44, height=26,
-                                           tag="pd_week",
-                                           callback=lambda: _switch_period("W"))
-                            dpg.add_button(label="月", width=44, height=26,
-                                           tag="pd_month",
-                                           callback=lambda: _switch_period("M"))
-                            dpg.add_button(label="分时", width=54, height=26,
-                                           tag="pd_min",
-                                           callback=lambda: _switch_period("MIN"))
-                            dpg.add_text("(分时自动每5秒刷新,仅拉当前这只)",
-                                         color=(130, 130, 130))
-                            dpg.add_button(label="AI点评", width=68, height=26,
-                                           tag="ai_comment_btn",
-                                           callback=on_ai_comment)
-                        # AI 点评结果面板(默认隐藏,点评时展开)
-                        with dpg.child_window(tag="ai_comment_win", height=170,
+                        # AI 点评结果面板(默认隐藏,点评时展开,底部带拖拽横条可调高)
+                        with dpg.child_window(tag="ai_comment_win",
+                                              height=MKT_SECTION_HEIGHTS.get("ai_comment_win", 180),
                                               border=True, show=False):
                             with dpg.group(horizontal=True):
                                 dpg.add_text("AI 综合点评", color=(160, 200, 255))
-                                # 结构化评级彩色标签(点评后填充)
                                 dpg.add_text("", tag="ai_rating_badge", show=False)
                                 dpg.add_text("", tag="ai_risk_badge", show=False)
                                 dpg.add_text("", tag="ai_cache_badge",
@@ -4821,25 +6996,26 @@ def build_ui():
                                                    "ai_comment_win", show=False))
                             dpg.add_text("", tag="ai_comment_text", wrap=820,
                                          color=(230, 230, 230))
-                            dpg.add_text(
-                                "说明:此评级/风险为 AI 对本只个股做『深度绝对评级』"
-                                "(事实含筹码/多周期/行业分位等,单独判定);与『AI精排Top10』"
-                                "中在候选池内『横向相对比较』的评级口径不同,两者可能不一致,"
-                                "均属正常。",
-                                wrap=820, color=(150, 150, 150))
                             dpg.add_text("", tag="ai_comment_disclaimer", wrap=820,
                                          color=(150, 150, 150), show=False)
-                        # 标题行:横向 group,把"涨跌幅"单独拆出来上色(单 text 无法分段着色)
-                        with dpg.group(tag="kline_title_bar", horizontal=True,
-                                       horizontal_spacing=0):
-                            dpg.add_text("K线 / 成交额 / MACD", tag="kline_title")
-                            dpg.add_text("", tag="kline_title_chg")   # 涨跌幅,红涨绿跌
-                            dpg.add_text("", tag="kline_title_suffix",
-                                         color=(160, 160, 160))       # 后缀(轮询中/已停)
-                        # 基本面信息栏(PE/PB/ROE/市值/成长性),紧贴图上方常驻显示
-                        # 用横向 group 容纳多个分色 text(单个 text 无法分字段着色)
-                        dpg.add_group(tag="kline_info", horizontal=True,
-                                      horizontal_spacing=0)
+                            _add_mkt_section_handle("ai_comment_win")
+                        # 券商级三行报价与四层量化抬头框 (支持底部拖拽横条调节高度)
+                        with dpg.child_window(
+                            tag="kline_hud_box",
+                            height=MKT_SECTION_HEIGHTS.get("kline_hud_box", 74),
+                            border=True,
+                        ):
+                            with dpg.group(tag="kline_title_bar", horizontal=True,
+                                           horizontal_spacing=0):
+                                dpg.add_text("K线 / 成交额 / MACD", tag="kline_title",
+                                             color=(140, 200, 255))
+                                dpg.add_text("", tag="kline_title_chg")
+                                dpg.add_text("", tag="kline_title_suffix",
+                                             color=(185, 190, 200))
+                            dpg.add_text("", tag="kline_quant_info", color=(255, 205, 110), wrap=1150)
+                            dpg.add_group(tag="kline_info", horizontal=True,
+                                          horizontal_spacing=0)
+                        _add_mkt_section_handle("kline_hud_box")
                         dpg.add_child_window(tag="chart_area", border=False, height=-1)
 
                     # --- Tab: 行情(大盘概览) ---
@@ -4978,66 +7154,257 @@ def build_ui():
                             with dpg.table(tag="mkt_board_table", header_row=True,
                                            resizable=True,
                                            policy=dpg.mvTable_SizingStretchProp,
-                                           height=-1, scrollY=True):
+                                           height=-1, scrollY=True,
+                                           sortable=True, sort_tristate=False,
+                                           callback=_on_board_table_sort):
                                 for col in ["排名", "板块", "涨跌幅", "成交额",
                                             "净额(全单)", "涨/跌家数", "领涨股"]:
                                     dpg.add_table_column(label=col)
 
-                    # --- Tab 2: 今日推荐 ---
-                    with dpg.tab(label="今日推荐"):
-                        dpg.add_text("策略排行(慢·算一次即可)与今日推荐(快)已分开:"
-                                     "先刷新排行,之后每天点『生成今日推荐』秒出",
-                                     color=(160, 200, 255), wrap=760)
+                    # --- Tab 3: 策略样本外评测室 (原今日推荐重构升级) ---
+                    with dpg.tab(label="策略样本外评测室"):
+                        dpg.add_text(
+                            "废除旧版全样本不切分、不剔除涨跌停的过拟合排行。"
+                            "以下所有策略统一按【2021~2023 训练窗】与【2024~2026 样本外测试窗】严格隔离评测，"
+                            "次日开盘买/到期开盘卖，剔除一字涨停买不进与跌停卖不出，扣除真实印花税与佣金。",
+                            color=(160, 200, 255), wrap=960,
+                        )
                         with dpg.group(horizontal=True):
-                            dpg.add_button(label="刷新策略排行", callback=on_run_ranking,
-                                           width=150, height=32, tag="rank_run_btn")
-                            dpg.add_button(label="生成今日推荐", callback=on_gen_picks,
-                                           width=150, height=32, tag="picks_run_btn")
-                            dpg.add_checkbox(label="大盘趋势过滤", default_value=True,
-                                             tag="rank_market")
-                            dpg.add_text("(推荐开启)", color=(130, 130, 130))
-                        dpg.add_text("点『刷新策略排行』开始", tag="rank_status",
-                                     color=(255, 200, 100), wrap=700)
+                            dpg.add_text("持有周期模式:", color=(255, 210, 110))
+                            dpg.add_button(
+                                label="● 短波段 (10日·两周)", tag="oos_h_10",
+                                width=155, height=28, callback=lambda: probability_desk.switch_horizon(10),
+                            )
+                            dpg.add_button(
+                                label="○ 中线 (60日·一季度)", tag="oos_h_60",
+                                width=155, height=28, callback=lambda: probability_desk.switch_horizon(60),
+                            )
+                            dpg.add_button(
+                                label="○ 长线 (120日·半年)", tag="oos_h_120",
+                                width=155, height=28, callback=lambda: probability_desk.switch_horizon(120),
+                            )
+                            dpg.add_button(label="重跑三周期评测", callback=on_run_ranking,
+                                           width=140, height=28, tag="rank_run_btn")
+                        dpg.add_text("", tag="rank_status",
+                                     color=(255, 200, 100), wrap=960)
                         dpg.add_separator()
-                        dpg.add_text("策略排行榜(按综合分)", color=(120, 220, 160))
+                        dpg.add_text("一、第一层：市场环境闸门 (Market Regime Gate) 样本外 (2024~2026) 真实表现",
+                                     color=(120, 220, 160))
+                        with dpg.table(tag="regime_oos_table", header_row=True, resizable=True,
+                                       policy=dpg.mvTable_SizingStretchProp,
+                                       height=MKT_SECTION_HEIGHTS.get("regime_oos_table", 100), scrollY=True):
+                            for col in [
+                                "市场环境状态", "建议总仓位上限", "训练窗(21-23)基准胜率", "训练窗盈亏比",
+                                "测试窗(24-26)调仓期数", "测试窗全市场胜率", "测试窗前20%高分档胜率", "高分档单期扣费净收益",
+                            ]:
+                                dpg.add_table_column(label=col)
+                        _add_mkt_section_handle("regime_oos_table")
+                        dpg.add_text("二、第二层：选股策略 样本外测试窗 (2024~2026) 【三重屏障实战胜率】与【固定持有胜率】对比",
+                                     color=(120, 220, 160))
                         with dpg.table(tag="rank_table", header_row=True, resizable=True,
                                        policy=dpg.mvTable_SizingStretchProp,
-                                       height=190, scrollY=True):
-                            for col in ["排名", "策略", "综合分", "年化%", "总收益%",
-                                        "胜率%", "回撤%", "盈亏比", "交易数"]:
+                                       height=MKT_SECTION_HEIGHTS.get("rank_table", 165), scrollY=True,
+                                       sortable=True, sort_tristate=False, callback=_on_rank_table_sort):
+                            for col in [
+                                "排名", "策略名称", "样本外判定",
+                                "实战胜率(止盈)", "固定到期胜率", "较盲买提升", "单期净赚", "盈亏比",
+                                "裸跑胜率", "训练窗(21-23)胜率", "策略极值条件说明",
+                            ]:
                                 dpg.add_table_column(label=col)
-                        dpg.add_separator()
-                        dpg.add_text("热门板块(今日推荐票的行业分布,x2+标红)",
+                        _add_mkt_section_handle("rank_table")
+                        dpg.add_text("三、组合级 2021~2026 净值曲线、水下回撤与分年度归因 (Portfolio Tearsheet)",
                                      color=(120, 220, 160))
-                        dpg.add_child_window(tag="hot_sectors", height=40, border=False)
-                        dpg.add_text("今日推荐票(最强策略选出,命中越多越值得关注)",
+                        dpg.add_child_window(tag="oos_curve_box",
+                                             height=MKT_SECTION_HEIGHTS.get("oos_curve_box", 192), border=True)
+                        _add_mkt_section_handle("oos_curve_box")
+                        with dpg.table(tag="oos_yearly_table", header_row=True, resizable=True,
+                                       policy=dpg.mvTable_SizingStretchProp,
+                                       height=MKT_SECTION_HEIGHTS.get("oos_yearly_table", 140), scrollY=True):
+                            for col in ["年份", "样本属性", "开启闸门组合收益", "全天候裸跑收益", "全市场等权基准", "组合超额收益"]:
+                                dpg.add_table_column(label=col)
+                        _add_mkt_section_handle("oos_yearly_table")
+                        with dpg.group(horizontal=True):
+                            dpg.add_text("四、今日共振候选行业分布:", color=(120, 220, 160))
+                            dpg.add_child_window(tag="hot_sectors", height=28, border=False)
+                        dpg.add_text("今日高胜率共振候选票 (双击代码看K线，附 ATR 挂单上限 / 止损 / 止盈计划)",
                                      color=(120, 220, 160))
                         with dpg.table(tag="picks_table", header_row=True, resizable=True,
                                        policy=dpg.mvTable_SizingStretchProp,
-                                       height=-1, scrollY=True):
-                            for col in ["代码", "名称", "行业", "现价", "来源策略",
-                                        "策略排名", "命中", "得分", "操作"]:
+                                       height=-1, scrollY=True,
+                                       sortable=True, sort_tristate=False, callback=_on_picks_table_sort):
+                            for col in [
+                                "代码", "名称", "行业", "现价", "条件胜率", "截面概率",
+                                "盈亏比", "挂单上限", "ATR止损", "目标止盈", "建议仓位", "命中策略", "操作",
+                            ]:
                                 dpg.add_table_column(label=col)
 
-                    # --- Tab 3: ETF 榜单 ---
-                    with dpg.tab(label="ETF榜单"):
-                        dpg.add_text("主流宽基+行业ETF实时榜单。点『刷新ETF行情』拉最新价,"
-                                     "点代码看K线,点+加入自选跟踪。",
-                                     color=(160, 200, 255), wrap=760)
+                    # --- Tab 5: 基金 & ETF 条件选基中心 ---
+                    with dpg.tab(label="基金 & ETF 选基中心"):
                         with dpg.group(horizontal=True):
-                            dpg.add_button(label="刷新ETF行情", callback=on_refresh_etf,
-                                           width=150, height=32, tag="etf_run_btn")
-                            dpg.add_combo(["按涨跌幅", "按成交额", "按最新价"],
-                                          default_value="按涨跌幅", width=140,
-                                          tag="etf_sort", callback=lambda s, a: _render_etf())
-                        dpg.add_text("未加载(先在左侧勾选『同时拉取ETF』更新数据,再点刷新)",
-                                     tag="etf_status", color=(255, 200, 100), wrap=740)
+                            dpg.add_button(
+                                label="● 场内 ETF 基金 (可盘中交易·双击看K线)", tag="fund_mode_etf_btn",
+                                width=275, height=30, callback=lambda: _switch_fund_mode("etf"),
+                            )
+                            dpg.add_button(
+                                label="○ 场外公募基金 (20000+只多周期业绩筛选)", tag="fund_mode_mf_btn",
+                                width=285, height=30, callback=lambda: _switch_fund_mode("mutual"),
+                            )
+                            dpg.add_button(
+                                label="⚡ 同步最新基金数据", callback=on_refresh_etf,
+                                width=160, height=30, tag="etf_run_btn",
+                            )
+                            dpg.add_button(
+                                label="重置筛选", width=80, height=30,
+                                callback=lambda: apply_fund_preset("reset"),
+                            )
+
+                        # 🤖 本地 AI 自然语言选基栏（调用本地 config.json 模型 + 深度核验回撤/规模/机构占比/夏普/经理年限）
+                        with dpg.group(horizontal=True):
+                            dpg.add_text("🤖 AI选基:", color=(255, 215, 110))
+                            dpg.add_input_text(
+                                tag="fund_ai_query_in",
+                                hint="直接输入自然语言条件，如：年化3%左右，最大回撤2%以内，基金规模10-50亿，机构占比不超过80%",
+                                default_value="成立时间长、机构占比80%以下、排名靠前的债基、回撤小的债基、规模50亿以上",
+                                width=460,
+                                on_enter=True,
+                                callback=lambda s, a: on_run_fund_ai_screen(),
+                            )
+                            dpg.add_button(
+                                label="🤖 AI 智能选基", tag="fund_ai_btn",
+                                width=115, height=26,
+                                callback=lambda: on_run_fund_ai_screen(),
+                            )
+                            dpg.add_text(" 灵感:", color=(155, 195, 240))
+                            for _flbl, _fq in (
+                                ("50亿老牌低回撤债", "成立时间长、机构占比80%以下、排名靠前的债基、回撤小的债基、规模50亿以上"),
+                                ("年化3%极低回撤债", "帮我选几个年化百分之3左右，最大回撤百分之二，基金规模10-50亿，机构占比不超过百分之八十的基金"),
+                                ("老将高夏普纯债", "基金经理从业8年以上、高夏普、规模10亿以上、回撤小的债基"),
+                            ):
+                                dpg.add_button(
+                                    label=_flbl, height=24, user_data=_fq,
+                                    callback=lambda s, a, u: (dpg.set_value("fund_ai_query_in", u), on_run_fund_ai_screen()),
+                                )
+                        with dpg.child_window(tag="fund_ai_summary_box", height=68, border=True, show=False):
+                            dpg.add_text("", tag="fund_ai_summary_txt", color=(235, 225, 185), wrap=960)
+
+                        # 通用筛选行：赛道分类 + 关键字搜索 + 经典预设方案
+                        with dpg.group(horizontal=True):
+                            dpg.add_text("赛道分类:", color=(140, 195, 255))
+                            dpg.add_combo(
+                                FUND_CATEGORIES, default_value="全部类别", width=135,
+                                tag="fund_cat_combo", callback=lambda s, a: _render_etf(),
+                            )
+                            dpg.add_text(" 搜索:")
+                            dpg.add_input_text(
+                                tag="fund_kw_in", hint="代码/名称(如 001235/半导体/红利/沪深300)",
+                                width=230,
+                                callback=lambda s, a: _render_etf(
+                                    use_ai_df=bool(STATE.get("fund_ai_df") is not None and not STATE["fund_ai_df"].empty)
+                                ),
+                            )
+                            dpg.add_text(" 快捷方案:", color=(255, 205, 110))
+                            dpg.add_button(
+                                label="百亿核心宽基/龙头ETF", height=24,
+                                callback=lambda: apply_fund_preset("core_liquid"),
+                            )
+                            dpg.add_button(
+                                label="折价套利/低吸ETF", height=24,
+                                callback=lambda: apply_fund_preset("discount_arb"),
+                            )
+                            dpg.add_button(
+                                label="高股息红利ETF", height=24,
+                                callback=lambda: apply_fund_preset("div_lowvol"),
+                            )
+                            dpg.add_button(
+                                label="三年长跑冠军公募", height=24,
+                                callback=lambda: (_switch_fund_mode("mutual"), apply_fund_preset("mf_3y_winner")),
+                            )
+
+                        # 场内 ETF 专属数值条件过滤栏
+                        with dpg.group(horizontal=True, tag="fund_etf_filter_bar", show=True):
+                            dpg.add_text("ETF筛选:", color=(120, 220, 160))
+                            dpg.add_input_float(
+                                label="规模≥(亿)", tag="etf_min_scale", default_value=0.0,
+                                width=72, step=0, format="%.1f", callback=lambda s, a: _render_etf(),
+                            )
+                            dpg.add_input_float(
+                                label="成交≥(亿)", tag="etf_min_amt", default_value=0.0,
+                                width=72, step=0, format="%.2f", callback=lambda s, a: _render_etf(),
+                            )
+                            dpg.add_input_float(
+                                label="溢价率≤%", tag="etf_max_prem", default_value=99.0,
+                                width=72, step=0, format="%.2f", callback=lambda s, a: _render_etf(),
+                            )
+                            dpg.add_input_float(
+                                label="20日涨≥%", tag="etf_min_r20", default_value=-99.0,
+                                width=72, step=0, format="%.1f", callback=lambda s, a: _render_etf(),
+                            )
+                            dpg.add_input_float(
+                                label="60日涨≥%", tag="etf_min_r60", default_value=-99.0,
+                                width=72, step=0, format="%.1f", callback=lambda s, a: _render_etf(),
+                            )
+                            dpg.add_text(" 排序:")
+                            dpg.add_combo(
+                                [
+                                    "按成交额", "按基金规模", "按今日涨跌",
+                                    "按折价率(低溢价优先)", "按换手率",
+                                    "按近20日涨幅", "按近60日涨幅", "按近1年涨幅",
+                                ],
+                                default_value="按成交额", width=155,
+                                tag="etf_sort", callback=_on_etf_sort_combo,
+                            )
+
+                        # 场外公募基金专属数值条件过滤栏
+                        with dpg.group(horizontal=True, tag="fund_mf_filter_bar", show=False):
+                            dpg.add_text("公募筛选:", color=(120, 220, 160))
+                            dpg.add_input_float(
+                                label="近3月≥%", tag="mf_min_r3m", default_value=-99.0,
+                                width=75, step=0, format="%.1f", callback=lambda s, a: _render_etf(),
+                            )
+                            dpg.add_input_float(
+                                label="近1年≥%", tag="mf_min_r1y", default_value=-99.0,
+                                width=75, step=0, format="%.1f", callback=lambda s, a: _render_etf(),
+                            )
+                            dpg.add_input_float(
+                                label="近3年≥%", tag="mf_min_r3y", default_value=-99.0,
+                                width=75, step=0, format="%.1f", callback=lambda s, a: _render_etf(),
+                            )
+                            dpg.add_input_float(
+                                label="手续费≤%", tag="mf_max_fee", default_value=9.9,
+                                width=75, step=0, format="%.2f", callback=lambda s, a: _render_etf(),
+                            )
+                            dpg.add_text(" 排序:")
+                            dpg.add_combo(
+                                [
+                                    "按近1年收益", "按近3年收益", "按近3月收益",
+                                    "按近1月收益", "按今年来收益", "按日增长率",
+                                    "按近1年回撤(低优先)", "按基金规模",
+                                ],
+                                default_value="按近1年收益", width=155,
+                                tag="mf_sort", callback=_on_mf_sort_combo,
+                            )
+
+                        dpg.add_text("正在加载本地基金库...", tag="etf_status", color=(255, 200, 100), wrap=960)
+                        # 基金产品深度详情面板(点击任意基金展开: 业绩走势% + 单位净值曲线 + 阶段涨幅与同类排名表，支持底部拖拽调高)
+                        with dpg.child_window(
+                            tag="fund_detail_box",
+                            height=MKT_SECTION_HEIGHTS.get("fund_detail_box", 355),
+                            border=True, show=False,
+                        ):
+                            dpg.add_group(tag="fund_detail_content")
+                        _add_mkt_section_handle("fund_detail_box")
+                        if dpg.does_item_exist("fund_detail_box_handle"):
+                            dpg.configure_item("fund_detail_box_handle", show=False)
                         dpg.add_separator()
                         with dpg.table(tag="etf_table", header_row=True, resizable=True,
                                        policy=dpg.mvTable_SizingStretchProp,
-                                       height=-1, scrollY=True):
-                            for col in ["代码", "名称", "现价", "涨跌幅%", "今开",
-                                        "最高", "最低", "成交额", "操作"]:
+                                       height=-1, scrollY=True, freeze_rows=1,
+                                       sortable=True, sort_tristate=False, callback=_on_etf_table_sort):
+                            for col in [
+                                "代码", "ETF名称", "赛道分类", "现价", "今日涨跌%",
+                                "IOPV净值", "溢价率%", "规模(亿)", "成交额(亿)", "换手率%",
+                                "近20日%", "近60日%", "近1年%", "操作",
+                            ]:
                                 dpg.add_table_column(label=col)
 
                     # --- Tab 4: 自选持仓 ---
@@ -5084,15 +7451,18 @@ def build_ui():
                         dpg.add_separator()
                         with dpg.table(tag="watch_table", header_row=True, resizable=True,
                                        policy=dpg.mvTable_SizingStretchProp,
-                                       height=240, scrollY=True):
+                                       height=MKT_SECTION_HEIGHTS.get("watch_table", 260), scrollY=True,
+                                       sortable=True, sort_tristate=False, callback=_on_watch_table_sort):
                             for col in ["代码", "名称", "加入日", "买入价", "现价",
                                         "今日涨跌%", "浮动盈亏%", "备注", "操作"]:
                                 dpg.add_table_column(label=col)
-                        dpg.add_separator()
+                        _add_mkt_section_handle("watch_table")
 
                         # ---- 价格预警 ----
                         dpg.add_text("价格预警(刷新实时行情时检查触发)", color=(120, 220, 160))
-                        dpg.add_child_window(tag="alert_fired", height=70, border=True)
+                        dpg.add_child_window(tag="alert_fired",
+                                             height=MKT_SECTION_HEIGHTS.get("alert_fired", 75), border=True)
+                        _add_mkt_section_handle("alert_fired")
                         with dpg.group(horizontal=True):
                             dpg.add_input_text(label="代码", width=90, tag="alert_code",
                                                hint="6位")
@@ -5119,31 +7489,38 @@ def build_ui():
                                 dpg.add_table_column(label=col)
 
     # 初始化
-    on_strategy_change(None, list(STRATEGY_LABEL2KEY.keys())[0])
     _refresh_cache_info()
     _refresh_market_state()
     _refresh_watchlist()
+    _refresh_side_drawer()
+    _init_fund_center()
     _refresh_alerts_table()
     _render_alerts([])
     _load_cached_ranking()   # 启动时载入上次排行(若有),推荐可直接秒出
     _sync_period_buttons("D")  # 默认高亮"日"周期
 
-    # 全局鼠标移动:驱动K线主图的自定义悬停提示(跟随鼠标定位到最近蜡烛)
+    # 全局鼠标移动与快捷键:驱动K线主图的自定义悬停提示与上下翻票
     with dpg.handler_registry():
         dpg.add_mouse_move_handler(callback=_on_kline_hover)
-        # 持仓表整行悬停高亮(highlight_table_cell 染背景,不抢点击,按钮仍可点)
+        dpg.add_mouse_move_handler(callback=_on_fund_plot_hover)
         dpg.add_mouse_move_handler(callback=_on_watch_row_hover)
-        # 行情页分隔条拖拽:move 实时调高度, release 结束拖拽
         dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Left,
                                    callback=_mkt_drag_move)
         dpg.add_mouse_release_handler(button=dpg.mvMouseButton_Left,
                                       callback=_mkt_drag_end)
+        dpg.add_key_press_handler(dpg.mvKey_Prior, callback=_on_key_step_stock)
+        dpg.add_key_press_handler(dpg.mvKey_Next, callback=_on_key_step_stock)
+        dpg.add_key_press_handler(dpg.mvKey_Up, callback=_on_key_step_stock)
+        dpg.add_key_press_handler(dpg.mvKey_Down, callback=_on_key_step_stock)
 
-    dpg.create_viewport(title="A-Share Stock Picker", width=1320, height=840)
+    dpg.create_viewport(title="A-Share Probability", width=1320, height=840)
     dpg.setup_dearpygui()
     dpg.show_viewport()
     dpg.set_primary_window("root", True)
-    dpg.start_dearpygui()
+    while dpg.is_dearpygui_running():
+        _drain_ui()
+        dpg.render_dearpygui_frame()
+    _save_ui_layout()
     dpg.destroy_context()
 
 

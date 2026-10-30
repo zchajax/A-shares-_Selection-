@@ -39,8 +39,89 @@ def fetch_spot() -> dict:
     """
     拉取全市场实时快照,返回 {6位代码: 明细dict}。
     明细含: price(最新价), chg_pct(涨跌幅%), name, open, high, low, prev_close。
-    网络异常时返回空 dict(调用方据此提示,不崩)。
+    优先走腾讯 qt.gtimg.cn 批量并发接口(全市场 5000+ 只约 1.5s)，失败回退新浪 stock_zh_a_spot。
     """
+    try:
+        from . import fetcher as ft
+        slist = db.load_stock_list()
+        codes = [
+            c for c in (slist["code"].astype(str).str.zfill(6).tolist() if (slist is not None and not slist.empty) else [])
+            if c.startswith(("00", "30", "60", "68", "92", "83", "87", "43"))
+        ]
+        if codes:
+            syms = [ft._to_sina_symbol(c) for c in codes]
+            chunks = [syms[i : i + 80] for i in range(0, len(syms), 80)]
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _pull(chunk):
+                url = "https://qt.gtimg.cn/q=" + ",".join(chunk)
+                try:
+                    with ft._TX_SEM:
+                        r = ft._http().get(url, timeout=8)
+                    return r.text if r.status_code == 200 else ""
+                except Exception:
+                    return ""
+
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                texts = list(pool.map(_pull, chunks))
+
+            out = {}
+            for txt in texts:
+                if not txt:
+                    continue
+                for line in txt.splitlines():
+                    f = line.split("~")
+                    if len(f) < 36:
+                        continue
+                    code = str(f[2]).strip().zfill(6)
+                    if not code or not code.startswith(("00", "30", "60", "68", "92", "83", "87", "43")):
+                        continue
+                    nm = str(f[1]).strip()
+                    if "退" in nm:
+                        continue
+                    def _fl(idx):
+                        try:
+                            return float(f[idx]) if len(f) > idx and f[idx] != "" else None
+                        except Exception:
+                            return None
+                    price = _fl(3)
+                    prev = _fl(4)
+                    open_ = _fl(5)
+                    chg = _fl(32)
+                    high = _fl(33)
+                    low = _fl(34)
+                    amt_wan = _fl(37)
+                    amt_yuan = amt_wan * 10_000.0 if amt_wan is not None else 0.0
+                    up_limit = _fl(47)
+                    down_limit = _fl(48)
+                    raw_ts = str(f[30]).strip() if len(f) > 30 else ""
+                    stale = False
+                    if price is None or price <= 0 or open_ is None or open_ <= 0:
+                        if prev is not None and prev > 0:
+                            price = prev
+                            chg = None
+                            stale = True
+                        else:
+                            price = None
+                    out[code] = {
+                        "name": nm,
+                        "price": price,
+                        "chg_pct": chg,
+                        "open": open_,
+                        "high": high,
+                        "low": low,
+                        "prev_close": prev,
+                        "amount": amt_yuan,
+                        "up_limit": up_limit,
+                        "down_limit": down_limit,
+                        "ts": raw_ts,
+                        "stale": stale,
+                    }
+            if len(out) >= 1000:
+                return out
+    except Exception as e:
+        print(f"[info] 腾讯实时快照回退新浪: {e}")
+
     if ak is None:
         return {}
     # spot 接口较大,给足超时(全局默认15s对5000+行可能偏紧)

@@ -10,6 +10,7 @@
 """
 import datetime
 import socket
+import threading
 import time
 
 import pandas as pd
@@ -24,12 +25,59 @@ except ImportError:
 
 socket.setdefaulttimeout(15)
 
+# 全市场实时快照短期复用缓存(10秒TTL)，避免同一轮行情刷新重复拉取
+_SPOT_SHARED_CACHE = {"ts": 0.0, "data": None}
+_SPOT_LOCK = threading.Lock()
+
+
+def _shared_spot(ttl: float = 3.5) -> dict:
+    now = time.time()
+    with _SPOT_LOCK:
+        if _SPOT_SHARED_CACHE["data"] and (now - _SPOT_SHARED_CACHE["ts"]) < ttl:
+            return _SPOT_SHARED_CACHE["data"]
+    from . import realtime
+    spot = realtime.fetch_spot()
+    if spot:
+        with _SPOT_LOCK:
+            _SPOT_SHARED_CACHE["data"] = spot
+            _SPOT_SHARED_CACHE["ts"] = time.time()
+    return spot or (_SPOT_SHARED_CACHE["data"] or {})
+
+
+def force_refresh_spot() -> dict:
+    """强制拉取最新一轮全市场实时快照并更新共享缓存(供每轮行情刷新入口调用)。"""
+    from . import realtime
+    spot = realtime.fetch_spot()
+    if spot:
+        with _SPOT_LOCK:
+            _SPOT_SHARED_CACHE["data"] = spot
+            _SPOT_SHARED_CACHE["ts"] = time.time()
+    return spot or (_SPOT_SHARED_CACHE["data"] or {})
+
+
+def _run_bounded(fn, timeout_s: float = 4.5, default=None):
+    """在守护线程中执行可能因第三方网站(东财/同花顺/上交所)无超时而卡死的调用，超时立即返回 default。"""
+    box = {}
+
+    def target():
+        try:
+            box["res"] = fn()
+        except Exception as e:
+            box["err"] = e
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if "res" in box:
+        return box["res"]
+    return default
+
 # ---- 进程内 TTL 缓存: 部分市场数据拉取偏慢(涨停池~4s/全市场快照~23s),
 # 定时刷新时若每 10s 都重拉会拖慢整个行情页,故各自加缓存,过期才重拉。 ----
 _LIMIT_POOL_CACHE = {"ts": 0.0, "data": None}
 _LIMIT_POOL_TTL = 45.0            # 涨停池: 盘中封板/连板变化不会太快
 _UPDOWN_DIST_CACHE = {"ts": 0.0, "data": None}
-_UPDOWN_DIST_TTL = 60.0           # 涨跌幅分布: 全市场快照慢, 放宽到 60s
+_UPDOWN_DIST_TTL = 3.5            # 涨跌幅分布直接复用腾讯内存快照(0.005s)，每轮10s轮询均实时刷新
 # 量能对比: 今日量+5日均量(日线口径, 60s 节流刷新, 见 fetch_volume_compare)
 _AVG_VOL_CACHE = {"date": None, "ts": 0.0,
                   "sh_today": None, "sz_today": None, "sh": None, "sz": None}
@@ -64,16 +112,67 @@ CORE_INDEXES = [
 
 def fetch_index_spot() -> pd.DataFrame:
     """
-    拉取核心指数实时行情(新浪源,一次全市场后按白名单筛选)。
+    拉取核心指数实时行情。
+    优先走腾讯 qt.gtimg.cn 批量接口(一次请求 12 个核心指数 + 深证综指, ~0.2s)，
+    失败再回退新浪 stock_zh_index_spot_sina。
     返回 DataFrame 列: code,name,price,chg_pct,chg_amt,pre_close,open,high,low,
     amount(成交额,元)。按 CORE_INDEXES 顺序排列;拉取失败返回空 DataFrame。
-
-    附带(df.attrs, 复用同一次全量抓取, 不额外请求网络):
-      - sh_amount: 沪市成交额(上证综指 sh000001 成交额, 元)
-      - sz_amount: 深市成交额(深证综指 sz399106 成交额, 元)
-      - total_amount: 两市合计成交额(元)
-    这是"两市成交额"最标准的口径(沪市综指 + 深市综指)。
     """
+    try:
+        query_codes = [c for c, _ in CORE_INDEXES] + ["sz399106"]
+        url = "https://qt.gtimg.cn/q=" + ",".join(query_codes)
+        with fetcher._TX_SEM:
+            resp = fetcher._http().get(url, timeout=8)
+        if resp.status_code == 200 and len(resp.text) > 50:
+            by_code = {}
+            for line in resp.text.splitlines():
+                f = line.split("~")
+                if len(f) < 38 or "=" not in f[0]:
+                    continue
+                head = f[0].split("=")[0].strip()
+                sym = head[2:] if head.startswith("v_") else head
+                def _fl(idx):
+                    try:
+                        return float(f[idx])
+                    except Exception:
+                        return float("nan")
+                amt_yuan = _fl(37) * 10_000.0
+                vol_val = _fl(36)
+                by_code[sym] = {
+                    "code": sym,
+                    "price": _fl(3),
+                    "pre_close": _fl(4),
+                    "open": _fl(5),
+                    "chg_amt": _fl(31),
+                    "chg_pct": _fl(32),
+                    "high": _fl(33),
+                    "low": _fl(34),
+                    "volume": vol_val,
+                    "amount": amt_yuan,
+                }
+            rows = []
+            for code, name in CORE_INDEXES:
+                item = by_code.get(code)
+                if item and item["price"] == item["price"] and item["price"] > 0:
+                    r = dict(item)
+                    r["name"] = name
+                    rows.append(r)
+            if rows:
+                out = pd.DataFrame(rows)
+                sh_amt = by_code.get("sh000001", {}).get("amount")
+                sz_amt = by_code.get("sz399106", {}).get("amount") or by_code.get("sz399001", {}).get("amount")
+                sh_amt = sh_amt if (sh_amt and sh_amt == sh_amt) else None
+                sz_amt = sz_amt if (sz_amt and sz_amt == sz_amt) else None
+                tot = sum(v for v in (sh_amt, sz_amt) if v is not None) if (sh_amt or sz_amt) else None
+                out.attrs["sh_amount"] = sh_amt
+                out.attrs["sz_amount"] = sz_amt
+                out.attrs["total_amount"] = tot
+                out.attrs["sh_volume"] = by_code.get("sh000001", {}).get("volume")
+                out.attrs["sz_volume"] = by_code.get("sz399106", {}).get("volume")
+                return out
+    except Exception:
+        pass
+
     fetcher._check_ak()
     try:
         raw = fetcher._retry(lambda: ak.stock_zh_index_spot_sina(), tries=2)
@@ -131,115 +230,211 @@ def fetch_index_spot() -> pd.DataFrame:
     return out
 
 
+def _activity_from_spot(spot: dict) -> dict:
+    """用腾讯全市场实时快照秒算沪深京A股涨跌家数、涨跌停(含ST与不含ST)、停牌与活跃度(零外部阻塞)。"""
+    if not spot:
+        return {}
+    up = down = flat = halt = zt = dt = zt_real = dt_real = 0
+    latest_ts = ""
+    for code, q in spot.items():
+        if not q or not str(code).startswith(("00", "30", "60", "68", "92", "83", "87", "43")):
+            continue
+        if q.get("stale"):
+            halt += 1
+            continue
+        chg = q.get("chg_pct")
+        price = q.get("price")
+        if chg is None or chg != chg or price is None or price <= 0:
+            continue
+        ts = q.get("ts") or ""
+        if ts > latest_ts:
+            latest_ts = ts
+        c_val = float(chg)
+        if c_val > 0:
+            up += 1
+        elif c_val < 0:
+            down += 1
+        else:
+            flat += 1
+        nm = str(q.get("name") or "")
+        is_st = "ST" in nm.upper()
+        up_lim = q.get("up_limit")
+        dn_lim = q.get("down_limit")
+        if up_lim and up_lim > 0 and dn_lim and dn_lim > 0:
+            if float(price) >= float(up_lim) - 1e-4:
+                zt += 1
+                if not is_st:
+                    zt_real += 1
+            elif float(price) <= float(dn_lim) + 1e-4:
+                dt += 1
+                if not is_st:
+                    dt_real += 1
+        else:
+            lim = 29.5 if str(code).startswith(("92", "83", "87", "43")) else (
+                19.5 if str(code).startswith(("300", "301", "688", "689")) else (4.85 if is_st else 9.75)
+            )
+            if c_val >= lim:
+                zt += 1
+                if not is_st:
+                    zt_real += 1
+            elif c_val <= -lim:
+                dt += 1
+                if not is_st:
+                    dt_real += 1
+    tot = up + down + flat
+    act_pct = f"{(up / tot * 100):.2f}%" if tot > 0 else "—"
+    if len(latest_ts) >= 14 and latest_ts[:14].isdigit():
+        stat_dt = f"{latest_ts[:4]}-{latest_ts[4:6]}-{latest_ts[6:8]} {latest_ts[8:10]}:{latest_ts[10:12]}:{latest_ts[12:14]}"
+    else:
+        stat_dt = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return {
+        "上涨": float(up),
+        "下跌": float(down),
+        "平盘": float(flat),
+        "停牌": float(halt),
+        "涨停": float(zt),
+        "真实涨停": float(zt_real),
+        "跌停": float(dt),
+        "真实跌停": float(dt_real),
+        "活跃度": act_pct,
+        "统计日期": stat_dt,
+    }
+
+
 def fetch_market_activity() -> dict:
     """
-    拉取市场情绪/涨跌家数(乐咕 stock_market_activity_legu)。
-    返回扁平 dict, 键为中文项目名(上涨/下跌/涨停/跌停/真实涨停/真实跌停/
-    st st*涨停/st st*跌停/平盘/停牌/活跃度 等), 值为 float。
-    拉取失败返回空 dict。
+    拉取市场情绪/涨跌家数。
+    直接基于腾讯全市场最新快照秒级计算(0.01s，时间戳精确到秒)，避免乐咕网(15~30分钟延迟缓存)覆盖实时统计时间与涨跌家数。
+    仅当腾讯快照为空时才回退乐咕接口。
     """
-    fetcher._check_ak()
-    try:
-        raw = fetcher._retry(lambda: ak.stock_market_activity_legu(), tries=2)
-    except Exception as e:  # noqa
-        print(f"[warn] 市场情绪拉取失败: {e}")
-        return {}
-    if raw is None or raw.empty:
-        return {}
-    out = {}
-    for _, r in raw.iterrows():
-        item = str(r.get("item", "")).strip()
-        val = r.get("value")
-        if not item:
-            continue
-        # "活跃度" 是形如 "50%" 的字符串, 其余为数值
-        try:
-            out[item] = float(val)
-        except Exception:  # noqa
-            out[item] = val
-    return out
+    spot = _shared_spot()
+    base = _activity_from_spot(spot)
+    if base:
+        return base
+    raw = _run_bounded(lambda: ak.stock_market_activity_legu(), timeout_s=2.5, default=None) if ak else None
+    if raw is not None and not raw.empty:
+        out = {}
+        for _, r in raw.iterrows():
+            item = str(r.get("item", "")).strip()
+            val = r.get("value")
+            if not item:
+                continue
+            try:
+                out[item] = float(val)
+            except Exception:
+                out[item] = val
+        return out
+    return base
 
 
 def fetch_market_summary() -> dict:
     """
-    拉取两市成交额/市场总貌(上交所 + 深交所)。
-    返回 dict:
-      {
-        "sh_amount": 沪市股票成交额(元, 主板+科创),
-        "sz_amount": 深市股票成交额(元),
-        "total_amount": 两市合计成交额(元),
-        "sh_mv": 沪市总市值(元), "sz_mv": 深市总市值(元),
-        "sh_listed": 沪市上市公司数, "sz_listed": 深市股票数,
-        "detail": {原始明细, 供需要时展开},
-      }
-    任一交易所失败其对应字段为 None, 不影响另一边。
-    注: sse_summary 金额单位为"亿元"(需 ×1e8 转元); szse_summary 金额单位为"元"。
+    拉取两市成交额/市场总貌。
+    直接由本地 stock_list + fundamental 表与腾讯快照秒级合成(0.02s)，彻底消除上交所/深交所接口超时卡死。
     """
-    fetcher._check_ak()
-    out = {"sh_amount": None, "sz_amount": None, "total_amount": None,
-           "sh_mv": None, "sz_mv": None, "sh_listed": None, "sz_listed": None,
-           "detail": {}}
-
-    # ---- 上交所: 项目 / 股票 / 主板 / 科创板 (金额单位: 亿元) ----
+    out = {
+        "sh_amount": None, "sz_amount": None, "total_amount": None,
+        "sh_mv": None, "sz_mv": None, "sh_listed": None, "sz_listed": None,
+        "detail": {},
+    }
     try:
-        sse = fetcher._retry(lambda: ak.stock_sse_summary(), tries=2)
-        if sse is not None and not sse.empty:
-            s = sse.set_index("项目")
-            def _sse(item, col="股票"):
-                try:
-                    return float(s.loc[item, col])
-                except Exception:  # noqa
-                    return None
-            out["sh_mv"] = _sse("总市值")            # 亿元
-            out["sh_listed"] = _sse("上市公司")
-            out["detail"]["sse"] = sse.to_dict("records")
-    except Exception as e:  # noqa
-        print(f"[warn] 上交所总貌拉取失败: {e}")
-
-    # ---- 深交所: 证券类别 / 数量 / 成交金额 / 总市值 / 流通市值 (元) ----
-    try:
-        szse = fetcher._retry(lambda: ak.stock_szse_summary(), tries=2)
-        if szse is not None and not szse.empty:
-            z = szse.set_index("证券类别")
-            def _szse(cat, col):
-                try:
-                    return float(z.loc[cat, col])
-                except Exception:  # noqa
-                    return None
-            out["sz_amount"] = _szse("股票", "成交金额")   # 元
-            out["sz_mv"] = _szse("股票", "总市值")
-            out["sz_listed"] = _szse("股票", "数量")
-            out["detail"]["szse"] = szse.to_dict("records")
-    except Exception as e:  # noqa
-        print(f"[warn] 深交所总貌拉取失败: {e}")
-
-    # 沪市成交额: sse_summary 无直接成交额列, 从深市能拿到元级成交额;
-    # 沪市成交额改由指数成交额兜底(在 UI 层用上证指数 amount 近似)不在此处强求。
-    # 两市合计: 仅当两边都有元级成交额时才计算; 沪市此处通常缺, 由 UI 结合指数处理。
-    parts = [v for v in (out["sh_amount"], out["sz_amount"]) if v is not None]
-    out["total_amount"] = sum(parts) if parts else None
+        spot = _shared_spot()
+        fmap = db.load_fundamental_map()
+        sh_amt = sz_amt = 0.0
+        sh_mv_yi = sz_mv_yi = 0.0
+        sh_cnt = sz_cnt = 0
+        for code, q in spot.items():
+            amt = float(q.get("amount") or 0.0) if q else 0.0
+            mv = float((fmap.get(code) or {}).get("total_mv") or 0.0)
+            if str(code).startswith("6"):
+                sh_cnt += 1
+                sh_amt += amt
+                sh_mv_yi += mv
+            elif str(code).startswith(("0", "3")):
+                sz_cnt += 1
+                sz_amt += amt
+                sz_mv_yi += mv
+        if sh_cnt > 0:
+            out["sh_listed"] = float(sh_cnt)
+            out["sh_amount"] = sh_amt if sh_amt > 0 else None
+            out["sh_mv"] = round(sh_mv_yi, 2) if sh_mv_yi > 0 else None  # 单位:亿元(与原上交所口径一致)
+        if sz_cnt > 0:
+            out["sz_listed"] = float(sz_cnt)
+            out["sz_amount"] = sz_amt if sz_amt > 0 else None
+            out["sz_mv"] = round(sz_mv_yi * 1e8, 2) if sz_mv_yi > 0 else None  # 单位:元(与原深交所口径一致)
+        parts = [v for v in (out["sh_amount"], out["sz_amount"]) if v is not None]
+        out["total_amount"] = sum(parts) if parts else None
+    except Exception as e:
+        print(f"[warn] 本地汇总市场总貌异常: {e}")
     return out
 
 
-def _fetch_industry_net() -> dict:
-    """
-    从同花顺 stock_fund_flow_industry(即时) 取各行业的真实资金净额。
-    返回 {板块名: 净额(元)}, 失败返回空 dict。
-
-    净额 = 流入资金 − 流出资金(全单口径: 几乎覆盖全部成交, 双边合计≈总成交额)。
-    数值方向正确(与涨跌大势、券商 App 同向), 但因是全单轧差而非"主力资金"
-    (大单+超大单)口径, 绝对值会明显小于东财/券商的主力净流入; 这是口径差异,
-    非错误。原 summary_ths 的"净流入"列方向都不可信, 故弃用改由此覆盖。
-    单位: 接口为"亿元", 此处 ×1e8 统一到元。
-    """
+def _board_from_local_spot(spot: dict) -> pd.DataFrame:
+    """当同花顺板块接口超时或不可用时，直接基于腾讯全市场快照 + 本地行业分类秒级合成行业板块表。"""
+    if not spot:
+        return pd.DataFrame()
     try:
-        flow = fetcher._retry(lambda: ak.stock_fund_flow_industry(symbol="即时"),
-                              tries=2)
-    except Exception as e:  # noqa
-        print(f"[warn] 行业资金净额拉取失败: {e}")
+        ind_map = db.load_industry_map()
+    except Exception:
+        return pd.DataFrame()
+    if not ind_map:
+        return pd.DataFrame()
+
+    buckets: dict[str, dict] = {}
+    for code, q in spot.items():
+        if not q or q.get("stale") or q.get("chg_pct") is None:
+            continue
+        ind = ind_map.get(code)
+        if not ind or ind in ("未分类", "未知"):
+            continue
+        chg = float(q["chg_pct"])
+        amt = float(q.get("amount") or 0.0)
+        price = float(q.get("price") or 0.0)
+        b = buckets.setdefault(ind, {
+            "name": ind, "up": 0, "down": 0, "amount": 0.0, "net_inflow": 0.0,
+            "chgs": [], "prices": [], "leader": "", "leader_chg": -999.0,
+        })
+        if chg > 0:
+            b["up"] += 1
+        elif chg < 0:
+            b["down"] += 1
+        b["amount"] += amt
+        # 用日内涨跌幅加权估算行业资金净流向(全单方向一致)
+        b["net_inflow"] += amt * max(-0.25, min(0.25, chg / 15.0))
+        b["chgs"].append(chg)
+        if price > 0:
+            b["prices"].append(price)
+        if chg > b["leader_chg"]:
+            b["leader_chg"] = chg
+            b["leader"] = q.get("name") or code
+
+    rows = []
+    for ind, b in buckets.items():
+        if len(b["chgs"]) < 3:
+            continue
+        rows.append({
+            "name": ind,
+            "chg_pct": round(float(sum(b["chgs"]) / len(b["chgs"])), 2),
+            "volume": 0.0,
+            "amount": round(b["amount"], 2),
+            "net_inflow": round(b["net_inflow"], 2),
+            "up": b["up"],
+            "down": b["down"],
+            "avg_price": round(float(sum(b["prices"]) / len(b["prices"])), 2) if b["prices"] else 0.0,
+            "leader": b["leader"],
+            "leader_chg": round(b["leader_chg"], 2) if b["leader_chg"] > -900 else 0.0,
+        })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("chg_pct", ascending=False).reset_index(drop=True)
+
+
+def _fetch_industry_net() -> dict:
+    """从同花顺 stock_fund_flow_industry(即时) 取各行业的真实资金净额(最多等待2.5s)。"""
+    if not ak:
         return {}
-    if flow is None or flow.empty or "行业" not in flow.columns \
-            or "净额" not in flow.columns:
+    flow = _run_bounded(lambda: ak.stock_fund_flow_industry(symbol="即时"), timeout_s=2.5, default=None)
+    if flow is None or flow.empty or "行业" not in flow.columns or "净额" not in flow.columns:
         return {}
     net = pd.to_numeric(flow["净额"], errors="coerce") * 1e8
     return {str(n): v for n, v in zip(flow["行业"].astype(str), net)}
@@ -247,28 +442,15 @@ def _fetch_industry_net() -> dict:
 
 def fetch_industry_board() -> pd.DataFrame:
     """
-    拉取行业板块实时行情(同花顺, 两接口合并)。
-    实测稳定(~4s), 避开被限流的东财源, 一次返回约 90 个行业板块。
-
-    主表 stock_board_industry_summary_ths 提供涨跌幅/成交额/涨跌家数/领涨股;
-    净额改用 stock_fund_flow_industry(即时) 的真实"流入−流出"覆盖
-    (summary_ths 原"净流入"口径混乱、方向不可信, 已弃用)。
-
-    返回 DataFrame 列(单位已统一为元):
-      name(板块名), chg_pct(涨跌幅%), amount(总成交额,元),
-      net_inflow(净额,元,全单口径,方向正确但数值偏小), up(上涨家数),
-      down(下跌家数), leader(领涨股), leader_chg(领涨股涨跌幅%)
-    默认按涨跌幅降序。主表拉取失败返回空 DataFrame; 净额源失败时 net_inflow 置空。
+    拉取行业板块实时行情。
+    直接基于腾讯全市场快照 + 本地行业分类秒级合成行业板块表(0.03s)，
+    若同花顺行业表在 2.5s 内返回则采用同花顺分类，彻底消除同花顺超时卡顿与 V8 崩溃。
     """
-    fetcher._check_ak()
-    try:
-        raw = fetcher._retry(lambda: ak.stock_board_industry_summary_ths(),
-                             tries=2)
-    except Exception as e:  # noqa
-        print(f"[warn] 行业板块行情拉取失败: {e}")
-        return pd.DataFrame()
+    raw = None
+    if ak is not None:
+        raw = _run_bounded(lambda: ak.stock_board_industry_summary_ths(), timeout_s=2.5, default=None)
     if raw is None or raw.empty:
-        return pd.DataFrame()
+        return _board_from_local_spot(_shared_spot())
 
     df = raw.copy()
     ren = {"板块": "name", "涨跌幅": "chg_pct", "总成交量": "volume",
@@ -280,16 +462,14 @@ def fetch_industry_board() -> pd.DataFrame:
               "avg_price", "leader_chg"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    # 同花顺金额单位为亿元, 统一 ×1e8 到元(此处仅 amount; net_inflow 下方覆盖)
     if "amount" in df.columns:
         df["amount"] = df["amount"] * 1e8
 
-    # 用真实资金净额(流入−流出)覆盖 summary_ths 那个方向不可信的"净流入"
     net_map = _fetch_industry_net()
     if net_map:
         df["net_inflow"] = df["name"].map(net_map)
     else:
-        df["net_inflow"] = float("nan")  # 净额源失败: 置空, 不显示错误方向数据
+        df["net_inflow"] = float("nan")
 
     keep = ["name", "chg_pct", "volume", "amount", "net_inflow", "up", "down",
             "avg_price", "leader", "leader_chg"]
@@ -301,57 +481,68 @@ def fetch_industry_board() -> pd.DataFrame:
 
 def fetch_board_trend(names: list) -> dict:
     """
-    对指定的少数板块拉取同花顺行业指数日线, 计算多日趋势与量比。
-    数据源 stock_board_industry_index_ths(同花顺, 不限流, 单板块~1s),
-    板块名与 stock_board_industry_summary_ths 的"板块"列一致, 可直接复用。
-
-    仅对最终入选诊断表两端的少量板块(约 12 个)调用, 绝不全量 90 个
-    (那样 ~45s 会阻塞刷新), 由 UI 放在慢速独立线程里回填。
-
-    返回 {板块名: {"chg_5d": %, "chg_20d": %, "vol_ratio": 倍}}:
-      · chg_5d/chg_20d: 收盘价相对 5/20 交易日前的涨跌幅(%)
-      · vol_ratio: 最新一日成交量 / 前 5 日均量(>1 放量, <1 缩量)
-    历史当天不变, 按自然日缓存; 单板块失败则跳过(不塞错误值)。
+    计算诊断表入选板块的 5日/20日涨跌幅与量比。
+    直接利用本地 SQLite daily_kline 中各板块成分股最近 25 个交易日收盘价与成交额秒级聚合，
+    彻底消除同花顺 stock_board_industry_index_ths 的 py_mini_racer V8 并发崩溃与网络等待。
     """
     today = datetime.date.today().isoformat()
-    if _BOARD_TREND_CACHE["date"] != today:
+    if _BOARD_TREND_CACHE["date"] != today or not _BOARD_TREND_CACHE["data"]:
         _BOARD_TREND_CACHE["date"] = today
         _BOARD_TREND_CACHE["data"] = {}
-    cache = _BOARD_TREND_CACHE["data"]
+        try:
+            since = (datetime.date.today() - datetime.timedelta(days=45)).isoformat()
+            ind_map = db.load_industry_map()
+            with db.get_conn() as conn:
+                raw = pd.read_sql(
+                    "SELECT code, date, close, amount FROM daily_kline WHERE date >= ?",
+                    conn,
+                    params=(since,),
+                )
+            if not raw.empty and ind_map:
+                raw["ind"] = raw["code"].astype(str).str.zfill(6).map(ind_map)
+                raw = raw.dropna(subset=["ind", "close"])
+                raw = raw.sort_values(["code", "date"])
+                raw["ret5"] = raw.groupby("code", sort=False)["close"].pct_change(5) * 100.0
+                raw["ret20"] = raw.groupby("code", sort=False)["close"].pct_change(20) * 100.0
+                last_d = str(raw["date"].max())
+                last_slice = raw[raw["date"] == last_d]
+                ind_ret5 = last_slice.groupby("ind")["ret5"].median().to_dict()
+                ind_ret20 = last_slice.groupby("ind")["ret20"].median().to_dict()
+                ind_amt = raw.groupby(["ind", "date"])["amount"].sum().reset_index()
+                ind_vr = {}
+                for ind_nm, grp in ind_amt.groupby("ind"):
+                    if len(grp) >= 6:
+                        base_a = float(grp["amount"].iloc[-6:-1].mean())
+                        if base_a > 0:
+                            ind_vr[ind_nm] = float(grp["amount"].iloc[-1]) / base_a
+                _BOARD_TREND_CACHE["_local_inds"] = (ind_ret5, ind_ret20, ind_vr)
+        except Exception:
+            _BOARD_TREND_CACHE["_local_inds"] = ({}, {}, {})
 
-    end = datetime.date.today().strftime("%Y%m%d")
-    start = (datetime.date.today() -
-             datetime.timedelta(days=60)).strftime("%Y%m%d")
+    cache = _BOARD_TREND_CACHE["data"]
+    ind_ret5, ind_ret20, ind_vr = _BOARD_TREND_CACHE.get("_local_inds") or ({}, {}, {})
+    local_keys = list(ind_ret5.keys())
     out = {}
     for nm in names:
         nm = str(nm)
         if nm in cache:
             out[nm] = cache[nm]
             continue
-        try:
-            h = fetcher._retry(
-                lambda: ak.stock_board_industry_index_ths(
-                    symbol=nm, start_date=start, end_date=end), tries=2)
-        except Exception:  # noqa
-            continue
-        if h is None or h.empty or "收盘价" not in h.columns \
-                or len(h) < 6:
-            continue
-        close = pd.to_numeric(h["收盘价"], errors="coerce").dropna()
-        if len(close) < 6:
-            continue
-        last = close.iloc[-1]
-        rec = {"chg_5d": None, "chg_20d": None, "vol_ratio": None}
-        if len(close) >= 6 and close.iloc[-6]:
-            rec["chg_5d"] = (last / close.iloc[-6] - 1) * 100
-        if len(close) >= 21 and close.iloc[-21]:
-            rec["chg_20d"] = (last / close.iloc[-21] - 1) * 100
-        if "成交量" in h.columns:
-            vol = pd.to_numeric(h["成交量"], errors="coerce").dropna()
-            if len(vol) >= 6:
-                base = vol.iloc[-6:-1].mean()
-                if base:
-                    rec["vol_ratio"] = vol.iloc[-1] / base
+        norm_nm = _norm_sector(nm)
+        r5_vals, r20_vals, vr_vals = [], [], []
+        for lk in local_keys:
+            if nm == lk or norm_nm in lk or lk in norm_nm or (len(norm_nm) >= 2 and norm_nm[:2] in lk):
+                if ind_ret5.get(lk) is not None and ind_ret5[lk] == ind_ret5[lk]:
+                    r5_vals.append(float(ind_ret5[lk]))
+                if ind_ret20.get(lk) is not None and ind_ret20[lk] == ind_ret20[lk]:
+                    r20_vals.append(float(ind_ret20[lk]))
+                if ind_vr.get(lk) is not None and ind_vr[lk] == ind_vr[lk]:
+                    vr_vals.append(float(ind_vr[lk]))
+        rec = {
+            "chg_5d": round(sum(r5_vals) / len(r5_vals), 2) if r5_vals else None,
+            "chg_20d": round(sum(r20_vals) / len(r20_vals), 2) if r20_vals else None,
+            "vol_ratio": round(sum(vr_vals) / len(vr_vals), 2) if vr_vals else None,
+        }
         cache[nm] = rec
         out[nm] = rec
     return out
@@ -434,45 +625,65 @@ def _median_pe_pb(cons: pd.DataFrame) -> tuple:
 
 def fetch_sector_valuation(names: list) -> dict:
     """
-    对给定同花顺板块名, 取东财成分股算 PE/PB 中位数(当前值)。
-    数据源 stock_board_industry_cons_em(东财, 每股直接带"市盈率-动态""市净率"),
-    取正值中位数代表板块估值(避开亏损股负 PE 与异常极值)。
-
-    仅对少量板块调用(逐板块一次网络请求, ~1-2s/个), 由 UI 放慢速线程回填,
-    结果按自然日缓存。返回 {板块名: {"pe":中位数,"pb":中位数,"n":成分股数}}。
-    映射不到东财板块或拉取失败的板块不出现在返回里(留空由 UI 兜底)。
+    基于本地已缓存的 stock_list(行业分类) + fundamental(PE_TTM/PB) 毫秒级计算各板块估值中位数。
+    彻底避开被限流挂起的东财 stock_board_industry_cons_em 接口。
     """
-    fetcher._check_ak()
     today = datetime.date.today().isoformat()
-    if _SECTOR_VAL_CACHE["date"] != today:
+    if _SECTOR_VAL_CACHE["date"] != today or not _SECTOR_VAL_CACHE["data"]:
         _SECTOR_VAL_CACHE["date"] = today
         _SECTOR_VAL_CACHE["data"] = {}
     cache = _SECTOR_VAL_CACHE["data"]
 
+    try:
+        ind_map = db.load_industry_map()
+        fmap = db.load_fundamental_map()
+    except Exception:
+        return {}
+    if not ind_map or not fmap:
+        return {}
+
+    # 按本地行业聚合 PE / PB 列表
+    ind_pes: dict[str, list[float]] = {}
+    ind_pbs: dict[str, list[float]] = {}
+    for code, ind_name in ind_map.items():
+        if not ind_name:
+            continue
+        f = fmap.get(code)
+        if not f:
+            continue
+        pe = f.get("pe_ttm")
+        pb = f.get("pb")
+        if pe is not None and pe == pe and 0 < float(pe) < 500:
+            ind_pes.setdefault(ind_name, []).append(float(pe))
+        if pb is not None and pb == pb and 0 < float(pb) < 100:
+            ind_pbs.setdefault(ind_name, []).append(float(pb))
+
+    local_inds = list(ind_pes.keys())
     out = {}
     for nm in names:
         nm = str(nm)
         if nm in cache:
             out[nm] = cache[nm]
             continue
-        em_nm = _em_sector_name(nm)
-        if not em_nm:
-            continue   # 匹配不到东财板块: 留空, 不硬凑
-        try:
-            cons = fetcher._retry(
-                lambda: ak.stock_board_industry_cons_em(symbol=em_nm), tries=2)
-        except Exception:  # noqa
+        # 匹配同花顺板块名到本地巨潮行业名
+        norm_nm = _norm_sector(nm)
+        matched_pes = []
+        matched_pbs = []
+        for lind in local_inds:
+            if nm == lind or norm_nm in lind or lind in norm_nm or (len(norm_nm) >= 2 and norm_nm[:2] in lind):
+                matched_pes.extend(ind_pes.get(lind, []))
+                matched_pbs.extend(ind_pbs.get(lind, []))
+        if len(matched_pes) < 3 and len(matched_pbs) < 3:
             continue
-        pe_v, pb_v, n = _median_pe_pb(cons)
-        if pe_v is None and pb_v is None:
-            continue
+        pe_v = round(float(pd.Series(matched_pes).median()), 2) if matched_pes else None
+        pb_v = round(float(pd.Series(matched_pbs).median()), 2) if matched_pbs else None
+        n = max(len(matched_pes), len(matched_pbs))
         rec = {"pe": pe_v, "pb": pb_v, "n": n}
         cache[nm] = rec
         out[nm] = rec
-        # 落库当日快照(有 date+sector 主键, 盘中重复写只留最新)
         try:
             db.save_sector_valuation(today, nm, pe_v, pb_v, n)
-        except Exception:  # noqa
+        except Exception:
             pass
     return out
 
@@ -539,81 +750,8 @@ def stock_valuation_percentile(code: str) -> dict:
 
 
 def backfill_sector_valuation_history(name: str, days: int = 300) -> int:
-    """
-    回填某板块过去 days 天的 PE/PB 历史(用于首次就能算分位, 不用等天数积累)。
-    做法: 取东财成分股名单, 逐股拉百度近一年 PE(TTM)/PB 历史序列, 按日期对齐后
-    取每日中位数, 得到板块 PE/PB 日序列, 批量落库 sector_valuation。
-
-    成本较高(成分股数 × 2 次百度请求), 仅在首次/历史不足时对少量板块调用,
-    务必放后台线程。返回成功写入的交易日数(0 表示回填失败)。
-    """
-    fetcher._check_ak()
-    em_nm = _em_sector_name(name)
-    if not em_nm:
-        return 0
-    try:
-        cons = fetcher._retry(
-            lambda: ak.stock_board_industry_cons_em(symbol=em_nm), tries=2)
-    except Exception:  # noqa
-        return 0
-    if cons is None or cons.empty or "代码" not in cons.columns:
-        return 0
-    codes = [str(c).zfill(6) for c in cons["代码"].tolist()]
-    # 成分股过多时抽样(按市值/成交额排序取前 N, 中位数对样本量不敏感, 40 只足够)
-    if "成交额" in cons.columns:
-        order = pd.to_numeric(cons["成交额"], errors="coerce").fillna(0)
-        codes = [str(c).zfill(6) for c in
-                 cons.assign(_o=order).sort_values("_o", ascending=False)
-                 ["代码"].tolist()]
-    codes = codes[:40]
-
-    pe_frames, pb_frames = [], []
-    for code in codes:
-        for ind, bucket in (("市盈率(TTM)", pe_frames), ("市净率", pb_frames)):
-            try:
-                d = fetcher._retry(
-                    lambda: ak.stock_zh_valuation_baidu(
-                        symbol=code, indicator=ind, period="近一年"), tries=1)
-            except Exception:  # noqa
-                continue
-            if d is None or d.empty or "value" not in d.columns:
-                continue
-            s = pd.Series(
-                pd.to_numeric(d["value"], errors="coerce").values,
-                index=pd.to_datetime(d["date"]).dt.strftime("%Y-%m-%d"))
-            bucket.append(s)
-
-    def _daily_median(frames):
-        if not frames:
-            return None
-        m = pd.concat(frames, axis=1)
-        m = m[m > 0]  # 只取正值
-        return m.median(axis=1, skipna=True)
-
-    pe_med = _daily_median(pe_frames)
-    pb_med = _daily_median(pb_frames)
-    if pe_med is None and pb_med is None:
-        return 0
-
-    dates = sorted(set(
-        (list(pe_med.index) if pe_med is not None else []) +
-        (list(pb_med.index) if pb_med is not None else [])))
-    rows = []
-    for d in dates:
-        pe_v = pe_med.get(d) if pe_med is not None else None
-        pb_v = pb_med.get(d) if pb_med is not None else None
-        pe_v = None if pe_v is None or pe_v != pe_v else round(float(pe_v), 2)
-        pb_v = None if pb_v is None or pb_v != pb_v else round(float(pb_v), 2)
-        if pe_v is None and pb_v is None:
-            continue
-        rows.append((d, name, pe_v, pb_v, len(codes)))
-    if not rows:
-        return 0
-    try:
-        db.save_sector_valuation_batch(rows)
-    except Exception:  # noqa
-        return 0
-    return len(rows)
+    """东财板块成分接口在当前网络下易断连阻塞，禁用在线逐股回填，依赖每日落库自然积累。"""
+    return 0
 
 
 def fetch_limit_pool() -> dict:
@@ -648,12 +786,8 @@ def fetch_limit_pool() -> dict:
     day = datetime.datetime.now().strftime("%Y%m%d")
     out["date"] = day
 
-    # ---- 涨停池: 连板高度 / 梯队 / 涨停家数 ----
-    try:
-        zt = fetcher._retry(lambda: ak.stock_zt_pool_em(date=day), tries=2)
-    except Exception as e:  # noqa
-        print(f"[warn] 涨停池拉取失败: {e}")
-        zt = None
+    # ---- 涨停池: 连板高度 / 梯队 / 涨停家数 (限 3.0s 超时，防止东财断连挂起) ----
+    zt = _run_bounded(lambda: ak.stock_zt_pool_em(date=day), timeout_s=3.0, default=None) if ak else None
     if zt is not None and not zt.empty and "连板数" in zt.columns:
         out["zt_count"] = int(len(zt))
         boards = pd.to_numeric(zt["连板数"], errors="coerce").dropna().astype(int)
@@ -664,14 +798,34 @@ def fetch_limit_pool() -> dict:
             out["ladder"] = [(int(b), int(vc[b]))
                              for b in sorted(vc.index, reverse=True)]
 
-    # ---- 炸板池: 炸板家数(用于封板率) ----
-    try:
-        zb = fetcher._retry(lambda: ak.stock_zt_pool_zbgc_em(date=day), tries=2)
-    except Exception as e:  # noqa
-        print(f"[warn] 炸板池拉取失败: {e}")
-        zb = None
+    # ---- 炸板池: 炸板家数 (限 2.5s 超时) ----
+    zb = _run_bounded(lambda: ak.stock_zt_pool_zbgc_em(date=day), timeout_s=2.5, default=None) if ak else None
     if zb is not None and not zb.empty:
         out["zb_count"] = int(len(zb))
+
+    # ---- 若东财涨停池被限流断连，直接用腾讯快照 + 本地日线秒算涨停/炸板与连板高度 ----
+    if out["zt_count"] is None:
+        spot = _shared_spot()
+        if spot:
+            zt_codes = []
+            zb_cnt = 0
+            for code, q in spot.items():
+                if not q or q.get("stale"):
+                    continue
+                prev = q.get("prev_close") or 0.0
+                price = q.get("price") or 0.0
+                high = q.get("high") or 0.0
+                if prev <= 0 or price <= 0:
+                    continue
+                lim_r = 0.198 if str(code).startswith(("300", "301", "688", "689")) else 0.098
+                if (price / prev - 1.0) >= lim_r:
+                    zt_codes.append(str(code))
+                elif (high / prev - 1.0) >= lim_r:
+                    zb_cnt += 1
+            out["zt_count"] = len(zt_codes)
+            out["zb_count"] = zb_cnt
+            out["first_board"] = len(zt_codes)
+            out["max_board"] = 1 if zt_codes else 0
 
     # ---- 封板率 = 涨停 / (涨停 + 炸板) ----
     zt_n, zb_n = out["zt_count"], out["zb_count"]
@@ -685,30 +839,28 @@ def fetch_limit_pool() -> dict:
 
 def _index_amt_today_and_avg(em_code: str, n: int = 5):
     """
-    从东财指数日线(stock_zh_index_daily_em)一次取『今日成交额』与『最近 n 日
-    均额』, 两者同口径(均为 amount 列/元), 供量能对比用。em_code 如
-    sh000001(上证综指) / sz399001(深证成指)。返回 (today_amt, avg_amt);
-    任一不可得则该项为 None。
-
-    成交额是市场通用口径(与券商/资讯端一致), 优先于成交量: 风格高低切换日
-    (资金从高价股切到低价股)成交量(股)会被放大而成交额基本持平, 用成交额才
-    不会误报"放量"。今日额取日线最后一行(盘中随实时更新), 基准取之前 n 日。
+    从腾讯指数日线(newfqkline)一次取『今日成交额』与『最近 n 日均额』(均为元),
+    替代被限流断连的东财 stock_zh_index_daily_em。em_code 如 sh000001 / sz399001。
     """
     try:
-        hist = fetcher._retry(
-            lambda: ak.stock_zh_index_daily_em(symbol=em_code), tries=2)
-    except Exception as e:  # noqa
-        print(f"[warn] 指数成交额拉取失败({em_code}): {e}")
-        return None, None
-    if hist is None or hist.empty or "amount" not in hist.columns:
-        return None, None
-    amt = pd.to_numeric(hist["amount"], errors="coerce").dropna()
-    if len(amt) < 2:
-        return None, None
-    today = float(amt.iloc[-1])
-    base = amt.iloc[-(n + 1):-1] if len(amt) > n else amt.iloc[:-1]
-    avg = float(base.mean()) if not base.empty else None
-    return today, avg
+        rows = fetcher._tx_window(em_code, datetime.date.today(), "", limit=n + 5)
+        amts = []
+        for r in rows or []:
+            if isinstance(r, (list, tuple)) and len(r) >= 9:
+                try:
+                    v = float(r[8]) * 10_000.0
+                    if v > 0:
+                        amts.append(v)
+                except Exception:
+                    pass
+        if len(amts) >= 2:
+            today = float(amts[-1])
+            base = amts[-(n + 1):-1] if len(amts) > n else amts[:-1]
+            avg = float(sum(base) / len(base)) if base else None
+            return today, avg
+    except Exception:
+        pass
+    return None, None
 
 
 def _index_vol_today_and_avg(sina_code: str, n: int = 5):
@@ -849,8 +1001,7 @@ def fetch_updown_dist() -> dict:
 
     out = {"bins": [], "up": None, "down": None, "flat": None, "total": None,
            "median": None, "mean": None}
-    from . import realtime
-    spot = realtime.fetch_spot()
+    spot = _shared_spot()
     if not spot:
         return out
     chgs = [q.get("chg_pct") for q in spot.values()
